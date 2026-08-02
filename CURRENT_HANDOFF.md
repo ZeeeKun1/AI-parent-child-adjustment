@@ -1,233 +1,321 @@
-# Current Handoff: Parent–Child Co-regulation Realtime PoC
+# 当前交接：亲子共同调节系统——实时摄像头版本开发
 
-Last updated: 2026-08-03 (Asia/Shanghai)
+更新时间：2026-08-03（Asia/Shanghai）
 
-## 1. Purpose and research context
+## 0. 新对话必须先做什么
 
-This repository is a technical feasibility prototype for a CHI-oriented study of AI-mediated parent–child homework co-regulation. The formative study is grounded in parent–child co-regulation theory and dynamic systems theory. The current technical question is deliberately narrow:
+请完整读取本文件，然后直接继续“第 11 节：Required next action”。新对话的主要任务是把当前的“本地上传视频测试版”扩展为正式实验可使用的“摄像头与麦克风实时输入版”。
 
-> Can Qwen-Omni-Realtime use synchronized speech and sampled video frames to classify a parent–child homework episode into one of four formative-study states and return timestamped, auditable evidence?
+不要重新设计已经完成的四个业务模块，也不要因为追求形式上的完美而逐项扩张需求。所有系统设计必须以本项目的形成性研究、三阶段主题分析、63 个 WOZ 干预片段和专家访谈结果为最高准则；工程参数若没有研究证据，只能标记为可配置的技术参数，不能伪装成研究结论。
 
-The four states are:
+用户偏好：严格回答当前问题，避免大段泛化说明和过多分点；先给结论，再给必要依据。
 
-- `normal`
-- `fluctuation`
-- `dysregulation`
-- `high_risk`
+## 1. 仓库、分支与版本边界
 
-The final four-state formative-study model is authoritative for implementation. Earlier three-state design drafts in the wider research workspace must not replace it.
-
-Their versioned definitions and evidence policy are in `config/state_codebook.yaml`. The codebook source is recorded as 63 WOZ intervention episodes plus expert interviews.
-
-This is not yet the complete experiment platform. Continuous live capture, parent/child speaker binding, rolling module-one assessments, and the formal participant UI have not been integrated. Modules two through four can replay consecutive assessments, select a constrained strategy, prepare identical prominent-text plus spoken-voice outputs, and generate traceable audio through the fixed Qwen realtime TTS snapshot and Maia voice.
-
-## 2. Repository and environment
-
-Project root: the repository root directory.
-
-Python environment: `.venv\Scripts\python.exe` (Windows) or `.venv/bin/python` (Linux/macOS).
-
-The repository is prepared for publication to `ZeeeKun1/AI-parent-child-adjustment` on the dedicated branch `prototype/local-video-poc`, based on the remote `main` branch. This branch is explicitly the local-uploaded-video technical prototype, not the formal live-camera experiment implementation. Do not delete or reorganize unrelated research files. Raw research media, `.env`, logs, runtime outputs, caches, and credentials are ignored by Git.
-
-Runtime paths are derived from the repository location and converted to absolute `pathlib.Path` values. There are no hard-coded machine paths inside application code.
-
-The `.env` file is already configured with:
-
-- `DASHSCOPE_API_KEY`
-- `ALIYUN_WORKSPACE_ID`
-- `ALIYUN_REGION=cn-beijing`
-- `OMNI_MODEL=qwen3.5-omni-flash-realtime`
-
-Never print, copy, commit, or expose the plaintext API key. The Workspace ID and API key have already been verified to belong to the China (Beijing) region and the same workspace.
-
-## 3. Implemented modules
-
-### Media replay
-
-`src/coregulation_poc/capture/video_replay.py`
-
-- Opens an absolute local video path with PyAV.
-- Requires both video and audio tracks.
-- Resamples audio to 16 kHz, mono, 16-bit PCM.
-- Produces 100 ms audio chunks.
-- Samples JPEG frames at approximately 1 fps.
-- Resizes frames to at most 1280×720.
-- Adds a non-overlapping `frame_time_ms` label to every sampled frame for evidence tracing.
-- Compresses each raw JPEG below 190 KB.
-- Sorts audio and image chunks on one normalized timeline.
-
-### Theory/formative-study translation
-
-- `config/state_codebook.yaml` version 2: four-state definitions, dynamic decision dimensions, normal–fluctuation boundary guidance, separate classification/action policy, independent modality sufficiency, and uncertainty rules. It deliberately does not impose arbitrary duration or event-count thresholds.
-- `src/coregulation_poc/fusion/prompting.py`: embeds the versioned codebook and the required `StateAssessment` JSON schema. Audio evidence must quote observed words; video evidence must cite a labeled frame and describe only visible behavior. Either modality may be insufficient without forcing evidence.
-- `src/coregulation_poc/fusion/response_parser.py`: accepts only schema-valid structured output and then validates session ID, clip duration, codebook interaction codes, and history requirements.
-- Speaker-role binding is not implemented in this PoC. Evidence actors may be `unknown`; future frontend enrollment and voiceprint matching must provide an external parent/child binding with a low-confidence fallback to `unknown`.
-
-### Qwen realtime transport
-
-`src/coregulation_poc/providers/qwen_omni_realtime.py` and `src/coregulation_poc/providers/websocket_transport.py`
-
-- Uses Alibaba Cloud's documented native WebSocket protocol through `websocket-client`.
-- Do not revert to `dashscope.audio.qwen_omni.OmniRealtimeConversation`: its threaded `WebSocketApp` consistently failed to connect on this machine even though the native synchronous WebSocket connection succeeds.
-- `websocket_transport.create_websocket_connection` resolves the endpoint hostname to IPv4 only, opens the TCP socket manually, wraps it with SSL, and hands the pre-connected socket to `websocket.create_connection`. This bypasses `websocket-client`'s default `AF_UNSPEC` resolution, which tries IPv6 addresses first and hangs until timeout on networks where IPv6 routes to the Aliyun MaaS host are broken.
-- Sends `input_audio_buffer.append` and `input_image_buffer.append` events.
-- Uses Manual mode (`turn_detection: null`).
-- Commits audio and image buffers before sending `response.create`.
-- `response.create` has already been corrected to contain only `event_id` and `type`, matching the official event reference.
-
-### Traceability
-
-`src/coregulation_poc/storage/run_artifacts.py`
-
-Every test creates an isolated run folder containing the input hash, codebook/prompt hash, software versions, summarized client events, server events, transcription events, latency metrics, raw model text, and schema-validated assessment. Real runs additionally save `audit.json` and a best-effort input transcript. Classification validity is distinct from audit readiness, so an ASR failure is preserved as an audit warning rather than hidden by a valid model response. Base64 audio/image payloads and credentials are not logged.
-
-### Diagnostics
-
-`src/coregulation_poc/diagnostics.py`
-
-The `diagnose` command currently checks, in order:
-
-1. configuration;
-2. video/audio decoding;
-3. DNS resolution;
-4. TCP port 443;
-5. WebSocket authentication and `session.created`;
-6. `session.update` and `session.updated`;
-7. one audio chunk plus one image frame and `input_audio_buffer.committed`.
-
-Reports are saved under `data/output/diagnostics/`.
-
-### Continuous state trajectory and intervention timing
-
-`config/intervention_policy.yaml` and `src/coregulation_poc/control/`
-
-- Maps the final four research states to no intervention, observation, explicit intervention, or progressive support.
-- Uses no fixed time or count threshold and never treats one signal as an intervention trigger.
-- Holds dysregulation/high-risk actions until a natural turn boundary.
-- Requires an observable post-intervention response before another intervention decision.
-- Requires interaction history before high-risk can enter progressive support.
-- Saves ordered state points, decisions, research-basis identifiers, and recovery status.
-- `trajectory-test` replays a JSON sequence of module-one assessments and writes auditable artifacts without calling an API.
-
-## 4. Current test media
-
-Local ignored input:
+本地项目根目录：
 
 ```text
-data/input/P01_test_01.mp4
+H:\Doctor Work\AI 亲子陪伴调节\访谈\二阶段主题分析\coregulation-realtime-poc
 ```
 
-Verified properties:
-
-- duration: 37.988 seconds;
-- resolution: 1280×720;
-- frame rate: 30 fps;
-- video codec: H.264;
-- audio codec: AAC at 44.1 kHz;
-- replay output: 380 PCM audio chunks and 38 JPEG frames.
-
-The clip ends immediately before expert intervention and contains preceding interaction context. It is intentionally excluded from Git.
-
-## 5. What has been verified
-
-The latest diagnostic run (2026-08-02 10:22 Asia/Shanghai) passed all seven checks. All five fresh-connection `session.update` variants, from `session: {}` through the full manual-mode configuration, returned `session.updated`. One audio chunk and one image frame were committed successfully.
-
-Latest successful diagnostic report:
+GitHub：
 
 ```text
-data/output/diagnostics/20260802T022009Z_P01_test_01.json
+https://github.com/ZeeeKun1/AI-parent-child-adjustment
 ```
 
-A full schema-version-2 paid video inference also completed successfully and produced a locally valid `fluctuation` assessment with per-modality evidence, high confidence, and a 593 ms first-response latency:
+已经推送的测试版分支：
 
 ```text
-data/output/runs/20260802T022024Z_P01_test_01_787141c2
+prototype/local-video-poc
 ```
 
-The model returned audio evidence (verbatim quotes of parent speech) and video evidence (labeled-frame observations of child hesitation and parental guidance), classifying the clip as `fluctuation`. The audit warning `audio_quote_not_found_in_best_effort_transcript` indicates that input ASR did not produce a matching transcript for cross-validation, so `audit_ready` is false.
+测试版提交：
 
-## 6. Active unresolved issue
-
-There is no active transport or model-access failure. The IPv6 timeout that briefly blocked WebSocket connections on 2026-08-02 has been resolved by forcing IPv4 in `websocket_transport.py`.
-
-The current open validation question is whether the schema-version-2 assessment quality holds across more research clips: verbatim audio quotes, labeled-frame visual evidence when observable, per-modality insufficiency when not observable, and explicit uncertainty near state boundaries. The single successful paid run produced a structurally valid assessment, but `audit_ready` is false because input ASR did not produce a cross-validatable transcript.
-
-## 7. Required next action
-
-Run one paid inference of `P01_test_01.mp4` with schema version 2, then inspect:
-
-1. `assessment.json` for per-modality evidence, confidence, alternative state, and ambiguity reason;
-2. `audit.json` for transcription status, quote matching, and audit readiness;
-3. `metrics.json` for separate `classification_valid` and `audit_ready` values;
-4. the original clip at every cited evidence interval.
-
-Do not batch-process research media until this single-run schema and audit behavior are accepted by the research team.
-
-## 8. Commands
-
-Run all local checks:
-
-```powershell
-python -m ruff check .
-python -m pytest tests/
+```text
+0297f954976674fed019117eaec9a573dd54a955
 ```
 
-Run full diagnostic:
+该分支明确对应“用户上传本地视频，再按真实时间回放给模型”的技术验证版本，不是正式实验的实时摄像头版本。远程 `main` 没有被修改。
 
-```powershell
-python -m coregulation_poc diagnose --video "data/input/P01_test_01.mp4"
+实时版本开始编码前，建议从 `prototype/local-video-poc` 创建新分支：
+
+```text
+feature/realtime-camera-pipeline
 ```
 
-Run real inference only after all diagnostic checks pass:
+不要在 `main` 上直接开发，也不要覆盖或删除 `prototype/local-video-poc`。
 
-```powershell
-python -m coregulation_poc video-test --video "data/input/P01_test_01.mp4" --session-id P01_test_01
+## 2. 当前系统已经完成什么
+
+### 模块一：多模态共同调节状态识别
+
+- 本地视频通过 PyAV 解码。
+- 音频转换为 16 kHz、单声道、16-bit PCM，每块约 100 ms。
+- 视频约每秒抽取一张 JPEG，最大 1280×720，并带可追溯的 `frame_time_ms`。
+- 音频块和图像帧按照统一时间线实时回放给 Qwen-Omni-Realtime。
+- 输出四种形成性研究状态：`normal`、`fluctuation`、`dysregulation`、`high_risk`。
+- 音频证据要求保留模型实际观察到的原话；视觉证据只描述可见行为并引用时间帧。
+- 某个模态证据不足时明确写证据不足，不强迫每次判断同时具备音频和视觉证据。
+- 状态边界允许保留 `alternative_state` 与 `ambiguity_reason`，不制造现实中不存在的绝对边界。
+- 本地 Praat/Parselmouth 只记录音高、强度、dBFS、浊音帧等客观声学特征，不单独推断情绪或状态。
+
+关键文件：
+
+```text
+config/state_codebook.yaml
+config/acoustic_analysis.yaml
+src/coregulation_poc/capture/video_replay.py
+src/coregulation_poc/providers/qwen_omni_realtime.py
+src/coregulation_poc/providers/websocket_transport.py
+src/coregulation_poc/fusion/prompting.py
+src/coregulation_poc/fusion/response_parser.py
+src/coregulation_poc/acoustics/prosody.py
+src/coregulation_poc/video_test.py
 ```
 
-## 9. Current verification status
+### 模块二：连续状态与干预时机
 
-Current local verification:
+- 保存连续状态轨迹，不覆盖模块一判断。
+- `normal` 不干预；`fluctuation` 继续观察；`dysregulation` 允许显式干预；`high_risk` 进入渐进支持。
+- 干预需要等待自然互动边界。
+- 干预后必须观察到亲子回应，才能再次决定是否干预。
+- 没有将固定秒数或固定事件次数包装成研究结论。
+
+关键文件：
+
+```text
+config/intervention_policy.yaml
+src/coregulation_poc/control/
+src/coregulation_poc/trajectory_test.py
+```
+
+### 模块三：策略选择
+
+- 只有模块二授权后才能选择策略。
+- 12 张版本化策略卡分别面向家长、孩子或双方。
+- 保存目标对象、修复目标、批准话术、预期恢复表现、下一策略和研究来源。
+- `unknown` 或笼统的双方证据不能被用来单独指责家长或孩子。
+- 模块三只决定干预内容与对象，不决定输出媒介。
+
+关键文件：
+
+```text
+config/strategy_cards.yaml
+src/coregulation_poc/intervention/
+src/coregulation_poc/strategy_test.py
+```
+
+### 模块四：文字与语音双通道输出
+
+- 同一条批准话术同时用于醒目文字和语音，不允许两个通道各自改写。
+- 文字醒目但不遮挡主要任务。
+- 暂停干预时两个通道都暂停。
+- 语音失败时保留文字并明确记录降级。
+- “成功显示/播放”不等于参与者已经看到、听到、理解或采纳。
+- TTS 固定为 `qwen3-tts-instruct-flash-realtime-2026-01-22`，音色固定为 `Maia`。
+- `optimize_instructions=false`，避免服务端重写实验语音指令。
+- 生成 24 kHz、单声道、16-bit WAV，并保存消息哈希、音频哈希、延迟、字符用量和清理后的事件记录。
+- 浏览器预览只播放已生成的 Maia 文件，不再随机调用系统中文声线。
+
+关键文件：
+
+```text
+config/delivery_policy.yaml
+src/coregulation_poc/delivery/
+src/coregulation_poc/providers/qwen_tts_realtime.py
+src/coregulation_poc/delivery_test.py
+```
+
+## 3. 已验证状态
+
+本地完整检查：
 
 ```text
 ruff: all checks passed
 pytest: 54 passed
-diagnostic: 7/7 passed (2026-08-02 10:22 Asia/Shanghai)
-schema-v2 paid inference: valid, state=fluctuation, audit_ready=false
-Qwen realtime TTS paid synthesis: valid, model=qwen3-tts-instruct-flash-realtime-2026-01-22, voice=Maia
 ```
 
-Latest successful schema-v2 paid inference artifacts:
+真实本地视频推理已经成功，样例片段约 38 秒，解码为 380 个音频块与 38 张图像帧。模块一得到结构有效的 `fluctuation` 结果；该结果是管线可行性证据，不是专家确认的准确率证据。当前一次运行的 `audit_ready=false`，原因是最佳努力 ASR 转录没有完整匹配模型引用的音频原话。
+
+真实 TTS 已经全通：
 
 ```text
-data/output/runs/20260802T022024Z_P01_test_01_787141c2
+model: qwen3-tts-instruct-flash-realtime-2026-01-22
+voice: Maia
+sample_rate_hz: 24000
+voice_synthesis_count: 1
+voice_synthesis_failure_count: 0
+first_audio_latency_ms: 562
+total_latency_ms: 1734
+audio_duration_ms: 4720
 ```
 
-A valid `assessment.json` indicates structural and contextual validity, not expert-confirmed classification accuracy. `audit_ready` must also be checked before treating evidence as fully auditable.
+本地运行目录均在 `data/output/`，已被 Git 忽略，不要上传研究媒体或运行音频。
 
-## 10. User communication preference
+## 4. 当前版本与实时实验版本的关键差距
 
-The user prefers concise Chinese responses that answer only the current question. Avoid broad redesigns, excessive branching, and long lists unless the user explicitly requests a complete plan. When debugging, report the concrete evidence first, then the single next action.
+当前 `video-test` 会先完整解码一个本地文件，然后按照原始时间戳回放给模型。它证明了模型、提示词、四状态结构、证据审计和后续模块能够运行，但还缺少正式实验需要的以下实时能力：
 
-## 11. Local acoustic measurement update
+1. 从摄像头和麦克风持续采集，而不是读取上传文件。
+2. 设备发现、设备选择、权限错误和中途断开处理。
+3. 有界缓冲与背压，避免长时实验无限占用内存。
+4. 持续或滚动地生成模块一评估，而不是每段视频只返回一次。
+5. 将连续评估实时送入模块二、模块三和模块四。
+6. 将文字提示和 Maia 音频发送到正式实验前端，并接收真实执行回执。
+7. 在前端开始阶段让家长和孩子分别确认音频身份，并通过声纹分段绑定说话者。
 
-Module one now includes a versioned Praat/Parselmouth supporting-measurement layer. It saves full-channel pitch, intensity, dBFS, and voiced-frame measurements to `acoustic_summary.json`, measures every model-cited audio interval in `acoustic_evidence.json`, and preserves Qwen ASR emotion labels separately in `input_emotions.json`. These observations never trigger a state by themselves.
+## 5. 实时版本应采用的总体数据流
 
-The current mono replay channel mixes parent and child speech, so results are deliberately marked `quality=limited`, `actor=unknown`, and are not interpreted as an individual's emotion. Speech rate remains unavailable until time-aligned text and frontend voiceprint speaker segments exist. The analysis policy and limitations are versioned in `config/acoustic_analysis.yaml` and hashed in each run manifest.
+```text
+摄像头 + 麦克风
+        ↓
+统一单调时钟与时间戳
+        ↓
+有界音频/视频队列
+        ↓
+Qwen-Omni-Realtime 持续会话
+        ↓
+模块一结构化状态评估
+        ↓
+模块二连续轨迹与时机控制
+        ↓
+模块三对象化策略选择
+        ↓
+模块四醒目文字 + Maia 语音
+        ↓
+前端执行回执与后续亲子回应
+```
 
-Local verification on `P01_test_01.mp4` passed without an API call. The acoustic layer detected measurable speech and produced a plausible mixed-channel pitch distribution, but this is a pipeline check rather than an accuracy claim. The next ordinary paid inference should be used to confirm creation of `acoustic_evidence.json` and `input_emotions.json`; no dedicated extra paid run is required.
+实时采集层只负责真实、同步、可追溯地提供媒体，不得在采集层重新定义状态或干预逻辑。
 
-## 12. Module-three strategy selection update
+## 6. 实时采集的工程要求
 
-Module three is now implemented in `src/coregulation_poc/intervention/` with a versioned 12-card library in `config/strategy_cards.yaml`. Cards explicitly target parent, child or both and record repair target, use/avoid conditions, approved template, expected recovery, next response-gated strategy and research provenance. Delivery modality is no longer stored in individual cards because module four now applies one versioned dual-channel contract.
+### 音视频格式
 
-The selector cannot override module two: it returns a held result unless the matching decision has both `intervention_permitted=true` and `strategy_selection_required=true`. Actor-specific cards require evidence explicitly assigned to that actor. Unknown or dyadic evidence can use a neutral dyadic fallback but cannot be used to single out one person.
+第一版应尽量保持与已经验证的本地回放输入一致，以减少同时变化的变量：
 
-`strategy-test` replays the same observation format through modules two and three without an API call. The verified example is `examples/strategy_replay.json`; its run selected `PARENT_TONE_AND_PACE`, targeted the parent, passed every wording check, and recorded observable recovery indicators.
+- 音频：16 kHz、mono、PCM16、约 100 ms 一块。
+- 视频：JPEG，最大 1280×720，初始约 1 fps。
+- 音频和视频使用同一个单调时钟生成毫秒时间戳。
 
-## 13. Module-four dual-channel delivery update
+100 ms、1 fps、分辨率和评估窗口属于工程参数，不是形成性研究结论。它们必须可配置、写入每次运行清单，并在延迟与识别效果验证后再冻结。
 
-Module four is implemented in `src/coregulation_poc/delivery/` with the versioned policy `config/delivery_policy.yaml`. It implements the research-team decision to show one prominent non-blocking text prompt and automatically speak the same Chinese message. It preserves the module-three target actor and cannot alter state, timing, repair target, strategy or wording.
+### 缓冲与长时运行
 
-The coordinator holds both outputs when intervention is paused. If voice is disabled or unavailable, it retains the visual prompt, marks the package `degraded`, and preserves the failure reason. Visual rendering and voice playback use separate execution records; a successful output is explicitly not treated as evidence that a participant saw, heard, understood or adopted the intervention.
+- 使用有界队列，队列满时明确记录丢帧或降采样，不能静默无限堆积。
+- 音频优先保持连续；视频在过载时可按规则丢弃较旧帧。
+- 所有媒体块必须具有严格递增时间戳。
+- 设备断开、API 断开和超时必须产生显式状态，不得伪装成正常评估。
+- 原始音视频默认不落盘；只有明确进入经批准的研究记录流程时才能保存。
 
-`delivery-test` replays modules one to four without an API call and saves `delivery_policy.json`, `delivery_packages.json`, an empty `delivery_execution_reports.json` contract for the future frontend, and one standalone HTML preview per prepared intervention. `delivery-test --synthesize-voice` uses `qwen3-tts-instruct-flash-realtime-2026-01-22` with `Maia`, saves a hashed 24 kHz mono WAV plus sanitized TTS events and synthesis metadata, and binds the preview to that exact file instead of browser Web Speech. The completed local suite reports `ruff: all checks passed` and `pytest: 54 passed`. A paid synthesis on 2026-08-03 completed successfully with one Maia WAV, zero synthesis failures, 562 ms first-audio latency and 1,734 ms total synthesis latency. Production UI integration remains later work rather than a module-four logic gap.
+### 持续评估
+
+模块一的评估频率与媒体窗口长度目前没有形成性研究给出的唯一数值。第一版需要做成可配置调度器，并将窗口起止、触发原因、媒体数量和延迟写入审计记录。
+
+固定技术窗口只能用于系统调度，不能直接成为干预阈值。是否干预仍必须由模块二依据研究政策、自然互动边界和干预后回应决定。
+
+## 7. 说话者绑定的既定方向
+
+正式前端开始会话时，让家长与孩子分别进行一次短音频确认/注册，然后由声纹分段将后续语音片段绑定为 `parent` 或 `child`。
+
+必须遵守：
+
+- 声纹置信不足、重叠说话或环境噪声严重时回退为 `unknown`。
+- 不能为了让输出看起来完整而强行指定说话者。
+- 客观声学特征按分段保存；语义内容继续交给多模态大模型理解。
+- 当前实时采集基础层应预留 `speaker_segment` 接口，但不要在没有选定和验证声纹方案前伪造实现。
+
+## 8. 不得破坏的研究与产品约束
+
+1. 最终四状态主题分析模型是权威来源，不能退回早期三状态草案。
+2. 音频证据尽量使用观察到的原话；视觉不可见时写证据不足。
+3. 不要求每个判断同时拥有音频和视觉证据。
+4. 客观音高、强度、语速等不能单独推断情绪或共同调节状态。
+5. `normal` 与 `fluctuation` 不触发干预。
+6. 状态边界允许不确定性，不追求现实中不存在的绝对分类边界。
+7. 模块二决定是否干预，模块三决定对谁说什么，模块四只负责呈现。
+8. 文字与语音必须保持同一条核心话术。
+9. 固定使用 Maia，避免音色变化成为实验混杂变量。
+10. 不把系统输出成功等同于参与者实际接收或恢复。
+
+## 9. 安全、隐私与 Git 约束
+
+- `.env` 中已配置北京地域的 API Key、Workspace ID 和模型设置。禁止打印、复制、提交或写入日志。
+- `.env`、`data/input/`、`data/output/`、音视频文件、缓存和虚拟环境已被 `.gitignore` 排除。
+- Base64 音频和图像负载不进入审计文件。
+- 新增实时采集后，默认只保存结构化事件、参数、哈希、延迟与错误，不保存原始家庭音视频。
+- 未获得覆盖云端处理与音视频记录的知情同意前，不对真实参与者运行。
+
+## 10. 当前可用命令
+
+```powershell
+# 配置检查
+python -m coregulation_poc doctor
+
+# 完整本地检查
+python -m ruff check src tests scripts
+python -m pytest
+
+# 本地视频真实推理
+python -m coregulation_poc video-test `
+  --video "H:\absolute\path\to\clip.mp4" `
+  --session-id P01_test_01
+
+# 模块二至四离线回放
+python -m coregulation_poc delivery-test `
+  --input "H:\absolute\path\to\strategy_replay.json"
+
+# 真实生成 Maia 音频
+python -m coregulation_poc delivery-test `
+  --input "H:\absolute\path\to\strategy_replay.json" `
+  --synthesize-voice
+```
+
+实时摄像头命令尚未实现。建议新增：
+
+```text
+python -m coregulation_poc live-test --camera-index ... --microphone-index ...
+```
+
+参数名称可在实现时根据 Windows 设备枚举方式调整，但不要把机器专属设备名称硬编码进仓库。
+
+## 11. Required next action
+
+新对话应直接执行以下任务：
+
+1. 检查工作区与 Git 状态，以 `prototype/local-video-poc` 为基线创建 `feature/realtime-camera-pipeline`。
+2. 先实现实时采集基础层，不先做正式 UI：
+   - 定义可复用的媒体源接口，使本地视频源和实时设备源可以输出同一种带时间戳媒体块；
+   - 增加 Windows 摄像头与麦克风设备枚举和明确选择；
+   - 实现有界音频/视频队列、单调时间戳、停止信号和设备错误；
+   - 新增 `live-test` 的短时 `--dry-run`，只验证采集、同步、格式、队列和指标，不调用付费 API；
+   - 默认不保存原始音视频。
+3. 为实时采集层编写可使用假设备/合成媒体源运行的测试，避免 CI 依赖真实摄像头。
+4. 本地采集验证通过后，再把同一媒体块接口接入现有 Qwen Provider，完成一次短时真实摄像头推理。
+5. 之后才实现持续评估调度、模块二至四在线串联、前端双通道呈现和声纹绑定。
+
+首个里程碑的验收标准：
+
+- 能列出并明确选择摄像头与麦克风；
+- 能连续采集至少一个可配置短时会话；
+- 输出音频格式与当前 Qwen 输入一致；
+- 音视频时间戳统一且严格递增；
+- 队列有界，停止后线程/设备完整释放；
+- 设备不可用或断开时给出可诊断错误；
+- 运行清单记录设备标识的非敏感部分、采集参数、块数量、丢帧数量和延迟；
+- 默认不生成原始音视频文件；
+- 不修改四状态代码本、干预政策、策略卡或固定 Maia 输出规则。
+
+## 12. 后续而非首个任务
+
+以下工作重要，但不要与首个实时采集里程碑同时展开：
+
+- 正式参与者前端与视觉样式完善；
+- 家长/孩子声纹模型选型和注册流程；
+- 长时压力测试和断线重连；
+- 多段专家标注视频的分类准确性验证；
+- 摄像头角度、遮挡、远场拾音和多人重叠语音实验；
+- CHI 稿件所需的用户实验、消融实验和统计分析。
+
+当前最重要的下一步只有一个：在不改变已有科学逻辑的前提下，把经过验证的本地视频媒体接口替换/扩展为可靠的实时摄像头与麦克风媒体接口。
