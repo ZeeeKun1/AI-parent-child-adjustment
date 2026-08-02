@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from pathlib import Path
+
+from coregulation_poc.codebook import load_state_codebook
+from coregulation_poc.connection_check import check_realtime_connection
+from coregulation_poc.control import load_intervention_policy
+from coregulation_poc.delivery import load_delivery_policy
+from coregulation_poc.delivery_test import run_delivery_test
+from coregulation_poc.diagnostics import run_all_diagnostics
+from coregulation_poc.intervention import load_strategy_library
+from coregulation_poc.paths import (
+    DELIVERY_POLICY_PATH,
+    INTERVENTION_POLICY_PATH,
+    PROJECT_ROOT,
+    STATE_CODEBOOK_PATH,
+    STRATEGY_CARDS_PATH,
+)
+from coregulation_poc.settings import Settings
+from coregulation_poc.strategy_test import run_strategy_test
+from coregulation_poc.trajectory_test import run_trajectory_test
+from coregulation_poc.video_test import run_video_test
+
+
+def doctor() -> int:
+    settings = Settings()
+    codebook = load_state_codebook()
+    intervention_policy = load_intervention_policy()
+    strategy_library = load_strategy_library()
+    delivery_policy = load_delivery_policy()
+    report = {
+        "project_root": str(PROJECT_ROOT),
+        "state_codebook": str(STATE_CODEBOOK_PATH),
+        "state_labels": list(codebook["states"]),
+        "intervention_policy": str(INTERVENTION_POLICY_PATH),
+        "intervention_policy_version": intervention_policy.version,
+        "strategy_library": str(STRATEGY_CARDS_PATH),
+        "strategy_library_version": strategy_library.version,
+        "strategy_card_count": len(strategy_library.cards),
+        "strategy_target_actors": sorted(
+            {card.target_actor.value for card in strategy_library.cards}
+        ),
+        "delivery_policy": str(DELIVERY_POLICY_PATH),
+        "delivery_policy_version": delivery_policy.version,
+        "delivery_modalities": ["visual_text", "spoken_voice"],
+        "tts_provider": delivery_policy.voice.provider,
+        "tts_model": delivery_policy.voice.model,
+        "tts_voice": delivery_policy.voice.voice,
+        "tts_realtime_base_url": settings.tts_realtime_base_url,
+        "input_dir": str(settings.input_dir),
+        "output_dir": str(settings.output_dir),
+        "cache_dir": str(settings.cache_dir),
+        "log_dir": str(settings.log_dir),
+        "api_key_configured": settings.dashscope_api_key is not None,
+        "workspace_configured": settings.aliyun_workspace_id is not None,
+        "realtime_endpoint_configured": settings.realtime_endpoint is not None,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Co-regulation realtime PoC utilities")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("doctor", help="Check local configuration")
+    subparsers.add_parser("connection-test", help="Test WebSocket authentication only")
+    diagnose_parser = subparsers.add_parser("diagnose", help="Run all preflight checks")
+    diagnose_parser.add_argument("--video", type=Path, required=True)
+    video_parser = subparsers.add_parser("video-test", help="Replay one clip to Qwen Omni")
+    video_parser.add_argument("--video", type=Path, required=True)
+    video_parser.add_argument("--session-id", required=True)
+    video_parser.add_argument("--dry-run", action="store_true")
+    trajectory_parser = subparsers.add_parser(
+        "trajectory-test",
+        help="Replay module-one assessments through the intervention controller",
+    )
+    trajectory_parser.add_argument("--input", type=Path, required=True)
+    strategy_parser = subparsers.add_parser(
+        "strategy-test",
+        help="Replay assessments through timing control and target-aware strategy selection",
+    )
+    strategy_parser.add_argument("--input", type=Path, required=True)
+    delivery_parser = subparsers.add_parser(
+        "delivery-test",
+        help="Replay assessments through timing, strategy and dual-channel delivery",
+    )
+    delivery_parser.add_argument("--input", type=Path, required=True)
+    delivery_parser.add_argument(
+        "--disable-voice",
+        action="store_true",
+        help="Exercise the visual-only fallback path",
+    )
+    delivery_parser.add_argument(
+        "--synthesize-voice",
+        action="store_true",
+        help="Generate and save the approved message with Qwen realtime TTS and Maia",
+    )
+    args = parser.parse_args()
+    if args.command in {None, "doctor"}:
+        raise SystemExit(doctor())
+    if args.command == "connection-test":
+        result = check_realtime_connection(Settings())
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if result["ok"] else 2)
+    if args.command == "diagnose":
+        if not args.video.is_absolute():
+            parser.error("--video must be an absolute path")
+        report_path, valid = asyncio.run(
+            run_all_diagnostics(video_path=args.video, settings=Settings())
+        )
+        print(
+            json.dumps(
+                {"report": str(report_path), "valid": valid}, ensure_ascii=False, indent=2
+            )
+        )
+        raise SystemExit(0 if valid else 2)
+    if args.command == "video-test":
+        if not args.video.is_absolute():
+            parser.error("--video must be an absolute path")
+        try:
+            run_dir, valid = asyncio.run(
+                run_video_test(
+                    video_path=args.video,
+                    session_id=args.session_id,
+                    settings=Settings(),
+                    dry_run=args.dry_run,
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.exit(2, f"Video test failed: {exc}\n")
+        print(json.dumps({"run_dir": str(run_dir), "valid": valid}, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if valid else 2)
+    if args.command == "trajectory-test":
+        if not args.input.is_absolute():
+            parser.error("--input must be an absolute path")
+        try:
+            run_dir, valid = run_trajectory_test(
+                input_path=args.input,
+                settings=Settings(),
+            )
+        except (ValueError, OSError) as exc:
+            parser.exit(2, f"Trajectory test failed: {exc}\n")
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "valid": valid},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise SystemExit(0 if valid else 2)
+    if args.command == "strategy-test":
+        if not args.input.is_absolute():
+            parser.error("--input must be an absolute path")
+        try:
+            run_dir, valid = run_strategy_test(
+                input_path=args.input,
+                settings=Settings(),
+            )
+        except (ValueError, OSError) as exc:
+            parser.exit(2, f"Strategy test failed: {exc}\n")
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "valid": valid},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise SystemExit(0 if valid else 2)
+    if args.command == "delivery-test":
+        if not args.input.is_absolute():
+            parser.error("--input must be an absolute path")
+        if args.disable_voice and args.synthesize_voice:
+            parser.error("--disable-voice and --synthesize-voice cannot be used together")
+        try:
+            run_dir, valid = run_delivery_test(
+                input_path=args.input,
+                settings=Settings(),
+                voice_enabled=not args.disable_voice,
+                synthesize_voice=args.synthesize_voice,
+            )
+        except (ValueError, OSError) as exc:
+            parser.exit(2, f"Delivery test failed: {exc}\n")
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "valid": valid},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise SystemExit(0 if valid else 2)

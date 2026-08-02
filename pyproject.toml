@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coregulation-realtime-poc"
+version = "0.1.0"
+description = "Technical feasibility prototype for real-time parent-child homework co-regulation state recognition."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "av>=14,<17",
+  "httpx>=0.28,<1",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "praat-parselmouth>=0.4.6,<0.5",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "PyYAML>=6.0,<7",
+  "websocket-client>=1.8,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+coregulation-poc = "coregulation_poc.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

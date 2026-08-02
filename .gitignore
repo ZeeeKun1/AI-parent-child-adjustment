@@ -1,0 +1,53 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*SecretKey*
+credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Research media and runtime data
+data/input/*
+data/output/*
+data/cache/*
+data/logs/*
+tests/fixtures/videos/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/cache/.gitkeep
+!data/logs/.gitkeep
+!tests/fixtures/videos/.gitkeep
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.pcm
+*.sqlite
+*.sqlite3
+
+# Local reports
+coverage.xml
+htmlcov/
+.coverage
+

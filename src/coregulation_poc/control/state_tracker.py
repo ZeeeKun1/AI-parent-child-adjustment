@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+from coregulation_poc.control.intervention_policy import (
+    DecisionRule,
+    InterventionPolicy,
+    StateActionRule,
+)
+from coregulation_poc.models import (
+    Actor,
+    ConfidenceLevel,
+    ControlObservation,
+    CoregulationState,
+    EvidenceSufficiency,
+    InterventionAction,
+    InterventionDecision,
+    InterventionDecisionReason,
+    RecoveryStatus,
+    StateTrajectoryPoint,
+    StateTrajectorySnapshot,
+)
+
+STATE_RANK = {
+    CoregulationState.NORMAL: 0,
+    CoregulationState.FLUCTUATION: 1,
+    CoregulationState.DYSREGULATION: 2,
+    CoregulationState.HIGH_RISK: 3,
+}
+
+
+class StateTrajectoryController:
+    """Convert module-one state assessments into research-grounded timing decisions."""
+
+    def __init__(self, policy: InterventionPolicy) -> None:
+        self.policy = policy
+        self._session_id: str | None = None
+        self._points: list[StateTrajectoryPoint] = []
+        self._decisions: list[InterventionDecision] = []
+        self._pending_intervention_state: CoregulationState | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    @property
+    def awaiting_post_intervention_response(self) -> bool:
+        return self._pending_intervention_state is not None
+
+    def ingest(self, observation: ControlObservation) -> InterventionDecision:
+        assessment = observation.assessment
+        self._validate_observation(observation)
+        previous_state = self._points[-1].state if self._points else None
+        sequence = len(self._points) + 1
+        point = StateTrajectoryPoint(
+            sequence=sequence,
+            assessed_at_ms=assessment.assessed_at_ms,
+            state=assessment.state,
+            confidence=assessment.confidence,
+            evidence_sufficiency=assessment.evidence_sufficiency,
+            interaction_performance=assessment.interaction_performance,
+        )
+        self._points.append(point)
+
+        recovery_status = self._recovery_status(observation)
+        if self.awaiting_post_intervention_response:
+            if not observation.post_intervention_response_observed:
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
+                    recovery_status=RecoveryStatus.PENDING,
+                )
+            self._pending_intervention_state = None
+
+        if (
+            assessment.evidence_sufficiency is EvidenceSufficiency.INSUFFICIENT
+            or assessment.state is None
+        ):
+            return self._record_guard_decision(
+                observation=observation,
+                previous_state=previous_state,
+                sequence=sequence,
+                reason=InterventionDecisionReason.INSUFFICIENT_EVIDENCE,
+                recovery_status=recovery_status,
+            )
+        if assessment.confidence is ConfidenceLevel.LOW:
+            return self._record_guard_decision(
+                observation=observation,
+                previous_state=previous_state,
+                sequence=sequence,
+                reason=InterventionDecisionReason.LOW_CONFIDENCE,
+                recovery_status=recovery_status,
+            )
+
+        rule = self.policy.state_actions[assessment.state]
+        if rule.history_required and not observation.interaction_history_available:
+            return self._record_guard_decision(
+                observation=observation,
+                previous_state=previous_state,
+                sequence=sequence,
+                reason=InterventionDecisionReason.HISTORY_REQUIRED,
+                recovery_status=recovery_status,
+            )
+        if rule.requires_natural_turn_boundary and not observation.natural_turn_boundary:
+            return self._record_guard_decision(
+                observation=observation,
+                previous_state=previous_state,
+                sequence=sequence,
+                reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                recovery_status=recovery_status,
+            )
+        return self._record_state_decision(
+            observation=observation,
+            previous_state=previous_state,
+            sequence=sequence,
+            rule=rule,
+            recovery_status=recovery_status,
+        )
+
+    def snapshot(self) -> StateTrajectorySnapshot:
+        if self._session_id is None:
+            raise ValueError("cannot create a trajectory snapshot before the first observation")
+        return StateTrajectorySnapshot(
+            session_id=self._session_id,
+            policy_version=self.policy.version,
+            points=list(self._points),
+            decisions=list(self._decisions),
+            awaiting_post_intervention_response=self.awaiting_post_intervention_response,
+        )
+
+    def _validate_observation(self, observation: ControlObservation) -> None:
+        assessment = observation.assessment
+        if self._session_id is None:
+            self._session_id = assessment.session_id
+        elif assessment.session_id != self._session_id:
+            raise ValueError("all trajectory observations must use the same session_id")
+        if self._points and assessment.assessed_at_ms < self._points[-1].assessed_at_ms:
+            raise ValueError("trajectory assessment timestamps must be non-decreasing")
+        if assessment.previous_state is not None:
+            if not observation.interaction_history_available:
+                raise ValueError("previous_state requires available interaction history")
+            if self._points and assessment.previous_state is not self._points[-1].state:
+                raise ValueError("assessment previous_state does not match the trajectory")
+
+    def _recovery_status(self, observation: ControlObservation) -> RecoveryStatus:
+        if self._pending_intervention_state is None:
+            return RecoveryStatus.NOT_APPLICABLE
+        if not observation.post_intervention_response_observed:
+            return RecoveryStatus.PENDING
+        current_state = observation.assessment.state
+        if current_state is None:
+            return RecoveryStatus.INDETERMINATE
+        previous_rank = STATE_RANK[self._pending_intervention_state]
+        current_rank = STATE_RANK[current_state]
+        if current_state is CoregulationState.NORMAL:
+            return RecoveryStatus.RECOVERED
+        if current_rank < previous_rank:
+            return RecoveryStatus.PARTIAL_RECOVERY
+        if current_rank == previous_rank:
+            return RecoveryStatus.NOT_RECOVERED
+        return RecoveryStatus.DETERIORATED
+
+    def _record_guard_decision(
+        self,
+        *,
+        observation: ControlObservation,
+        previous_state: CoregulationState | None,
+        sequence: int,
+        reason: InterventionDecisionReason,
+        recovery_status: RecoveryStatus,
+    ) -> InterventionDecision:
+        rule = self.policy.guard_actions[reason]
+        return self._record_decision(
+            observation=observation,
+            previous_state=previous_state,
+            sequence=sequence,
+            rule=rule,
+            recovery_status=recovery_status,
+        )
+
+    def _record_state_decision(
+        self,
+        *,
+        observation: ControlObservation,
+        previous_state: CoregulationState | None,
+        sequence: int,
+        rule: StateActionRule,
+        recovery_status: RecoveryStatus,
+    ) -> InterventionDecision:
+        decision = self._record_decision(
+            observation=observation,
+            previous_state=previous_state,
+            sequence=sequence,
+            rule=rule,
+            recovery_status=recovery_status,
+        )
+        if decision.action in {
+            InterventionAction.INTERVENE,
+            InterventionAction.PROGRESSIVE_SUPPORT,
+        }:
+            self._pending_intervention_state = decision.current_state
+        return decision
+
+    def _record_decision(
+        self,
+        *,
+        observation: ControlObservation,
+        previous_state: CoregulationState | None,
+        sequence: int,
+        rule: DecisionRule,
+        recovery_status: RecoveryStatus,
+    ) -> InterventionDecision:
+        assessment = observation.assessment
+        action_requires_strategy = rule.action in {
+            InterventionAction.INTERVENE,
+            InterventionAction.PROGRESSIVE_SUPPORT,
+        }
+        actors = self._evidence_actors(observation)
+        decision = InterventionDecision(
+            session_id=assessment.session_id,
+            sequence=sequence,
+            decided_at_ms=assessment.assessed_at_ms,
+            previous_state=previous_state,
+            current_state=assessment.state,
+            action=rule.action,
+            reason_code=rule.reason_code,
+            reason=rule.rationale,
+            natural_turn_boundary=observation.natural_turn_boundary,
+            intervention_permitted=action_requires_strategy,
+            strategy_selection_required=action_requires_strategy,
+            recovery_status=recovery_status,
+            evidence_actors=actors,
+            interaction_performance=assessment.interaction_performance,
+            research_basis=rule.research_basis,
+        )
+        self._decisions.append(decision)
+        return decision
+
+    @staticmethod
+    def _evidence_actors(observation: ControlObservation) -> list[Actor]:
+        actors = [item.actor for item in observation.assessment.modality_evidence.all_items]
+        return list(dict.fromkeys(actors)) or [Actor.UNKNOWN]

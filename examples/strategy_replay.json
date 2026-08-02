@@ -1,0 +1,79 @@
+{
+  "session_id": "strategy_example",
+  "observations": [
+    {
+      "assessment": {
+        "session_id": "strategy_example",
+        "assessed_at_ms": 1000,
+        "state": "normal",
+        "evidence_sufficiency": "sufficient",
+        "confidence": "high",
+        "interaction_performance": [
+          "normal task progression"
+        ],
+        "modality_evidence": {
+          "audio": {
+            "sufficiency": "sufficient",
+            "items": [
+              {
+                "modality": "audio",
+                "actor": "both",
+                "start_ms": 0,
+                "end_ms": 1000,
+                "code": "normal task progression",
+                "observation": "双方围绕当前题目正常交流。",
+                "quote": "我们先看第一步。"
+              }
+            ]
+          },
+          "video": {
+            "sufficiency": "insufficient",
+            "items": [],
+            "limitation_reason": "示例不提供视觉证据。"
+          }
+        },
+        "reason": "双方保持协调并继续推进任务。"
+      },
+      "natural_turn_boundary": false,
+      "post_intervention_response_observed": false,
+      "interaction_history_available": false
+    },
+    {
+      "assessment": {
+        "session_id": "strategy_example",
+        "assessed_at_ms": 2000,
+        "state": "dysregulation",
+        "evidence_sufficiency": "sufficient",
+        "confidence": "high",
+        "interaction_performance": [
+          "pace conflict"
+        ],
+        "modality_evidence": {
+          "audio": {
+            "sufficiency": "sufficient",
+            "items": [
+              {
+                "modality": "audio",
+                "actor": "parent",
+                "start_ms": 1200,
+                "end_ms": 2000,
+                "code": "pace conflict",
+                "observation": "家长连续提出多个问题，儿童没有获得完整回应空间。",
+                "quote": "快一点，这一步是什么，下一步呢？"
+              }
+            ]
+          },
+          "video": {
+            "sufficiency": "insufficient",
+            "items": [],
+            "limitation_reason": "示例不提供视觉证据。"
+          }
+        },
+        "reason": "持续的节奏冲突使双方无法自行恢复有效互动。"
+      },
+      "natural_turn_boundary": true,
+      "post_intervention_response_observed": false,
+      "interaction_history_available": true
+    }
+  ]
+}

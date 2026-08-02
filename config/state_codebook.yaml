@@ -1,0 +1,99 @@
+version: 2
+source: "Formative study: 63 WOZ intervention episodes and expert interviews"
+
+classification_principles:
+  boundary_basis: "Three-stage thematic analysis and formative study"
+  use_hard_time_or_count_thresholds: false
+  assess_whole_sequence: true
+  preserve_boundary_uncertainty: true
+  allow_alternative_state: true
+  guidance: >-
+    Classify dynamic interaction patterns from the observed trajectory rather than
+    from one isolated error, utterance, gesture, duration threshold, or event count.
+
+decision_dimensions:
+  coordination_disruption:
+    values: [none, mild, marked]
+  recovery_capacity:
+    values: [spontaneous, prompted_within_dyad, not_observed]
+  persistence:
+    values: [isolated, repeated, sustained]
+  task_engagement:
+    values: [maintained, variable, disengaged]
+  interaction_balance:
+    values: [balanced, temporarily_uneven, persistently_imbalanced]
+
+boundary_guidance:
+  normal_vs_fluctuation: >-
+    An isolated wrong answer followed by smooth, supportive correction can remain
+    normal. Fluctuation requires observable temporarily uneven coordination across
+    the sequence while the dyad still retains recovery capacity. When both remain
+    plausible, report confidence, alternative_state, and ambiguity_reason.
+
+intervention_policy:
+  classification_is_separate_from_action: true
+  no_intervention_states: [normal, fluctuation]
+  other_states_require_separate_intervention_policy: true
+
+states:
+  normal:
+    label: "Normal"
+    definition: >-
+      Both participants respond to one another, adjust their pace, and continue
+      effective interaction around the homework task.
+    interaction_performance:
+      - "normal task progression"
+      - "active child participation"
+      - "supportive parental guidance"
+    history_required: false
+
+  fluctuation:
+    label: "Fluctuation"
+    definition: >-
+      Coordination becomes temporarily uneven, but at least one participant
+      remains stable and the dyad retains the capacity to recover without intervention.
+    interaction_performance:
+      - "brief task stall"
+      - "child comprehension difficulty"
+      - "mild parental prompting"
+      - "temporarily insufficient instructional support"
+    history_required: false
+
+  dysregulation:
+    label: "Dysregulation"
+    definition: >-
+      The dyad cannot restore effective interaction on its own, and the child's
+      attention has clearly shifted away from the homework task.
+    interaction_performance:
+      - "sustained task stall"
+      - "pace conflict"
+      - "misaligned understanding"
+      - "escalating negative interaction"
+    history_required: false
+
+  high_risk:
+    label: "High risk"
+    definition: >-
+      The dyad shows a persistent controlling-dependent pattern or sustained,
+      intense task resistance that short-term support is unlikely to change.
+    interaction_performance:
+      - "persistent interaction imbalance"
+      - "parental over-helping or task takeover"
+      - "child passive dependence"
+      - "sustained strong resistance or withdrawal"
+    history_required: true
+
+evidence_policy:
+  require_timestamp: true
+  require_observable_source: true
+  allow_insufficient_evidence: true
+  assess_modalities_independently: true
+  require_both_modalities: false
+  audio_quote_required: true
+  video_direct_observation_required: true
+  insufficient_modality_must_be_reported: true
+  unknown_actor_allowed_when_speaker_binding_is_unavailable: true
+  prohibited_inferences:
+    - "diagnosis from a single behavior"
+    - "emotion labels without observable support"
+    - "high-risk classification from one isolated turn"

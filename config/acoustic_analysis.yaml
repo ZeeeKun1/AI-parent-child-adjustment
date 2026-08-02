@@ -1,0 +1,23 @@
+version: 1
+source: "Formative study: experts use speech rate, loudness, language content, expressions, actions, attention direction, task progression, and overall atmosphere together"
+
+extractor:
+  name: "praat_parselmouth"
+  pitch_floor_hz: 50.0
+  pitch_ceiling_hz: 800.0
+  analysis_time_step_seconds: 0.01
+  intensity_minimum_pitch_hz: 50.0
+
+interpretation_policy:
+  role: "supporting_measurement_only"
+  single_feature_must_not_trigger_state: true
+  raw_pitch_must_not_be_interpreted_as_emotion: true
+  raw_intensity_must_not_be_interpreted_as_emotion: true
+  within_speaker_change_required_for_behavioral_interpretation: true
+  preserve_measurement_when_interpretation_is_limited: true
+
+current_runtime_limits:
+  - "The replay audio is a mixed mono channel until frontend voiceprint binding is connected."
+  - "Absolute intensity is affected by microphone gain, distance, and room acoustics."
+  - "Speech rate requires time-aligned text and speaker segments and is therefore not estimated from the whole mixed clip."
+  - "Acoustic measurements support, but never replace, semantic, visual, temporal, and task-progression evidence."

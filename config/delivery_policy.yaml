@@ -1,0 +1,44 @@
+version: 2
+source:
+  - "形成性研究与WOZ实验：专家在亲子互动过程中采用语音实施干预"
+  - "三阶段主题分析3.0：干预内容需区分家长、儿童与双方对象"
+  - "研究团队设计决定（2026-08-02）：醒目文字提示与语音同步输出"
+  - "实时亲子指导相关研究：语音能够提供即时支持，但需控制打断与误报风险"
+
+principles:
+  require_authorized_intervention_plan: true
+  visual_and_voice_are_primary_modalities: true
+  identical_core_message_across_modalities: true
+  preserve_target_actor_from_strategy: true
+  do_not_repeat_before_observed_response: true
+  record_channels_separately: true
+  never_infer_seen_or_heard_from_successful_output: true
+
+visual:
+  headings_by_target:
+    parent: "互动支持提示"
+    child: "互动支持提示"
+    both: "共同互动提示"
+  prominence: "high"
+  placement: "prominent_overlay"
+  blocks_primary_task: false
+  dismissible: true
+
+voice:
+  provider: "alibaba_qwen_realtime_tts"
+  model: "qwen3-tts-instruct-flash-realtime-2026-01-22"
+  voice: "Maia"
+  language: "zh-CN"
+  language_type: "chinese"
+  response_format: "pcm"
+  sample_rate_hz: 24000
+  mode: "commit"
+  instructions: "请使用冷静、中性、支持性的成年女性声音，以自然且不催促的节奏清晰表达；不要夸张，不使用责备或命令式语气。"
+  optimize_instructions: false
+  autoplay: true
+  style: "calm_neutral_supportive"
+
+fallback:
+  hold_all_output_when_interventions_paused: true
+  preserve_visual_when_voice_unavailable: true
+  record_voice_failure_without_claiming_message_was_heard: true
