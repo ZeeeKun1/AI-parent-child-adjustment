@@ -5,6 +5,8 @@ import asyncio
 import json
 from pathlib import Path
 
+from coregulation_poc.capture.devices import list_windows_media_devices
+from coregulation_poc.capture.media import MediaFormat, MediaSourceError
 from coregulation_poc.codebook import load_state_codebook
 from coregulation_poc.connection_check import check_realtime_connection
 from coregulation_poc.control import load_intervention_policy
@@ -12,6 +14,7 @@ from coregulation_poc.delivery import load_delivery_policy
 from coregulation_poc.delivery_test import run_delivery_test
 from coregulation_poc.diagnostics import run_all_diagnostics
 from coregulation_poc.intervention import load_strategy_library
+from coregulation_poc.live_test import run_live_test
 from coregulation_poc.paths import (
     DELIVERY_POLICY_PATH,
     INTERVENTION_POLICY_PATH,
@@ -57,6 +60,10 @@ def doctor() -> int:
         "api_key_configured": settings.dashscope_api_key is not None,
         "workspace_configured": settings.aliyun_workspace_id is not None,
         "realtime_endpoint_configured": settings.realtime_endpoint is not None,
+        "live_capture_backend": "windows_directshow",
+        "live_capture_command": "live-test --dry-run",
+        "live_capture_api_called": False,
+        "live_capture_raw_media_saved": False,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
@@ -73,6 +80,27 @@ def main() -> None:
     video_parser.add_argument("--video", type=Path, required=True)
     video_parser.add_argument("--session-id", required=True)
     video_parser.add_argument("--dry-run", action="store_true")
+    live_parser = subparsers.add_parser(
+        "live-test",
+        help="Capture a short camera and microphone session without calling an API",
+    )
+    live_parser.add_argument("--list-devices", action="store_true")
+    camera_selector = live_parser.add_mutually_exclusive_group()
+    camera_selector.add_argument("--camera-index", type=int)
+    camera_selector.add_argument("--camera-name")
+    microphone_selector = live_parser.add_mutually_exclusive_group()
+    microphone_selector.add_argument("--microphone-index", type=int)
+    microphone_selector.add_argument("--microphone-name")
+    live_parser.add_argument("--session-id", default="live_dry_run")
+    live_parser.add_argument("--duration-seconds", type=float, default=10.0)
+    live_parser.add_argument("--dry-run", action="store_true")
+    live_parser.add_argument("--audio-chunk-ms", type=int, default=100)
+    live_parser.add_argument("--image-interval-ms", type=int, default=1000)
+    live_parser.add_argument("--max-audio-queue-chunks", type=int, default=100)
+    live_parser.add_argument("--max-image-queue-chunks", type=int, default=10)
+    live_parser.add_argument("--camera-width", type=int)
+    live_parser.add_argument("--camera-height", type=int)
+    live_parser.add_argument("--camera-fps", type=int)
     trajectory_parser = subparsers.add_parser(
         "trajectory-test",
         help="Replay module-one assessments through the intervention controller",
@@ -132,6 +160,48 @@ def main() -> None:
         except (ValueError, OSError) as exc:
             parser.exit(2, f"Video test failed: {exc}\n")
         print(json.dumps({"run_dir": str(run_dir), "valid": valid}, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if valid else 2)
+    if args.command == "live-test":
+        try:
+            if args.list_devices:
+                inventory = list_windows_media_devices()
+                print(json.dumps(inventory.as_public_dict(), ensure_ascii=False, indent=2))
+                raise SystemExit(0)
+            if not args.dry_run:
+                parser.error("live-test currently requires --dry-run; it does not call a paid API")
+            if args.camera_index is None and args.camera_name is None:
+                parser.error("select a camera with --camera-index or --camera-name")
+            if args.microphone_index is None and args.microphone_name is None:
+                parser.error("select a microphone with --microphone-index or --microphone-name")
+            if (args.camera_width is None) != (args.camera_height is None):
+                parser.error("--camera-width and --camera-height must be provided together")
+            run_dir, valid = run_live_test(
+                session_id=args.session_id,
+                settings=Settings(),
+                duration_seconds=args.duration_seconds,
+                camera_index=args.camera_index,
+                camera_name=args.camera_name,
+                microphone_index=args.microphone_index,
+                microphone_name=args.microphone_name,
+                media_format=MediaFormat(
+                    audio_chunk_ms=args.audio_chunk_ms,
+                    image_interval_ms=args.image_interval_ms,
+                ),
+                max_audio_queue_chunks=args.max_audio_queue_chunks,
+                max_image_queue_chunks=args.max_image_queue_chunks,
+                requested_camera_width=args.camera_width,
+                requested_camera_height=args.camera_height,
+                requested_camera_fps=args.camera_fps,
+            )
+        except (MediaSourceError, ValueError, OSError) as exc:
+            parser.exit(2, f"Live test failed: {exc}\n")
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "valid": valid},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         raise SystemExit(0 if valid else 2)
     if args.command == "trajectory-test":
         if not args.input.is_absolute():

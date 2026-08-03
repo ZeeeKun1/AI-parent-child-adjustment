@@ -1,27 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
+from threading import Event
 
 import av
-import cv2
+
+from coregulation_poc.capture.imaging import encode_timestamped_jpeg
+from coregulation_poc.capture.media import (
+    MediaChunk,
+    MediaFormat,
+    MediaKind,
+    MediaSourceDescription,
+)
 
 
 class VideoValidationError(ValueError):
     """Raised when a clip cannot support the intended audio-video test."""
-
-
-class MediaKind(StrEnum):
-    AUDIO = "audio"
-    IMAGE = "image"
-
-
-@dataclass(frozen=True, slots=True)
-class MediaChunk:
-    kind: MediaKind
-    timestamp_ms: int
-    payload: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +42,35 @@ class ReplayMedia:
     audio_chunk_ms: int
     image_interval_ms: int
     image_timestamp_labels: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayMediaSource:
+    """Expose decoded local-video chunks through the common media-source contract."""
+
+    media: ReplayMedia
+
+    @property
+    def description(self) -> MediaSourceDescription:
+        return MediaSourceDescription(
+            source_type="local_video_replay",
+            source_id=self.media.metadata.path.name,
+            media_format=MediaFormat(
+                audio_sample_rate=self.media.audio_sample_rate,
+                audio_chunk_ms=self.media.audio_chunk_ms,
+                image_interval_ms=self.media.image_interval_ms,
+                image_timestamp_labels=self.media.image_timestamp_labels,
+            ),
+        )
+
+    def iter_chunks(self, stop_event: Event) -> Iterator[MediaChunk]:
+        for chunk in self.media.chunks:
+            if stop_event.is_set():
+                return
+            yield chunk
+
+    def close(self) -> None:
+        return None
 
 
 def _frame_timestamp_ms(frame: av.AudioFrame | av.VideoFrame) -> int:
@@ -84,55 +109,6 @@ def inspect_video(path: Path) -> VideoMetadata:
             )
     except (av.FFmpegError, OSError) as exc:
         raise VideoValidationError(f"Cannot open video: {exc}") from exc
-
-
-def _resize_for_api(image: object, *, max_width: int = 1280, max_height: int = 720) -> object:
-    height, width = image.shape[:2]
-    scale = min(1.0, max_width / width, max_height / height)
-    if scale == 1.0:
-        return image
-    return cv2.resize(
-        image,
-        (round(width * scale), round(height * scale)),
-        interpolation=cv2.INTER_AREA,
-    )
-
-
-def _add_frame_timestamp_label(image: object, timestamp_ms: int) -> object:
-    """Add a non-overlapping timestamp strip so visual evidence can cite an exact frame."""
-    strip_height = 40
-    annotated = cv2.copyMakeBorder(
-        image,
-        strip_height,
-        0,
-        0,
-        0,
-        cv2.BORDER_CONSTANT,
-        value=(0, 0, 0),
-    )
-    cv2.putText(
-        annotated,
-        f"frame_time_ms={timestamp_ms}",
-        (12, 27),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    return annotated
-
-
-def _encode_jpeg(image: object, *, max_bytes: int, timestamp_ms: int) -> bytes:
-    candidate = _resize_for_api(image, max_height=680)
-    candidate = _add_frame_timestamp_label(candidate, timestamp_ms)
-    for quality in (85, 78, 70, 62, 54, 46):
-        ok, encoded = cv2.imencode(".jpg", candidate, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if ok and encoded.nbytes <= max_bytes:
-            return encoded.tobytes()
-    raise VideoValidationError(
-        f"A sampled frame still exceeds {max_bytes} bytes after compression."
-    )
 
 
 def decode_video_for_replay(
@@ -176,7 +152,7 @@ def decode_video_for_replay(
                     elif isinstance(frame, av.VideoFrame):
                         timestamp_ms = _frame_timestamp_ms(frame)
                         if timestamp_ms >= next_image_ms:
-                            jpeg = _encode_jpeg(
+                            jpeg = encode_timestamped_jpeg(
                                 frame.to_ndarray(format="bgr24"),
                                 max_bytes=max_image_bytes,
                                 timestamp_ms=timestamp_ms,

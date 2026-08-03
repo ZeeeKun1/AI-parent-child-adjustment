@@ -4,6 +4,29 @@
 
 当前仓库只包含独立、可迁移的技术验证骨架，不包含正式前端UI，也不会将参与者音视频或API密钥纳入版本控制。
 
+当前实时开发分支已经加入Windows摄像头与麦克风采集基础层。它通过DirectShow明确枚举和选择设备，将音频转换为16 kHz单声道PCM16、约100 ms一块，将视频压缩为最大1280×720且带时间标签的JPEG，并用有界队列记录视频丢帧和音频背压。首个`live-test --dry-run`只验证设备、格式、同步、队列和释放，不调用API，也不保存原始音视频。
+
+## 实时摄像头与麦克风采集测试
+
+先列出Windows可以访问的设备：
+
+```powershell
+python -m coregulation_poc live-test --list-devices
+```
+
+从列表中明确选择一个摄像头和麦克风，进行10秒采集：
+
+```powershell
+python -m coregulation_poc live-test `
+  --camera-index 0 `
+  --microphone-index 0 `
+  --duration-seconds 10 `
+  --session-id P01_live_device_check `
+  --dry-run
+```
+
+每次运行只在`data/output/runs/<run_id>/`保存`manifest.json`、`events.jsonl`、`metrics.json`和`result.json`。这些文件包含非敏感设备信息、采集参数、时间戳、块大小、队列深度、丢帧数和错误，不包含PCM、JPEG、Base64负载或可回放媒体。参数均为可配置工程初值，不代表形成性研究阈值。详细说明见[实时采集说明](docs/live-capture.md)。
+
 ## 单个视频测试
 
 先复制并填写`.env`中的`DASHSCOPE_API_KEY`和`ALIYUN_WORKSPACE_ID`。视频应放在被 Git 忽略的`data/input/`中，详细要求见[视频片段准备规范](docs/video-preparation.md)。

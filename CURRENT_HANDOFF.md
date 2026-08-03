@@ -4,7 +4,7 @@
 
 ## 0. 新对话必须先做什么
 
-请完整读取本文件，然后直接继续“第 11 节：Required next action”。新对话的主要任务是把当前的“本地上传视频测试版”扩展为正式实验可使用的“摄像头与麦克风实时输入版”。
+请完整读取本文件，然后直接继续“第 11 节：Required next action”。实时摄像头与麦克风采集基础层已经完成，不要重新实现；下一任务是先在具备真实摄像头和麦克风的实验电脑上通过短时干运行，再把同一种媒体块接入现有Qwen Provider。
 
 不要重新设计已经完成的四个业务模块，也不要因为追求形式上的完美而逐项扩张需求。所有系统设计必须以本项目的形成性研究、三阶段主题分析、63 个 WOZ 干预片段和专家访谈结果为最高准则；工程参数若没有研究证据，只能标记为可配置的技术参数，不能伪装成研究结论。
 
@@ -15,7 +15,7 @@
 本地项目根目录：
 
 ```text
-H:\Doctor Work\AI 亲子陪伴调节\访谈\二阶段主题分析\coregulation-realtime-poc
+H:\Doctor Work\AI 亲子陪伴调节\访谈\三阶段主题分析\coregulation-realtime-live
 ```
 
 GitHub：
@@ -38,13 +38,13 @@ prototype/local-video-poc
 
 该分支明确对应“用户上传本地视频，再按真实时间回放给模型”的技术验证版本，不是正式实验的实时摄像头版本。远程 `main` 没有被修改。
 
-实时版本开始编码前，建议从 `prototype/local-video-poc` 创建新分支：
+实时采集版本已经在独立工作区和以下分支开发：
 
 ```text
 feature/realtime-camera-pipeline
 ```
 
-不要在 `main` 上直接开发，也不要覆盖或删除 `prototype/local-video-poc`。
+不要在 `main` 上直接开发，也不要覆盖或删除原目录中的 `prototype/local-video-poc`。
 
 ## 2. 当前系统已经完成什么
 
@@ -153,17 +153,25 @@ audio_duration_ms: 4720
 
 本地运行目录均在 `data/output/`，已被 Git 忽略，不要上传研究媒体或运行音频。
 
+实时采集基础层本地检查：
+
+```text
+ruff: all checks passed
+pytest: 66 passed
+```
+
+合成摄像头/麦克风源已经验证统一媒体接口、PCM/JPEG格式、有界队列、严格时间戳、停止释放和不保存原始媒体。当前开发电脑的DirectShow枚举可发现一个OBS虚拟摄像头，但没有可访问的麦克风，因此尚未在该电脑上执行真实双设备短时采集；这属于硬件前置条件，不应通过伪造麦克风绕过。
+
 ## 4. 当前版本与实时实验版本的关键差距
 
-当前 `video-test` 会先完整解码一个本地文件，然后按照原始时间戳回放给模型。它证明了模型、提示词、四状态结构、证据审计和后续模块能够运行，但还缺少正式实验需要的以下实时能力：
+当前 `video-test` 仍保留本地文件真实推理路径；新增的 `live-test --dry-run` 已经完成摄像头/麦克风持续采集、设备枚举与选择、设备错误、有界缓冲、背压、严格时间戳、停止释放和元数据审计。正式实验仍缺少：
 
-1. 从摄像头和麦克风持续采集，而不是读取上传文件。
-2. 设备发现、设备选择、权限错误和中途断开处理。
-3. 有界缓冲与背压，避免长时实验无限占用内存。
-4. 持续或滚动地生成模块一评估，而不是每段视频只返回一次。
-5. 将连续评估实时送入模块二、模块三和模块四。
-6. 将文字提示和 Maia 音频发送到正式实验前端，并接收真实执行回执。
-7. 在前端开始阶段让家长和孩子分别确认音频身份，并通过声纹分段绑定说话者。
+1. 在具备真实摄像头和麦克风的实验电脑上完成短时双设备采集验收。
+2. 将实时媒体块接入Qwen Provider，完成一次短时真实摄像头推理。
+3. 持续或滚动地生成模块一评估，而不是每段视频只返回一次。
+4. 将连续评估实时送入模块二、模块三和模块四。
+5. 将文字提示和 Maia 音频发送到正式实验前端，并接收真实执行回执。
+6. 在前端开始阶段让家长和孩子分别确认音频身份，并通过声纹分段绑定说话者。
 
 ## 5. 实时版本应采用的总体数据流
 
@@ -257,6 +265,17 @@ python -m coregulation_poc doctor
 python -m ruff check src tests scripts
 python -m pytest
 
+# 列出Windows摄像头和麦克风
+python -m coregulation_poc live-test --list-devices
+
+# 不调用API的短时真实设备采集
+python -m coregulation_poc live-test `
+  --camera-index 0 `
+  --microphone-index 0 `
+  --duration-seconds 10 `
+  --session-id P01_live_device_check `
+  --dry-run
+
 # 本地视频真实推理
 python -m coregulation_poc video-test `
   --video "H:\absolute\path\to\clip.mp4" `
@@ -272,30 +291,18 @@ python -m coregulation_poc delivery-test `
   --synthesize-voice
 ```
 
-实时摄像头命令尚未实现。建议新增：
-
-```text
-python -m coregulation_poc live-test --camera-index ... --microphone-index ...
-```
-
-参数名称可在实现时根据 Windows 设备枚举方式调整，但不要把机器专属设备名称硬编码进仓库。
+`live-test`当前有意只支持`--dry-run`，不会调用付费API。设备名称没有硬编码；必须从本机枚举结果中明确选择。
 
 ## 11. Required next action
 
 新对话应直接执行以下任务：
 
-1. 检查工作区与 Git 状态，以 `prototype/local-video-poc` 为基线创建 `feature/realtime-camera-pipeline`。
-2. 先实现实时采集基础层，不先做正式 UI：
-   - 定义可复用的媒体源接口，使本地视频源和实时设备源可以输出同一种带时间戳媒体块；
-   - 增加 Windows 摄像头与麦克风设备枚举和明确选择；
-   - 实现有界音频/视频队列、单调时间戳、停止信号和设备错误；
-   - 新增 `live-test` 的短时 `--dry-run`，只验证采集、同步、格式、队列和指标，不调用付费 API；
-   - 默认不保存原始音视频。
-3. 为实时采集层编写可使用假设备/合成媒体源运行的测试，避免 CI 依赖真实摄像头。
-4. 本地采集验证通过后，再把同一媒体块接口接入现有 Qwen Provider，完成一次短时真实摄像头推理。
-5. 之后才实现持续评估调度、模块二至四在线串联、前端双通道呈现和声纹绑定。
+1. 在具备真实摄像头和麦克风的Windows实验电脑上运行`live-test --list-devices`，明确选择两个设备。
+2. 运行至少一个可配置的短时`live-test --dry-run`，核对`manifest.json`、`metrics.json`和`result.json`，确认双模态数量、严格时间戳、丢帧、背压和设备释放均符合预期。
+3. 若真实设备验收通过，将`MediaCaptureSession`输出的同一种`MediaChunk`接入现有Qwen Provider，完成一次短时实时推理；继续默认不保存原始媒体。
+4. 真实推理通过后，再实现滚动评估调度、模块二至四在线串联、前端双通道呈现和声纹绑定。
 
-首个里程碑的验收标准：
+已实现、待真实双设备最终验收的首个里程碑标准：
 
 - 能列出并明确选择摄像头与麦克风；
 - 能连续采集至少一个可配置短时会话；

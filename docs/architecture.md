@@ -25,6 +25,17 @@ All filesystem access uses absolute `pathlib.Path` values generated from the rep
 
 Raw audio/image Base64 payloads and API credentials are intentionally excluded from run artifacts.
 
+## Live device capture path
+
+1. `capture/devices.py` uses FFmpeg DirectShow discovery to list Windows cameras and microphones, and requires an explicit device index or exact name.
+2. `capture/directshow.py` opens both selected endpoints in one DirectShow graph, resamples audio to 16 kHz mono PCM16, samples timestamp-labelled JPEG frames and places both modalities on one strictly increasing monotonic timeline.
+3. `capture/media.py` defines the common `MediaSource` and `MediaChunk` contract used by both decoded local video and live devices. It also reserves a speaker-segment contract without pretending that speaker binding is already implemented.
+4. `capture/buffer.py` bounds memory use. Audio backpressure stops with a diagnostic error instead of silently losing speech; video overload drops the oldest frame and records the count.
+5. `capture/session.py` owns one producer thread, stop signal and device close lifecycle.
+6. `live_test.py` validates a short capture without calling an API and writes only a manifest, payload-free event summaries, metrics and a result.
+
+After real-device dry-run validation, the same media chunks can be forwarded to the existing realtime provider without changing the four-state codebook or downstream intervention modules.
+
 ## Continuous trajectory control path
 
 1. Module one supplies consecutive schema-valid `StateAssessment` objects.
