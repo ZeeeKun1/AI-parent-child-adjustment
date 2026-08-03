@@ -4,7 +4,7 @@
 
 ## 0. 新对话必须先做什么
 
-请完整读取本文件，然后直接继续“第 11 节：Required next action”。实时摄像头与麦克风采集基础层已经完成，不要重新实现；下一任务是先在具备真实摄像头和麦克风的实验电脑上通过短时干运行，再把同一种媒体块接入现有Qwen Provider。
+请完整读取本文件，然后直接继续“第 11 节：Required next action”。Windows DirectShow 与浏览器到服务器的摄像头/麦克风采集基础层都已经完成，不要重新实现；下一任务是先在真实浏览器和双设备上通过短时干运行，再把浏览器产生的同一种媒体块接入现有Qwen Provider。
 
 不要重新设计已经完成的四个业务模块，也不要因为追求形式上的完美而逐项扩张需求。所有系统设计必须以本项目的形成性研究、三阶段主题分析、63 个 WOZ 干预片段和专家访谈结果为最高准则；工程参数若没有研究证据，只能标记为可配置的技术参数，不能伪装成研究结论。
 
@@ -45,6 +45,14 @@ feature/realtime-camera-pipeline
 ```
 
 不要在 `main` 上直接开发，也不要覆盖或删除原目录中的 `prototype/local-video-poc`。
+
+该分支已经推送的浏览器开发前基线提交：
+
+```text
+45584d1 Add realtime camera and microphone capture
+```
+
+浏览器服务器采集改动目前只在本地工作区，尚未提交或推送；验证完整后再形成独立提交。
 
 ## 2. 当前系统已经完成什么
 
@@ -127,6 +135,27 @@ src/coregulation_poc/providers/qwen_tts_realtime.py
 src/coregulation_poc/delivery_test.py
 ```
 
+### 浏览器到服务器采集
+
+- 参与者浏览器通过`getUserMedia`明确申请摄像头和麦克风权限。
+- AudioWorklet连续输出16 kHz、单声道、PCM16、约100 ms音频块。
+- Canvas约每秒生成一张最大1280×720且带`frame_time_ms`的JPEG。
+- 同源WebSocket把音视频转换为与本地回放、DirectShow一致的`MediaChunk`。
+- 服务端校验协议、音频长度、JPEG、尺寸、会话时长和严格递增时间戳。
+- 非本机监听必须配置不少于12字符的实验访问码；访问码、设备标识和远程IP不写入运行记录。
+- 当前浏览器服务是采集干运行，不调用Qwen、不生成状态与干预，也不保存原始音视频。
+
+关键文件：
+
+```text
+src/coregulation_poc/web/app.py
+src/coregulation_poc/web/protocol.py
+src/coregulation_poc/web/static/
+docs/browser-deployment.md
+tests/unit/test_browser_app.py
+tests/unit/test_browser_protocol.py
+```
+
 ## 3. 已验证状态
 
 本地完整检查：
@@ -162,25 +191,37 @@ pytest: 66 passed
 
 合成摄像头/麦克风源已经验证统一媒体接口、PCM/JPEG格式、有界队列、严格时间戳、停止释放和不保存原始媒体。当前开发电脑的DirectShow枚举可发现一个OBS虚拟摄像头，但没有可访问的麦克风，因此尚未在该电脑上执行真实双设备短时采集；这属于硬件前置条件，不应通过伪造麦克风绕过。
 
+浏览器服务器采集本地检查：
+
+```text
+ruff: all checks passed
+pytest: 75 passed
+HTTP health check: passed
+browser WebSocket synthetic audio/JPEG session: passed
+```
+
+自动测试已经覆盖页面、健康检查、访问码、正常停止、中途断线、双模态格式、统一`MediaChunk`和不保存原始媒体。应用内浏览器与本机`127.0.0.1`网络隔离，无法代替真实浏览器设备验收；必须在实验电脑的Chrome/Edge中完成权限与真实双设备检查。
+
 ## 4. 当前版本与实时实验版本的关键差距
 
-当前 `video-test` 仍保留本地文件真实推理路径；新增的 `live-test --dry-run` 已经完成摄像头/麦克风持续采集、设备枚举与选择、设备错误、有界缓冲、背压、严格时间戳、停止释放和元数据审计。正式实验仍缺少：
+当前 `video-test` 仍保留本地文件真实推理路径；`live-test --dry-run`已经完成Windows设备采集；`web-live`已经完成参与者浏览器到服务器的实时采集和元数据审计。正式实验仍缺少：
 
-1. 在具备真实摄像头和麦克风的实验电脑上完成短时双设备采集验收。
-2. 将实时媒体块接入Qwen Provider，完成一次短时真实摄像头推理。
-3. 持续或滚动地生成模块一评估，而不是每段视频只返回一次。
-4. 将连续评估实时送入模块二、模块三和模块四。
-5. 将文字提示和 Maia 音频发送到正式实验前端，并接收真实执行回执。
-6. 在前端开始阶段让家长和孩子分别确认音频身份，并通过声纹分段绑定说话者。
+1. 在真实实验电脑的Chrome/Edge中完成浏览器权限、摄像头、麦克风和短时双设备采集验收。
+2. 在测试服务器完成HTTPS/WSS反向代理与逐参与者邀请机制。
+3. 将浏览器实时媒体块接入Qwen Provider，完成一次短时真实摄像头推理。
+4. 持续或滚动地生成模块一评估，而不是每段视频只返回一次。
+5. 将连续评估实时送入模块二、模块三和模块四。
+6. 将文字提示和 Maia 音频发送到正式实验前端，并接收真实执行回执。
+7. 在前端开始阶段让家长和孩子分别确认音频身份，并通过声纹分段绑定说话者。
 
 ## 5. 实时版本应采用的总体数据流
 
 ```text
-摄像头 + 麦克风
+参与者浏览器：摄像头 + 麦克风
         ↓
-统一单调时钟与时间戳
+AudioWorklet + Canvas + 同源WSS
         ↓
-有界音频/视频队列
+服务器统一MediaChunk与严格时间戳
         ↓
 Qwen-Omni-Realtime 持续会话
         ↓
@@ -249,7 +290,7 @@ Qwen-Omni-Realtime 持续会话
 
 ## 9. 安全、隐私与 Git 约束
 
-- `.env` 中已配置北京地域的 API Key、Workspace ID 和模型设置。禁止打印、复制、提交或写入日志。
+- 新工作区当前没有复制原目录中被Git忽略的`.env`；接入Qwen前需在本目录单独配置北京地域的API Key、Workspace ID和模型设置。禁止打印、复制、提交或写入日志。
 - `.env`、`data/input/`、`data/output/`、音视频文件、缓存和虚拟环境已被 `.gitignore` 排除。
 - Base64 音频和图像负载不进入审计文件。
 - 新增实时采集后，默认只保存结构化事件、参数、哈希、延迟与错误，不保存原始家庭音视频。
@@ -276,6 +317,11 @@ python -m coregulation_poc live-test `
   --session-id P01_live_device_check `
   --dry-run
 
+# 浏览器到服务器采集（本机测试）
+python -m coregulation_poc web-live `
+  --host 127.0.0.1 `
+  --port 8000
+
 # 本地视频真实推理
 python -m coregulation_poc video-test `
   --video "H:\absolute\path\to\clip.mp4" `
@@ -291,18 +337,19 @@ python -m coregulation_poc delivery-test `
   --synthesize-voice
 ```
 
-`live-test`当前有意只支持`--dry-run`，不会调用付费API。设备名称没有硬编码；必须从本机枚举结果中明确选择。
+`live-test`和`web-live`当前都有意只做采集验证，不调用付费API。DirectShow设备名称没有硬编码；必须从本机枚举结果中明确选择。服务器非本机监听必须在`.env`配置`BROWSER_CAPTURE_ACCESS_TOKEN`，并通过HTTPS/WSS对外提供服务。
 
 ## 11. Required next action
 
 新对话应直接执行以下任务：
 
-1. 在具备真实摄像头和麦克风的Windows实验电脑上运行`live-test --list-devices`，明确选择两个设备。
-2. 运行至少一个可配置的短时`live-test --dry-run`，核对`manifest.json`、`metrics.json`和`result.json`，确认双模态数量、严格时间戳、丢帧、背压和设备释放均符合预期。
-3. 若真实设备验收通过，将`MediaCaptureSession`输出的同一种`MediaChunk`接入现有Qwen Provider，完成一次短时实时推理；继续默认不保存原始媒体。
-4. 真实推理通过后，再实现滚动评估调度、模块二至四在线串联、前端双通道呈现和声纹绑定。
+1. 在具备真实摄像头和麦克风的实验电脑上启动`web-live`，使用Chrome/Edge打开页面并完成短时采集。
+2. 核对`manifest.json`、`metrics.json`和`result.json`，确认双模态数量、严格时间戳、客户端丢帧、音频背压和正常停止均符合预期。
+3. 在测试服务器配置实验访问码和HTTPS/WSS反向代理，重复一次短时远程采集，并验证拒绝无效访问码和跨站连接。
+4. 若真实浏览器验收通过，将浏览器WebSocket会话中的同一种`MediaChunk`接入现有Qwen Provider，完成一次短时实时推理；继续默认不保存原始媒体。
+5. 真实推理通过后，再实现滚动评估调度、模块二至四在线串联、前端双通道呈现和声纹绑定。
 
-已实现、待真实双设备最终验收的首个里程碑标准：
+已实现、待真实浏览器双设备最终验收的首个里程碑标准：
 
 - 能列出并明确选择摄像头与麦克风；
 - 能连续采集至少一个可配置短时会话；
@@ -313,6 +360,8 @@ python -m coregulation_poc delivery-test `
 - 运行清单记录设备标识的非敏感部分、采集参数、块数量、丢帧数量和延迟；
 - 默认不生成原始音视频文件；
 - 不修改四状态代码本、干预政策、策略卡或固定 Maia 输出规则。
+- 参与者只需打开网页并在明确授权后开始采集；服务器不尝试直接读取参与者硬件。
+- 非本机监听要求实验访问码，正式公网访问要求HTTPS/WSS。
 
 ## 12. 后续而非首个任务
 
@@ -325,4 +374,4 @@ python -m coregulation_poc delivery-test `
 - 摄像头角度、遮挡、远场拾音和多人重叠语音实验；
 - CHI 稿件所需的用户实验、消融实验和统计分析。
 
-当前最重要的下一步只有一个：在不改变已有科学逻辑的前提下，把经过验证的本地视频媒体接口替换/扩展为可靠的实时摄像头与麦克风媒体接口。
+当前最重要的下一步只有一个：在真实实验电脑和Chrome/Edge中验收已经实现的浏览器摄像头与麦克风采集，再把同一种`MediaChunk`接入Qwen实时会话。

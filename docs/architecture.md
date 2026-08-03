@@ -36,6 +36,17 @@ Raw audio/image Base64 payloads and API credentials are intentionally excluded f
 
 After real-device dry-run validation, the same media chunks can be forwarded to the existing realtime provider without changing the four-state codebook or downstream intervention modules.
 
+## Browser-to-server capture path
+
+1. `web/static/index.html` presents explicit capture controls, a local camera preview, an experiment access-code field and metadata-only privacy notice.
+2. `web/static/audio-worklet.js` continuously resamples the browser microphone to 16 kHz mono PCM16 in approximately 100 ms chunks. `web/static/app.js` samples timestamp-labelled JPEG frames at approximately 1 fps.
+3. The browser sends a small binary protocol over a same-origin WebSocket. Audio backpressure stops explicitly; image overload skips frames and reports the count.
+4. `web/protocol.py` validates payload type, size, JPEG dimensions and timestamps, then emits the same `MediaChunk` used by local replay and DirectShow capture.
+5. `web/app.py` enforces session identifiers, optional experiment access codes, same-origin WebSockets and a maximum session duration. Non-local CLI binding requires an access code.
+6. Browser capture run artifacts contain metadata and metrics only. They exclude PCM, JPEG, device identifiers, remote IPs, access codes and API secrets.
+
+The current browser server is a capture dry-run. Its per-session chunk hook is the boundary for the next Qwen integration; it does not yet generate state assessments or interventions.
+
 ## Continuous trajectory control path
 
 1. Module one supplies consecutive schema-valid `StateAssessment` objects.

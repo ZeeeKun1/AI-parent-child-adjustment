@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     tts_realtime_base_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
     connection_timeout_seconds: int = Field(default=20, ge=5, le=120)
     response_timeout_seconds: int = Field(default=90, ge=10, le=300)
+    browser_capture_access_token: SecretStr | None = None
 
     input_dir: Path = Field(default=DEFAULT_INPUT_DIR)
     output_dir: Path = Field(default=DEFAULT_OUTPUT_DIR)

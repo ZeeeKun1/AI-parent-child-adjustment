@@ -26,6 +26,7 @@ from coregulation_poc.settings import Settings
 from coregulation_poc.strategy_test import run_strategy_test
 from coregulation_poc.trajectory_test import run_trajectory_test
 from coregulation_poc.video_test import run_video_test
+from coregulation_poc.web.app import run_browser_capture_server
 
 
 def doctor() -> int:
@@ -64,6 +65,12 @@ def doctor() -> int:
         "live_capture_command": "live-test --dry-run",
         "live_capture_api_called": False,
         "live_capture_raw_media_saved": False,
+        "browser_capture_command": "web-live --host 127.0.0.1 --port 8000",
+        "browser_capture_raw_media_saved": False,
+        "browser_capture_api_called": False,
+        "browser_capture_access_token_configured": (
+            settings.browser_capture_access_token is not None
+        ),
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
@@ -101,6 +108,18 @@ def main() -> None:
     live_parser.add_argument("--camera-width", type=int)
     live_parser.add_argument("--camera-height", type=int)
     live_parser.add_argument("--camera-fps", type=int)
+    web_live_parser = subparsers.add_parser(
+        "web-live",
+        help="Serve a browser camera and microphone capture page",
+    )
+    web_live_parser.add_argument("--host", default="127.0.0.1")
+    web_live_parser.add_argument("--port", type=int, default=8000)
+    web_live_parser.add_argument("--output-dir", type=Path)
+    web_live_parser.add_argument(
+        "--log-level",
+        choices=("critical", "error", "warning", "info", "debug"),
+        default="info",
+    )
     trajectory_parser = subparsers.add_parser(
         "trajectory-test",
         help="Replay module-one assessments through the intervention controller",
@@ -145,6 +164,50 @@ def main() -> None:
             )
         )
         raise SystemExit(0 if valid else 2)
+    if args.command == "web-live":
+        if not 1 <= args.port <= 65535:
+            parser.error("--port must be between 1 and 65535")
+        settings = Settings()
+        output_dir = args.output_dir or settings.output_dir
+        if not output_dir.is_absolute():
+            parser.error("--output-dir must be an absolute path")
+        access_token = (
+            settings.browser_capture_access_token.get_secret_value()
+            if settings.browser_capture_access_token is not None
+            else None
+        )
+        local_hosts = {"127.0.0.1", "localhost", "::1"}
+        if args.host not in local_hosts and access_token is None:
+            parser.error(
+                "BROWSER_CAPTURE_ACCESS_TOKEN is required when --host is not localhost"
+            )
+        if access_token is not None and len(access_token) < 12:
+            parser.error("BROWSER_CAPTURE_ACCESS_TOKEN must contain at least 12 characters")
+        print(
+            json.dumps(
+                {
+                    "status": "starting",
+                    "open": f"http://{args.host}:{args.port}",
+                    "https_required_outside_localhost": True,
+                    "raw_media_saved": False,
+                    "api_called": False,
+                    "access_control_required": access_token is not None,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        try:
+            run_browser_capture_server(
+                host=args.host,
+                port=args.port,
+                output_dir=output_dir,
+                access_token=access_token,
+                log_level=args.log_level,
+            )
+        except OSError as exc:
+            parser.exit(2, f"Browser capture server failed: {exc}\n")
+        raise SystemExit(0)
     if args.command == "video-test":
         if not args.video.is_absolute():
             parser.error("--video must be an absolute path")
