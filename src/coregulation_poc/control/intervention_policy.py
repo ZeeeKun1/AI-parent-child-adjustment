@@ -20,6 +20,7 @@ class PolicyPrinciples(BaseModel):
     use_single_signal_as_trigger: bool
     require_natural_turn_boundary_for_intervention: bool
     require_post_intervention_response_before_repeat: bool
+    post_intervention_max_wait_count: int = Field(ge=1)
     low_confidence_action: InterventionAction
     insufficient_evidence_action: InterventionAction
 
@@ -38,6 +39,13 @@ class StateActionRule(DecisionRule):
     history_required: bool
 
 
+class PositiveMaintenanceRule(DecisionRule):
+    allowed_states: list[CoregulationState] = Field(min_length=1)
+    explicit_trigger_performances: list[str] = Field(min_length=1)
+    recovery_transition_states: list[CoregulationState] = Field(min_length=1)
+    requires_natural_turn_boundary: bool
+
+
 class InterventionPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -46,6 +54,7 @@ class InterventionPolicy(BaseModel):
     research_basis: dict[str, str]
     principles: PolicyPrinciples
     guard_actions: dict[InterventionDecisionReason, DecisionRule]
+    positive_maintenance: PositiveMaintenanceRule
     state_actions: dict[CoregulationState, StateActionRule]
 
     @model_validator(mode="after")
@@ -76,6 +85,18 @@ class InterventionPolicy(BaseModel):
         if any(rule.action is not InterventionAction.HOLD for rule in self.guard_actions.values()):
             raise ValueError("controller guards must hold rather than authorize intervention")
 
+        if self.positive_maintenance.action is not InterventionAction.REINFORCE:
+            raise ValueError("positive maintenance must use the reinforce action")
+        if (
+            self.positive_maintenance.reason_code
+            is not InterventionDecisionReason.POSITIVE_MAINTENANCE_OPPORTUNITY
+        ):
+            raise ValueError("positive maintenance must use its dedicated reason code")
+        if set(self.positive_maintenance.allowed_states) != {CoregulationState.NORMAL}:
+            raise ValueError("positive maintenance is limited to clearly coordinated states")
+        if not self.positive_maintenance.requires_natural_turn_boundary:
+            raise ValueError("positive maintenance must wait for a natural turn boundary")
+
         for state in (CoregulationState.DYSREGULATION, CoregulationState.HIGH_RISK):
             if not self.state_actions[state].requires_natural_turn_boundary:
                 raise ValueError(f"state {state.value} must wait for a natural turn boundary")
@@ -97,7 +118,11 @@ class InterventionPolicy(BaseModel):
 
         referenced_basis = {
             basis
-            for rule in [*self.guard_actions.values(), *self.state_actions.values()]
+            for rule in [
+                *self.guard_actions.values(),
+                self.positive_maintenance,
+                *self.state_actions.values(),
+            ]
             for basis in rule.research_basis
         }
         missing_basis = referenced_basis - set(self.research_basis)

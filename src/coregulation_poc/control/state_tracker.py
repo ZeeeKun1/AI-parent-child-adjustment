@@ -36,6 +36,8 @@ class StateTrajectoryController:
         self._points: list[StateTrajectoryPoint] = []
         self._decisions: list[InterventionDecision] = []
         self._pending_intervention_state: CoregulationState | None = None
+        self._post_intervention_wait_count: int = 0
+        self._reinforced_positive_performances: set[str] = set()
 
     @property
     def session_id(self) -> str | None:
@@ -44,6 +46,14 @@ class StateTrajectoryController:
     @property
     def awaiting_post_intervention_response(self) -> bool:
         return self._pending_intervention_state is not None
+
+    def mark_intervention_not_delivered(self) -> None:
+        """Release the response guard when every delivery channel failed."""
+
+        if self._pending_intervention_state is None:
+            raise ValueError("there is no pending intervention delivery to release")
+        self._pending_intervention_state = None
+        self._post_intervention_wait_count = 0
 
     def ingest(self, observation: ControlObservation) -> InterventionDecision:
         assessment = observation.assessment
@@ -63,14 +73,25 @@ class StateTrajectoryController:
         recovery_status = self._recovery_status(observation)
         if self.awaiting_post_intervention_response:
             if not observation.post_intervention_response_observed:
-                return self._record_guard_decision(
-                    observation=observation,
-                    previous_state=previous_state,
-                    sequence=sequence,
-                    reason=InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
-                    recovery_status=RecoveryStatus.PENDING,
-                )
-            self._pending_intervention_state = None
+                self._post_intervention_wait_count += 1
+                if (
+                    self._post_intervention_wait_count
+                    >= self.policy.principles.post_intervention_max_wait_count
+                ):
+                    self._pending_intervention_state = None
+                    self._post_intervention_wait_count = 0
+                    recovery_status = RecoveryStatus.TIMEOUT
+                else:
+                    return self._record_guard_decision(
+                        observation=observation,
+                        previous_state=previous_state,
+                        sequence=sequence,
+                        reason=InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
+                        recovery_status=RecoveryStatus.PENDING,
+                    )
+            else:
+                self._pending_intervention_state = None
+                self._post_intervention_wait_count = 0
 
         if (
             assessment.evidence_sufficiency is EvidenceSufficiency.INSUFFICIENT
@@ -91,6 +112,31 @@ class StateTrajectoryController:
                 reason=InterventionDecisionReason.LOW_CONFIDENCE,
                 recovery_status=recovery_status,
             )
+
+        positive_performances = self._positive_maintenance_performances(
+            observation=observation,
+            previous_state=previous_state,
+            recovery_status=recovery_status,
+        )
+        if positive_performances:
+            rule = self.policy.positive_maintenance
+            if rule.requires_natural_turn_boundary and not observation.natural_turn_boundary:
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                    recovery_status=recovery_status,
+                )
+            decision = self._record_state_decision(
+                observation=observation,
+                previous_state=previous_state,
+                sequence=sequence,
+                rule=rule,
+                recovery_status=recovery_status,
+            )
+            self._reinforced_positive_performances.update(positive_performances)
+            return decision
 
         rule = self.policy.state_actions[assessment.state]
         if rule.history_required and not observation.interaction_history_available:
@@ -116,6 +162,31 @@ class StateTrajectoryController:
             rule=rule,
             recovery_status=recovery_status,
         )
+
+    def _positive_maintenance_performances(
+        self,
+        *,
+        observation: ControlObservation,
+        previous_state: CoregulationState | None,
+        recovery_status: RecoveryStatus,
+    ) -> set[str]:
+        assessment = observation.assessment
+        rule = self.policy.positive_maintenance
+        observed = set(assessment.interaction_performance)
+        explicit = observed.intersection(rule.explicit_trigger_performances)
+        self._reinforced_positive_performances.intersection_update(explicit)
+
+        transition = set()
+        if (
+            assessment.state in rule.allowed_states
+            and previous_state in rule.recovery_transition_states
+            and recovery_status is RecoveryStatus.NOT_APPLICABLE
+            and "normal task progression" in observed
+        ):
+            transition.add("normal task progression")
+
+        candidates = explicit | transition
+        return candidates - self._reinforced_positive_performances
 
     def snapshot(self) -> StateTrajectorySnapshot:
         if self._session_id is None:
@@ -195,10 +266,12 @@ class StateTrajectoryController:
             recovery_status=recovery_status,
         )
         if decision.action in {
+            InterventionAction.REINFORCE,
             InterventionAction.INTERVENE,
             InterventionAction.PROGRESSIVE_SUPPORT,
         }:
             self._pending_intervention_state = decision.current_state
+            self._post_intervention_wait_count = 0
         return decision
 
     def _record_decision(
@@ -212,6 +285,7 @@ class StateTrajectoryController:
     ) -> InterventionDecision:
         assessment = observation.assessment
         action_requires_strategy = rule.action in {
+            InterventionAction.REINFORCE,
             InterventionAction.INTERVENE,
             InterventionAction.PROGRESSIVE_SUPPORT,
         }

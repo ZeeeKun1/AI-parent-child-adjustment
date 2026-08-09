@@ -23,6 +23,10 @@ class RepairTarget(StrEnum):
     NEEDS_CLARIFICATION = "needs_clarification"
     AUTONOMY_BOUNDARY = "autonomy_boundary"
     TASK_PAUSE = "task_pause"
+    POSITIVE_REINFORCEMENT = "positive_reinforcement"
+    POSTURE_ADJUSTMENT = "posture_adjustment"
+    ENVIRONMENT_ADJUSTMENT = "environment_adjustment"
+    BOUNDARY_SETTING = "boundary_setting"
 
 
 class MessageSource(StrEnum):
@@ -48,7 +52,7 @@ class StrategyPrinciples(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     module_two_authorization_required: bool
-    normal_and_fluctuation_do_not_enter_strategy_selection: bool
+    normal_requires_positive_maintenance_authorization: bool
     target_actor_must_be_explicit: bool
     one_card_one_primary_action: bool
     llm_may_rephrase_but_must_not_change_strategy: bool
@@ -80,17 +84,11 @@ class StrategyCard(BaseModel):
     approved_template: str = Field(min_length=1)
     expected_recovery: list[str] = Field(min_length=1)
     research_codes: list[str] = Field(min_length=1)
-    next_strategy_if_not_recovered: str | None = None
 
     @model_validator(mode="after")
     def validate_card_scope(self) -> StrategyCard:
         if self.target_actor is Actor.UNKNOWN:
             raise ValueError("strategy cards must explicitly target parent, child or both")
-        if any(
-            state in {CoregulationState.NORMAL, CoregulationState.FLUCTUATION}
-            for state in self.states
-        ):
-            raise ValueError("normal and fluctuation cannot enter module-three selection")
         return self
 
 
@@ -109,8 +107,8 @@ class StrategyLibraryConfig(BaseModel):
     def validate_library(self) -> StrategyLibraryConfig:
         required_principles = {
             "module_two_authorization_required": self.principles.module_two_authorization_required,
-            "normal_and_fluctuation_do_not_enter_strategy_selection": (
-                self.principles.normal_and_fluctuation_do_not_enter_strategy_selection
+            "normal_requires_positive_maintenance_authorization": (
+                self.principles.normal_requires_positive_maintenance_authorization
             ),
             "target_actor_must_be_explicit": self.principles.target_actor_must_be_explicit,
             "one_card_one_primary_action": self.principles.one_card_one_primary_action,
@@ -133,12 +131,6 @@ class StrategyLibraryConfig(BaseModel):
             raise ValueError("strategy card identifiers must be unique")
         cards = {card.strategy_id: card for card in self.cards}
         for card in self.cards:
-            next_id = card.next_strategy_if_not_recovered
-            if next_id is not None:
-                if next_id not in cards:
-                    raise ValueError(f"strategy {card.strategy_id} references unknown next card")
-                if next_id == card.strategy_id:
-                    raise ValueError("a strategy cannot immediately repeat itself")
             self._validate_template(card)
 
         for rule in self.routing_rules:
@@ -151,6 +143,13 @@ class StrategyLibraryConfig(BaseModel):
                     )
 
         expected_routes = {
+            CoregulationState.NORMAL: {
+                "normal task progression",
+                "active child participation",
+                "supportive parental guidance",
+                "task completion",
+                "positive dyadic exchange",
+            },
             CoregulationState.DYSREGULATION: {
                 "sustained task stall",
                 "pace conflict",
@@ -221,7 +220,6 @@ class InterventionPlan(BaseModel):
     outcome_interpretation: dict[RecoveryStatus, list[str]]
     validation_checks: dict[str, bool]
     previous_strategy_id: str | None = None
-    next_strategy_if_not_recovered: str | None = None
     progressive_support: bool
     research_codes: list[str] = Field(min_length=1)
     research_sources: list[str] = Field(min_length=1)
@@ -231,6 +229,7 @@ class InterventionPlan(BaseModel):
         if self.target_actor is Actor.UNKNOWN:
             raise ValueError("an intervention plan cannot target an unknown actor")
         if self.decision_action not in {
+            InterventionAction.REINFORCE,
             InterventionAction.INTERVENE,
             InterventionAction.PROGRESSIVE_SUPPORT,
         }:

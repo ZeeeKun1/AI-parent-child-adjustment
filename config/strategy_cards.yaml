@@ -1,12 +1,12 @@
-version: 2
+version: 3
 source:
-  - "三阶段主题分析3.0：专家干预策略类别、适用状态与干预对象"
+  - "三阶段主题分析3.0：专家干预策略类别、适用状态与干预对象（二级code实例拆分为单方卡）"
   - "形成性研究3.4.3：干预应根据亲子共调节状态匹配策略"
   - "WOZ后果编码：家长调整、儿童重新参与、任务继续推进与亲子关系缓和"
 
 principles:
   module_two_authorization_required: true
-  normal_and_fluctuation_do_not_enter_strategy_selection: true
+  normal_requires_positive_maintenance_authorization: true
   target_actor_must_be_explicit: true
   one_card_one_primary_action: true
   llm_may_rephrase_but_must_not_change_strategy: true
@@ -45,56 +45,123 @@ outcome_mapping:
     - "干预后可观察证据不足"
 
 routing_rules:
+  - state: "normal"
+    interaction_performance: "normal task progression"
+    strategy_ids: ["DYAD_POSITIVE_AFFIRM"]
+  - state: "normal"
+    interaction_performance: "active child participation"
+    strategy_ids: ["CHILD_POSITIVE_AFFIRM", "DYAD_POSITIVE_AFFIRM"]
+  - state: "normal"
+    interaction_performance: "supportive parental guidance"
+    strategy_ids: ["PARENT_POSITIVE_AFFIRM", "DYAD_POSITIVE_AFFIRM"]
+  - state: "normal"
+    interaction_performance: "task completion"
+    strategy_ids: ["DYAD_POSITIVE_AFFIRM", "CHILD_POSITIVE_AFFIRM", "PARENT_POSITIVE_AFFIRM"]
+  - state: "normal"
+    interaction_performance: "positive dyadic exchange"
+    strategy_ids: ["DYAD_POSITIVE_AFFIRM"]
   - state: "dysregulation"
     interaction_performance: "escalating negative interaction"
-    strategy_ids: ["CHILD_AFFECT_SOOTHE", "PARENT_TONE_AND_PACE", "DYAD_AFFECT_BRAKE"]
+    strategy_ids: ["DYAD_RELATIONSHIP_RESET", "CHILD_AFFECT_SOOTHE", "PARENT_TONE_AND_PACE", "PARENT_CAREGIVER_EMPATHY"]
   - state: "dysregulation"
     interaction_performance: "pace conflict"
-    strategy_ids: ["PARENT_TONE_AND_PACE", "DYAD_PACE_RESET"]
+    strategy_ids: ["PARENT_TONE_AND_PACE", "CHILD_PACE_RESET", "PARENT_PACE_RESET"]
   - state: "dysregulation"
     interaction_performance: "misaligned understanding"
-    strategy_ids: ["DYAD_INTENT_TRANSLATION"]
+    strategy_ids: ["DYAD_RELATIONSHIP_RESET", "CHILD_INTENT_TRANSLATION", "PARENT_INTENT_TRANSLATION", "CHILD_NEEDS_INQUIRY"]
   - state: "dysregulation"
     interaction_performance: "sustained task stall"
-    strategy_ids: ["PARENT_SCAFFOLD_CHANGE", "CHILD_NEEDS_INQUIRY", "DYAD_TASK_RESET"]
+    strategy_ids: ["CHILD_NEEDS_INQUIRY", "PARENT_SCAFFOLD_CHANGE", "CHILD_STRATEGY_SUPPORT"]
   - state: "high_risk"
     interaction_performance: "sustained strong resistance or withdrawal"
-    strategy_ids: ["DYAD_TASK_PAUSE", "CHILD_NEEDS_INQUIRY"]
+    strategy_ids: ["CHILD_PACE_RESET", "CHILD_NEEDS_INQUIRY", "CHILD_BOUNDARY_SET"]
   - state: "high_risk"
     interaction_performance: "parental over-helping or task takeover"
-    strategy_ids: ["PARENT_AUTONOMY_SPACE", "DYAD_ROLE_RESTART"]
+    strategy_ids: ["PARENT_AUTONOMY_SPACE", "PARENT_BOUNDARY_SET"]
   - state: "high_risk"
     interaction_performance: "child passive dependence"
-    strategy_ids: ["PARENT_AUTONOMY_SPACE", "DYAD_ROLE_RESTART"]
+    strategy_ids: ["CHILD_AUTONOMY_SPACE", "PARENT_AUTONOMY_SPACE"]
   - state: "high_risk"
     interaction_performance: "persistent interaction imbalance"
-    strategy_ids: ["PARENT_AUTONOMY_SPACE", "DYAD_ROLE_RESTART", "DYAD_TASK_PAUSE"]
+    strategy_ids: ["PARENT_AUTONOMY_SPACE", "PARENT_BOUNDARY_SET", "CHILD_BOUNDARY_SET"]
 
 cards:
-  - strategy_id: "DYAD_AFFECT_BRAKE"
-    name: "中性制动"
-    states: ["dysregulation", "high_risk"]
+  - strategy_id: "DYAD_POSITIVE_AFFIRM"
+    name: "双方正向强化"
+    states: ["normal"]
+    target_actor: "both"
+    repair_target: "positive_reinforcement"
+    use_when:
+      - "双方完成任务、恢复协调或出现明确的积极互动"
+      - "需要巩固双方共同形成的积极互动回路"
+    avoid_when:
+      - "只是一般性顺利推进，没有新的积极事件"
+    action: "具体指出双方刚刚共同完成的积极行为，并邀请保持当前方式"
+    approved_template: "你们刚才一起把节奏调整好了，可以继续保持现在这种配合。"
+    expected_recovery:
+      - "双方保持积极互动"
+      - "任务继续推进"
+    research_codes:
+      - "正向强化与平衡维护"
+
+  - strategy_id: "DYAD_RELATIONSHIP_RESET"
+    name: "双方理解重置"
+    states: ["dysregulation"]
     target_actor: "both"
     repair_target: "relationship_repair"
     use_when:
-      - "互动中的压力、否定或对立正在升级"
-      - "继续推进任务可能强化负向循环"
+      - "双方出现误解、责备或正在升级的负向互动"
+      - "现有证据只能支持双方互动失配，不能可靠归因到单方"
     avoid_when:
-      - "双方已经恢复低压力的任务沟通"
-    action: "在自然话轮边界暂停当前负向循环，不判断谁对谁错"
-    approved_template: "我们先停一下，继续推进可能会让大家更着急。先给彼此一点时间。"
+      - "能够明确识别由某一方发起且适合单方支持"
+    action: "在自然停顿处暂停归因，让儿童先说明一个困难，再由家长回应"
+    approved_template: "我们先不判断谁对谁错。孩子先说一个卡住的地方，家长听完再回应。"
     expected_recovery:
-      - "压力性表达减少"
-      - "双方出现暂停"
-      - "互动不再继续升级"
+      - "双方减少负面归因"
+      - "儿童表达具体困难"
+      - "家长开始回应需要"
     research_codes:
       - "亲子互相理解与关系修复"
-      - "情绪降温与状态安抚"
-    next_strategy_if_not_recovered: "DYAD_PACE_RESET"
+
+  - strategy_id: "CHILD_POSITIVE_AFFIRM"
+    name: "儿童正向肯定"
+    states: ["normal", "fluctuation"]
+    target_actor: "child"
+    repair_target: "positive_reinforcement"
+    use_when:
+      - "任务顺利推进或儿童积极尝试"
+      - "需要巩固积极反馈回路"
+    avoid_when:
+      - "儿童已经因过度表扬而分散注意力"
+    action: "肯定儿童当前表现或努力，鼓励继续"
+    approved_template: "你刚才做得很好，继续保持这个节奏就好。"
+    expected_recovery:
+      - "儿童保持参与积极性"
+      - "任务持续推进"
+    research_codes:
+      - "正向肯定与鼓励"
+
+  - strategy_id: "PARENT_POSITIVE_AFFIRM"
+    name: "家长正向肯定"
+    states: ["normal", "fluctuation"]
+    target_actor: "parent"
+    repair_target: "positive_reinforcement"
+    use_when:
+      - "家长耐心讲解且互动顺畅"
+      - "需要巩固家长当前辅导方式"
+    avoid_when:
+      - "家长已经因表扬而放松对任务节奏的关注"
+    action: "肯定家长耐心讲解，鼓励继续当前方式"
+    approved_template: "您的耐心讲解很有帮助，可以继续这样的方式。"
+    expected_recovery:
+      - "家长维持当前辅导节奏"
+      - "互动保持协调"
+    research_codes:
+      - "正向肯定与鼓励"
 
   - strategy_id: "PARENT_TONE_AND_PACE"
     name: "家长语气与节奏调节"
-    states: ["dysregulation"]
+    states: ["fluctuation", "dysregulation"]
     target_actor: "parent"
     repair_target: "parent_regulation"
     use_when:
@@ -110,71 +177,10 @@ cards:
       - "儿童获得回应空间"
     research_codes:
       - "家长情绪与语气调节"
-      - "任务节奏调节"
-    next_strategy_if_not_recovered: "DYAD_PACE_RESET"
-
-  - strategy_id: "PARENT_CAREGIVER_EMPATHY"
-    name: "家长照护负担共情"
-    states: ["dysregulation", "high_risk"]
-    target_actor: "parent"
-    repair_target: "parent_regulation"
-    use_when:
-      - "家长表现出持续疲惫、无力或辅导挫败"
-      - "直接建议可能引起防御"
-    avoid_when:
-      - "没有可观察的家长负担或挫败证据"
-    action: "先承认家长的投入，再提供一个可执行的减负动作"
-    approved_template: "你已经投入了很多精力。可以先停一下，把接下来缩小为一个步骤。"
-    expected_recovery:
-      - "家长防御性表达减少"
-      - "家长愿意暂停或调整方式"
-    research_codes:
-      - "家长支持与照护负担共情"
-
-  - strategy_id: "PARENT_SCAFFOLD_CHANGE"
-    name: "调整任务支架"
-    states: ["dysregulation"]
-    target_actor: "parent"
-    repair_target: "task_support"
-    use_when:
-      - "任务持续停滞且现有讲解无效"
-      - "家长重复纠错或直接提供答案"
-    avoid_when:
-      - "儿童正在独立尝试或完整表达思路"
-    action: "先定位具体卡点，再只提供一个最小提示"
-    approved_template: "可以先确认孩子具体卡在哪一步，再只提供一个最小提示，不直接给答案。"
-    expected_recovery:
-      - "家长改变讲解方式"
-      - "儿童表达具体困难"
-      - "任务推进一个步骤"
-    research_codes:
-      - "学习策略支持"
-      - "需求探询与表达引导"
-    next_strategy_if_not_recovered: "DYAD_TASK_RESET"
-
-  - strategy_id: "PARENT_AUTONOMY_SPACE"
-    name: "归还儿童自主空间"
-    states: ["high_risk"]
-    target_actor: "parent"
-    repair_target: "autonomy_boundary"
-    use_when:
-      - "家长长期接管、代答或过度纠正"
-      - "儿童等待指令并缺少独立尝试"
-    avoid_when:
-      - "儿童已经获得并正在使用独立尝试空间"
-    action: "把下一步交还儿童，只在儿童提出需要时提供必要提示"
-    approved_template: "可以把下一步交还给孩子，让他先独立尝试或表达，再提供必要提示。"
-    expected_recovery:
-      - "家长减少代劳和即时纠正"
-      - "儿童开始独立尝试或表达"
-    research_codes:
-      - "自主性支持"
-      - "边界设定与角色定位"
-    next_strategy_if_not_recovered: "DYAD_ROLE_RESTART"
 
   - strategy_id: "CHILD_AFFECT_SOOTHE"
     name: "儿童压力安抚"
-    states: ["dysregulation"]
+    states: ["fluctuation", "dysregulation"]
     target_actor: "child"
     repair_target: "child_support"
     use_when:
@@ -190,7 +196,42 @@ cards:
       - "儿童重新参与"
     research_codes:
       - "儿童情绪识别与安抚"
-      - "需求探询与表达引导"
+
+  - strategy_id: "CHILD_INTENT_TRANSLATION"
+    name: "儿童意图理解引导"
+    states: ["dysregulation"]
+    target_actor: "child"
+    repair_target: "relationship_repair"
+    use_when:
+      - "儿童对家长辅导表现出不耐烦或对立"
+      - "双方对困难原因产生误解"
+    avoid_when:
+      - "儿童正在直接、低压力地表达"
+    action: "帮助儿童理解家长意图，引导儿童表达一个具体困难"
+    approved_template: "家长讲这些是想帮你。你可以先说一个具体困难，让家长知道怎么帮你。"
+    expected_recovery:
+      - "儿童减少对家长的负面归因"
+      - "儿童表达具体困难"
+    research_codes:
+      - "亲子互相理解与关系修复"
+
+  - strategy_id: "PARENT_INTENT_TRANSLATION"
+    name: "家长意图理解引导"
+    states: ["dysregulation"]
+    target_actor: "parent"
+    repair_target: "relationship_repair"
+    use_when:
+      - "家长对儿童行为产生误解或归因"
+      - "沟通转向责备或对立"
+    avoid_when:
+      - "家长已经在低压力地倾听儿童表达"
+    action: "帮助家长理解儿童可能不是不想做而是遇到困难，引导倾听"
+    approved_template: "孩子可能不是不想做，是遇到了具体困难。可以先听他说一个卡住的地方。"
+    expected_recovery:
+      - "家长减少负面归因"
+      - "家长开始回应具体需要"
+    research_codes:
+      - "亲子互相理解与关系修复"
 
   - strategy_id: "CHILD_NEEDS_INQUIRY"
     name: "儿童需求表达引导"
@@ -209,107 +250,220 @@ cards:
       - "双方获得可协商的信息"
     research_codes:
       - "需求探询与表达引导"
-      - "儿童情绪识别与安抚"
-    next_strategy_if_not_recovered: "DYAD_TASK_RESET"
 
-  - strategy_id: "DYAD_INTENT_TRANSLATION"
-    name: "双方意图转译"
-    states: ["dysregulation"]
-    target_actor: "both"
-    repair_target: "relationship_repair"
+  - strategy_id: "PARENT_CAREGIVER_EMPATHY"
+    name: "家长照护负担共情"
+    states: ["fluctuation", "dysregulation", "high_risk"]
+    target_actor: "parent"
+    repair_target: "parent_regulation"
     use_when:
-      - "双方对困难原因或彼此行为产生误解"
-      - "任务沟通转向责备或对立"
+      - "家长表现出持续疲惫、无力或辅导挫败"
+      - "直接建议可能引起防御"
     avoid_when:
-      - "双方已经在直接、低压力地协商"
-    action: "让儿童先说明一个困难，家长听完后再回应"
-    approved_template: "现在沟通有些卡住。可以先让孩子说一个具体困难，家长听完后再回应。"
+      - "没有可观察的家长负担或挫败证据"
+    action: "先承认家长的投入，再提供一个可执行的减负动作"
+    approved_template: "你已经投入了很多精力。可以先停一下，把接下来缩小为一个步骤。"
     expected_recovery:
-      - "双方减少负面归因"
-      - "儿童表达困难"
-      - "家长开始回应具体需要"
+      - "家长防御性表达减少"
+      - "家长愿意暂停或调整方式"
     research_codes:
-      - "亲子互相理解与关系修复"
-      - "需求探询与表达引导"
-    next_strategy_if_not_recovered: "DYAD_AFFECT_BRAKE"
+      - "家长支持与照护负担共情"
 
-  - strategy_id: "DYAD_PACE_RESET"
-    name: "双方节奏重置"
+  - strategy_id: "CHILD_PACE_RESET"
+    name: "儿童任务节奏调节"
     states: ["dysregulation", "high_risk"]
-    target_actor: "both"
+    target_actor: "child"
     repair_target: "task_pacing"
     use_when:
-      - "双方节奏持续冲突"
-      - "儿童来不及表达或操作"
+      - "家长讲解频率过快，儿童跟不上"
+      - "儿童出现注意力游离或脑子跟不上的反应"
     avoid_when:
       - "任务已经按照儿童可跟随的节奏推进"
-    action: "把当前任务缩小为一步，并重新安排表达顺序"
-    approved_template: "我们先把节奏放慢，只处理下一步。孩子先说想法，家长稍后再补充。"
+    action: "建议儿童休息或换一个简单的部分做"
+    approved_template: "我们先休息一下，或者换一个简单的部分做。"
     expected_recovery:
-      - "双方不再同时推进多个要求"
-      - "儿童获得完整表达或操作机会"
-      - "任务重新开始推进"
+      - "儿童压力暂时缓解"
+      - "儿童重新跟随任务节奏"
     research_codes:
       - "任务节奏调节"
-      - "自主性支持"
-    next_strategy_if_not_recovered: "DYAD_TASK_RESET"
 
-  - strategy_id: "DYAD_TASK_RESET"
-    name: "共同任务重置"
+  - strategy_id: "PARENT_PACE_RESET"
+    name: "家长任务节奏调节"
     states: ["dysregulation", "high_risk"]
-    target_actor: "both"
+    target_actor: "parent"
+    repair_target: "task_pacing"
+    use_when:
+      - "家长持续高频催促或讲解过快"
+      - "儿童来不及表达或操作"
+    avoid_when:
+      - "家长已经主动放慢节奏"
+    action: "建议家长让孩子喝水或降低当前任务强度"
+    approved_template: "可以先让孩子去喝口水，降低一下当前的任务强度。"
+    expected_recovery:
+      - "家长降低任务强度或节奏"
+      - "儿童获得喘息空间"
+    research_codes:
+      - "任务节奏调节"
+
+  - strategy_id: "CHILD_STRATEGY_SUPPORT"
+    name: "儿童学习策略支持"
+    states: ["dysregulation"]
+    target_actor: "child"
     repair_target: "task_support"
     use_when:
-      - "任务持续停滞且当前方法无效"
-      - "具体责任对象不够明确"
+      - "儿童在同一认知点反复出错"
+      - "现有方法无效且儿童愿意尝试"
     avoid_when:
-      - "儿童正在独立解决问题"
-    action: "共同确认一个卡点，并只处理下一步"
-    approved_template: "我们先只确认一个问题：现在具体卡在哪一步，然后只处理这一步。"
+      - "儿童正在独立尝试且方法有效"
+    action: "提供一个具体可执行的学习策略或工具"
+    approved_template: "你可以试着用纸演算这一步，或者换个方法检查一下。"
     expected_recovery:
-      - "双方确认同一个任务卡点"
+      - "儿童采用新策略推进任务"
       - "任务推进一个步骤"
     research_codes:
       - "学习策略支持"
-      - "任务节奏调节"
 
-  - strategy_id: "DYAD_TASK_PAUSE"
-    name: "暂停任务并探询原因"
-    states: ["high_risk"]
-    target_actor: "both"
-    repair_target: "task_pause"
+  - strategy_id: "PARENT_SCAFFOLD_CHANGE"
+    name: "家长学习策略调整"
+    states: ["dysregulation"]
+    target_actor: "parent"
+    repair_target: "task_support"
     use_when:
-      - "儿童持续强烈抵触或完全退出"
-      - "继续推动任务可能强化抵触"
+      - "任务持续停滞且现有讲解无效"
+      - "家长重复纠错或直接提供答案"
     avoid_when:
-      - "儿童已经重新参与并愿意继续"
-    action: "暂停当前任务，先了解无法继续的原因"
-    approved_template: "我们先暂停当前任务，不急着继续。等准备好后，只确认现在为什么难以继续。"
+      - "儿童正在独立尝试或完整表达思路"
+    action: "建议家长更换讲解思路，先定位卡点再提供最小提示"
+    approved_template: "可以先确认孩子具体卡在哪一步，再只提供一个最小提示，不直接给答案。"
     expected_recovery:
-      - "任务压力暂时停止"
-      - "儿童开始表达抵触原因或需要"
-      - "双方停止继续强推任务"
+      - "家长改变讲解方式"
+      - "儿童表达具体困难"
+      - "任务推进一个步骤"
     research_codes:
-      - "需求探询与表达引导"
-      - "任务节奏调节"
-    next_strategy_if_not_recovered: "CHILD_NEEDS_INQUIRY"
+      - "学习策略支持"
 
-  - strategy_id: "DYAD_ROLE_RESTART"
-    name: "双方角色重新协调"
+  - strategy_id: "CHILD_AUTONOMY_SPACE"
+    name: "儿童自主性支持"
     states: ["high_risk"]
-    target_actor: "both"
+    target_actor: "child"
     repair_target: "autonomy_boundary"
     use_when:
-      - "家长控制与儿童被动依赖长期持续"
-      - "单次家长侧建议没有带来改变"
+      - "儿童长期被动依赖，等待指令"
+      - "儿童缺少独立尝试或表达空间"
     avoid_when:
-      - "双方已经形成儿童先尝试、家长再支持的分工"
-    action: "明确儿童先尝试和表达、家长提供最低必要支持的顺序"
-    approved_template: "接下来先由孩子决定从哪一步开始，家长只在孩子提出需要时给一个提示。"
+      - "儿童已经获得并正在使用独立尝试空间"
+    action: "通过小范围选择和可完成步骤，鼓励儿童承担学习决策"
+    approved_template: "你可以先自己决定从哪一步开始试，遇到困难再请家长帮忙。"
     expected_recovery:
-      - "儿童获得选择和独立尝试空间"
-      - "家长减少接管"
-      - "双方形成新的任务分工"
+      - "儿童开始独立尝试或表达"
+      - "儿童承担部分学习决策"
     research_codes:
       - "自主性支持"
+
+  - strategy_id: "PARENT_AUTONOMY_SPACE"
+    name: "归还儿童自主空间"
+    states: ["high_risk"]
+    target_actor: "parent"
+    repair_target: "autonomy_boundary"
+    use_when:
+      - "家长长期接管、代答或过度纠正"
+      - "儿童等待指令并缺少独立尝试"
+    avoid_when:
+      - "儿童已经获得并正在使用独立尝试空间"
+    action: "提醒家长减少代劳和即时纠正，为儿童保留独立尝试空间"
+    approved_template: "可以把下一步交还给孩子，让他先独立尝试或表达，再提供必要提示。"
+    expected_recovery:
+      - "家长减少代劳和即时纠正"
+      - "儿童开始独立尝试或表达"
+    research_codes:
+      - "自主性支持"
+
+  - strategy_id: "CHILD_POSTURE_ADJUST"
+    name: "儿童身体姿态调整"
+    states: ["fluctuation", "dysregulation"]
+    target_actor: "child"
+    repair_target: "posture_adjustment"
+    use_when:
+      - "儿童因疲劳导致坐姿歪斜或头离桌面过近"
+      - "注意力完全游离于作业外"
+    avoid_when:
+      - "儿童姿态正常且注意力集中"
+    action: "提醒儿童调整坐姿、拿好书或抬头看"
+    approved_template: "你可以先坐端正，把书拿好，抬头看一下再继续。"
+    expected_recovery:
+      - "儿童调整坐姿"
+      - "注意力重新回到任务"
+    research_codes:
+      - "身体姿态与学习状态调整"
+
+  - strategy_id: "PARENT_POSTURE_ATTENTION"
+    name: "家长身体状态关注"
+    states: ["fluctuation", "dysregulation"]
+    target_actor: "parent"
+    repair_target: "posture_adjustment"
+    use_when:
+      - "儿童出现揉眼睛、困倦等疲劳信号"
+      - "家长未注意到儿童的身体疲劳信号"
+    avoid_when:
+      - "儿童状态正常且家长已经关注"
+    action: "提醒家长关注孩子揉眼睛或困倦状态，可能需要休息"
+    approved_template: "可以关注一下孩子是否揉眼睛或困倦，可能需要休息一下。"
+    expected_recovery:
+      - "家长注意到儿童疲劳信号"
+      - "家长主动安排休息"
+    research_codes:
+      - "身体姿态与学习状态调整"
+
+  - strategy_id: "PARENT_ENV_ADJUST"
+    name: "家长学习环境调整"
+    states: ["normal", "fluctuation", "dysregulation"]
+    target_actor: "parent"
+    repair_target: "environment_adjustment"
+    use_when:
+      - "外部事件或环境因素持续打断儿童专注"
+      - "学习材料缺失或环境噪音干扰"
+    avoid_when:
+      - "学习环境安静且材料齐全"
+    action: "建议家长调整学习空间，减少环境干扰"
+    approved_template: "可以看一下学习环境是否有干扰，调整一下空间让孩子更专注。"
+    expected_recovery:
+      - "环境干扰减少"
+      - "儿童专注状态恢复"
+    research_codes:
+      - "学习环境调整"
+
+  - strategy_id: "CHILD_BOUNDARY_SET"
+    name: "儿童边界设定"
+    states: ["dysregulation", "high_risk"]
+    target_actor: "child"
+    repair_target: "boundary_setting"
+    use_when:
+      - "儿童试图跳过家长直接向AI索要答案"
+      - "需要明确AI不直接回答学习内容"
+    avoid_when:
+      - "儿童已经在向家长寻求帮助"
+    action: "引导儿童向家长提问，AI回避直接回答学习内容"
+    approved_template: "这个问题可以先问问家长的想法，我们一起听听看。"
+    expected_recovery:
+      - "儿童转向家长寻求帮助"
+      - "不再直接向AI索要答案"
+    research_codes:
+      - "边界设定与角色定位"
+
+  - strategy_id: "PARENT_BOUNDARY_SET"
+    name: "家长边界设定"
+    states: ["dysregulation", "high_risk"]
+    target_actor: "parent"
+    repair_target: "boundary_setting"
+    use_when:
+      - "家长过度依赖AI评分或指导"
+      - "需要明确家长是主要指导者"
+    avoid_when:
+      - "家长已经在主导辅导且不依赖AI"
+    action: "强调家长是主要指导者，AI提供辅助而非代替"
+    approved_template: "您是孩子的主要指导者，我会在您需要时提供辅助，不会代替您指导。"
+    expected_recovery:
+      - "家长重新承担主要指导角色"
+      - "减少对AI的过度依赖"
+    research_codes:
       - "边界设定与角色定位"

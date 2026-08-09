@@ -22,7 +22,7 @@ def sha256_file(path: Path) -> str:
 
 
 class RunArtifactStore:
-    """Write one immutable, ignored-by-Git audit folder per API test."""
+    """Write one immutable, ignored-by-Git audit folder per test run."""
 
     def __init__(self, output_dir: Path, session_id: str) -> None:
         safe_session = SAFE_ID.sub("_", session_id).strip("_") or "session"

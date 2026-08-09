@@ -25,6 +25,7 @@ def _assessment(
     confidence: str = "high",
     evidence_sufficient: bool = True,
     previous_state: str | None = None,
+    performance: str | None = None,
 ) -> StateAssessment:
     if not evidence_sufficient:
         return StateAssessment(
@@ -57,7 +58,7 @@ def _assessment(
         evidence_sufficiency="sufficient",
         confidence=confidence,
         ambiguity_reason=ambiguity_reason,
-        interaction_performance=performances[state],
+        interaction_performance=[performance] if performance else performances[state],
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -91,6 +92,7 @@ def _observation(
     evidence_sufficient: bool = True,
     session_id: str = "demo",
     previous_state: str | None = None,
+    performance: str | None = None,
 ) -> ControlObservation:
     return ControlObservation(
         assessment=_assessment(
@@ -100,6 +102,7 @@ def _observation(
             confidence=confidence,
             evidence_sufficient=evidence_sufficient,
             previous_state=previous_state,
+            performance=performance,
         ),
         natural_turn_boundary=boundary,
         post_intervention_response_observed=response_observed,
@@ -128,6 +131,52 @@ def test_normal_and_fluctuation_do_not_intervene(
     assert decision.action is expected_action
     assert decision.reason_code == expected_reason
     assert decision.intervention_permitted is False
+
+
+def test_positive_maintenance_waits_for_boundary_and_does_not_repeat() -> None:
+    controller = _controller()
+
+    waiting = controller.ingest(
+        _observation(
+            "normal",
+            1000,
+            boundary=False,
+            performance="task completion",
+        )
+    )
+    reinforced = controller.ingest(
+        _observation(
+            "normal",
+            2000,
+            boundary=True,
+            performance="task completion",
+        )
+    )
+    repeated = controller.ingest(
+        _observation(
+            "normal",
+            3000,
+            boundary=True,
+            response_observed=True,
+            performance="task completion",
+        )
+    )
+
+    assert waiting.action is InterventionAction.HOLD
+    assert reinforced.action is InterventionAction.REINFORCE
+    assert repeated.action is InterventionAction.NO_INTERVENTION
+
+
+def test_self_recovery_from_fluctuation_can_be_reinforced() -> None:
+    controller = _controller()
+    controller.ingest(_observation("fluctuation", 1000, boundary=False))
+
+    decision = controller.ingest(_observation("normal", 2000, boundary=True))
+
+    assert decision.action is InterventionAction.REINFORCE
+    assert decision.reason_code is (
+        InterventionDecisionReason.POSITIVE_MAINTENANCE_OPPORTUNITY
+    )
 
 
 def test_dysregulation_waits_for_natural_turn_boundary() -> None:
@@ -199,3 +248,19 @@ def test_trajectory_rejects_session_or_time_discontinuity() -> None:
         )
     with pytest.raises(ValueError, match="non-decreasing"):
         controller.ingest(_observation("normal", 1000, boundary=False))
+
+def test_post_intervention_response_timeout() -> None:
+    controller = _controller()
+    controller.ingest(_observation("dysregulation", 1000, boundary=True))
+
+    waiting_1 = controller.ingest(_observation("dysregulation", 2000, boundary=True))
+    assert waiting_1.action is InterventionAction.HOLD
+    assert waiting_1.recovery_status is RecoveryStatus.PENDING
+
+    waiting_2 = controller.ingest(_observation("dysregulation", 3000, boundary=True))
+    assert waiting_2.action is InterventionAction.HOLD
+    assert waiting_2.recovery_status is RecoveryStatus.PENDING
+
+    timeout_decision = controller.ingest(_observation("dysregulation", 4000, boundary=True))
+    assert timeout_decision.recovery_status is RecoveryStatus.TIMEOUT
+    assert timeout_decision.action is InterventionAction.INTERVENE
