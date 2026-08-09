@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from coregulation_poc.capture.media import MediaChunk, MediaFormat
 from coregulation_poc.paths import DEFAULT_OUTPUT_DIR, PACKAGE_DIR, resolve_project_path
+from coregulation_poc.runtime.session import RealtimeBrowserSession, RealtimeSessionFactory
 from coregulation_poc.web.protocol import (
     PROTOCOL_VERSION,
     BrowserCaptureRecorder,
@@ -26,6 +27,18 @@ from coregulation_poc.web.protocol import (
 SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 STATIC_DIR = (PACKAGE_DIR / "web" / "static").resolve()
 ChunkHandler = Callable[[MediaChunk], Awaitable[None]]
+AUDITED_RUNTIME_EVENTS = {
+    "loop_started",
+    "analysis_started",
+    "state_update",
+    "intervention",
+    "intervention_held",
+    "intervention_outcome",
+    "interventions_paused",
+    "interventions_resumed",
+    "delivery_execution_received",
+    "loop_error",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +108,7 @@ def create_browser_capture_app(
     config: BrowserServerConfig | None = None,
     *,
     chunk_handler: ChunkHandler | None = None,
+    session_factory: RealtimeSessionFactory | None = None,
 ) -> FastAPI:
     server_config = config or BrowserServerConfig()
     app = FastAPI(
@@ -118,7 +132,9 @@ def create_browser_capture_app(
             "protocol_version": PROTOCOL_VERSION,
             "raw_media_saved": False,
             "api_called": False,
+            "api_calls_enabled": session_factory is not None,
             "downstream_chunk_handler_configured": chunk_handler is not None,
+            "realtime_loop_configured": session_factory is not None,
             "access_control_required": server_config.access_token is not None,
         }
 
@@ -129,7 +145,41 @@ def create_browser_capture_app(
             return
         await websocket.accept()
         recorder: BrowserCaptureRecorder | None = None
+        runtime_session: RealtimeBrowserSession | None = None
+        runtime_stopped = False
         completion_status = "disconnected"
+        send_lock = asyncio.Lock()
+
+        async def send_json(payload: dict[str, Any]) -> None:
+            async with send_lock:
+                await websocket.send_json(payload)
+                if recorder is not None and payload.get("type") in AUDITED_RUNTIME_EVENTS:
+                    audited = dict(payload)
+                    audio_attached = isinstance(audited.pop("audio_base64", None), str)
+                    recorder.store.append_event(
+                        {
+                            "type": "realtime_loop_event",
+                            "event": audited,
+                            "audio_attached_to_browser_message": audio_attached,
+                            "payload_saved": False,
+                        }
+                    )
+
+        async def stop_runtime(status: str) -> None:
+            nonlocal runtime_stopped
+            if runtime_session is None or runtime_stopped:
+                return
+            runtime_stopped = True
+            await runtime_session.stop(status)
+
+        def runtime_metrics() -> dict[str, Any]:
+            if runtime_session is None:
+                return {}
+            metrics = getattr(runtime_session, "runtime_metrics", None)
+            if isinstance(metrics, dict):
+                return metrics
+            return {"api_call_count": runtime_session.api_call_count}
+
         try:
             try:
                 hello_event = await asyncio.wait_for(
@@ -151,7 +201,9 @@ def create_browser_capture_app(
                 max_image_bytes=server_config.max_image_bytes,
                 client_capabilities=capabilities,
             )
-            await websocket.send_json(
+            if session_factory is not None:
+                runtime_session = session_factory(session_id, send_json)
+            await send_json(
                 {
                     "type": "ready",
                     "protocol_version": PROTOCOL_VERSION,
@@ -162,6 +214,7 @@ def create_browser_capture_app(
                     "max_image_bytes": server_config.max_image_bytes,
                     "max_session_seconds": server_config.max_session_seconds,
                     "raw_media_saved": False,
+                    "realtime_loop_enabled": runtime_session is not None,
                 }
             )
             session_deadline = time.monotonic() + server_config.max_session_seconds
@@ -182,6 +235,8 @@ def create_browser_capture_app(
                     chunk = recorder.accept_packet(event["bytes"])
                     if chunk_handler is not None:
                         await chunk_handler(chunk)
+                    if runtime_session is not None:
+                        await runtime_session.accept_chunk(chunk)
                     continue
                 raw_text = event.get("text")
                 if raw_text is None:
@@ -189,21 +244,26 @@ def create_browser_capture_app(
                 control = _parse_control(raw_text)
                 if control["type"] == "start":
                     recorder.start()
-                    await websocket.send_json({"type": "started"})
+                    await send_json({"type": "started"})
+                    if runtime_session is not None:
+                        await runtime_session.start()
                 elif control["type"] == "stop":
                     completion_status = "completed"
+                    await stop_runtime(completion_status)
                     client_metrics = control.get("client_metrics")
                     summary = recorder.finish(
                         status=completion_status,
                         client_metrics=(
                             client_metrics if isinstance(client_metrics, dict) else None
                         ),
+                        runtime_metrics=runtime_metrics(),
                     )
-                    await websocket.send_json({"type": "summary", **summary.as_public_dict()})
+                    await send_json({"type": "summary", **summary.as_public_dict()})
                     await websocket.close(code=1000)
                     return
                 elif control["type"] == "abort":
                     completion_status = "failed"
+                    await stop_runtime(completion_status)
                     client_metrics = control.get("client_metrics")
                     summary = recorder.finish(
                         status=completion_status,
@@ -211,12 +271,15 @@ def create_browser_capture_app(
                         client_metrics=(
                             client_metrics if isinstance(client_metrics, dict) else None
                         ),
+                        runtime_metrics=runtime_metrics(),
                     )
-                    await websocket.send_json({"type": "summary", **summary.as_public_dict()})
+                    await send_json({"type": "summary", **summary.as_public_dict()})
                     await websocket.close(code=1011)
                     return
                 elif control["type"] == "ping":
-                    await websocket.send_json({"type": "pong"})
+                    await send_json({"type": "pong"})
+                elif runtime_session is not None and await runtime_session.handle_control(control):
+                    continue
                 else:
                     raise BrowserProtocolError(
                         f"unsupported control message: {control['type']}"
@@ -226,13 +289,18 @@ def create_browser_capture_app(
         except (BrowserProtocolError, ValueError, OSError) as exc:
             completion_status = "failed"
             if recorder is not None:
-                recorder.finish(status="failed", error=str(exc))
+                recorder.finish(
+                    status="failed",
+                    error=str(exc),
+                    runtime_metrics=runtime_metrics(),
+                )
             try:
-                await websocket.send_json({"type": "error", "message": str(exc)})
+                await send_json({"type": "error", "message": str(exc)})
                 await websocket.close(code=1003)
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
+            await stop_runtime(completion_status)
             if recorder is not None and not recorder.finished:
                 recorder.finish(
                     status=completion_status,
@@ -241,6 +309,7 @@ def create_browser_capture_app(
                         if completion_status == "disconnected"
                         else None
                     ),
+                    runtime_metrics=runtime_metrics(),
                 )
 
     return app
@@ -253,12 +322,13 @@ def run_browser_capture_server(
     output_dir: Path,
     access_token: str | None,
     log_level: str = "info",
+    session_factory: RealtimeSessionFactory | None = None,
 ) -> None:
     import uvicorn
 
     config = BrowserServerConfig(output_dir=output_dir, access_token=access_token)
     uvicorn.run(
-        create_browser_capture_app(config),
+        create_browser_capture_app(config, session_factory=session_factory),
         host=host,
         port=port,
         log_level=log_level,

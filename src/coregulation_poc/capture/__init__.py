@@ -10,6 +10,10 @@ from coregulation_poc.capture.media import (
     SpeakerRole,
     SpeakerSegment,
 )
+from coregulation_poc.capture.turn_boundary import (
+    TurnBoundaryConfig,
+    TurnBoundaryDetector,
+)
 
 __all__ = [
     "MediaChunk",
@@ -20,4 +24,6 @@ __all__ = [
     "MediaSourceError",
     "SpeakerRole",
     "SpeakerSegment",
+    "TurnBoundaryConfig",
+    "TurnBoundaryDetector",
 ]

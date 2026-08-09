@@ -45,6 +45,8 @@ states:
       - "normal task progression"
       - "active child participation"
       - "supportive parental guidance"
+      - "task completion"
+      - "positive dyadic exchange"
     history_required: false
 
   fluctuation:

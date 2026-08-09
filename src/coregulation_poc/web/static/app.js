@@ -7,6 +7,7 @@ const IMAGE_BACKPRESSURE_BYTES = 1024 * 1024;
 const elements = {
   consent: document.querySelector("#consent"),
   start: document.querySelector("#start-button"),
+  pauseInterventions: document.querySelector("#pause-interventions-button"),
   stop: document.querySelector("#stop-button"),
   status: document.querySelector("#status"),
   video: document.querySelector("#preview"),
@@ -16,6 +17,12 @@ const elements = {
   session: document.querySelector("#session-code"),
   summary: document.querySelector("#summary"),
   accessCode: document.querySelector("#access-code"),
+  intervention: document.querySelector("#intervention"),
+  interventionTarget: document.querySelector("#intervention-target"),
+  interventionHeading: document.querySelector("#intervention-heading"),
+  interventionMessage: document.querySelector("#intervention-message"),
+  interventionChannel: document.querySelector("#intervention-channel"),
+  dismissIntervention: document.querySelector("#dismiss-intervention"),
 };
 
 let socket = null;
@@ -35,6 +42,8 @@ let droppedImages = 0;
 let audioBackpressureStops = 0;
 let negotiated = null;
 let imageCaptureBusy = false;
+let interventionAudioUrl = null;
+let interventionsPaused = false;
 
 function makeSessionCode() {
   const randomPart = crypto.randomUUID
@@ -55,6 +64,19 @@ function updateCounters() {
   if (captureActive) {
     elements.elapsed.textContent = `${Math.round(performance.now() - startedAt)} ms`;
   }
+}
+
+function updateInterventionPauseControl() {
+  elements.pauseInterventions.dataset.paused = String(interventionsPaused);
+  elements.pauseInterventions.textContent = interventionsPaused ? "恢复提示" : "暂停提示";
+}
+
+function toggleInterventions() {
+  if (!captureActive || !socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: interventionsPaused ? "resume_interventions" : "pause_interventions",
+    recorded_at_ms: sessionTimestampMs(),
+  }));
 }
 
 function websocketUrl() {
@@ -111,6 +133,120 @@ function waitForMessage(ws, acceptedTypes, timeoutMs = 10000) {
     ws.addEventListener("message", onMessage);
     ws.addEventListener("close", onClose, { once: true });
   });
+}
+
+function sessionTimestampMs() {
+  return startedAt ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
+}
+
+function releaseInterventionAudio() {
+  if (interventionAudioUrl) URL.revokeObjectURL(interventionAudioUrl);
+  interventionAudioUrl = null;
+}
+
+function decodeBase64Audio(encoded, mimeType) {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: mimeType || "audio/wav" }));
+}
+
+async function playInterventionAudio(message) {
+  if (!message.voice_expected) {
+    return { status: "not_attempted" };
+  }
+  if (!message.audio_base64) {
+    return {
+      status: "failed",
+      started_at_ms: sessionTimestampMs(),
+      error: message.voice_error || "服务器未提供语音音频",
+    };
+  }
+  releaseInterventionAudio();
+  interventionAudioUrl = decodeBase64Audio(message.audio_base64, message.audio_mime_type);
+  const audio = new Audio(interventionAudioUrl);
+  const startedAtMs = sessionTimestampMs();
+  try {
+    await audio.play();
+    await new Promise((resolve, reject) => {
+      audio.addEventListener("ended", resolve, { once: true });
+      audio.addEventListener("error", () => reject(new Error("语音播放失败")), { once: true });
+    });
+    return {
+      status: "delivered",
+      started_at_ms: startedAtMs,
+      completed_at_ms: sessionTimestampMs(),
+      provider: message.voice_provider,
+      output_identifier: message.voice_output_identifier,
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      started_at_ms: startedAtMs,
+      provider: message.voice_provider,
+      error: error instanceof Error ? error.message : "语音播放失败",
+    };
+  }
+}
+
+async function presentIntervention(message) {
+  const targetNames = { parent: "给家长", child: "给儿童", both: "给家长和儿童" };
+  const visualStartedAtMs = sessionTimestampMs();
+  elements.interventionTarget.textContent = targetNames[message.target_actor] || "互动提示";
+  elements.interventionHeading.textContent = message.heading;
+  elements.interventionMessage.textContent = message.message;
+  elements.interventionChannel.textContent = message.voice_expected
+    ? "文字提示已显示，正在播放语音。"
+    : "文字提示已显示；本次未启用语音。";
+  elements.intervention.hidden = false;
+
+  const voice = await playInterventionAudio(message);
+  elements.interventionChannel.textContent = voice.status === "delivered"
+    ? "文字与语音提示均已完成。"
+    : voice.status === "failed"
+      ? "文字提示已显示，语音未能播放。"
+      : "文字提示已显示；本次未启用语音。";
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    type: "delivery_execution",
+    delivery_id: message.delivery_id,
+    recorded_at_ms: sessionTimestampMs(),
+    visual: {
+      status: "delivered",
+      started_at_ms: visualStartedAtMs,
+      completed_at_ms: visualStartedAtMs,
+      provider: "browser_overlay",
+    },
+    voice,
+  }));
+}
+
+function handleServerMessage(event) {
+  if (typeof event.data !== "string") return;
+  let message;
+  try {
+    message = JSON.parse(event.data);
+  } catch {
+    return;
+  }
+  if (message.type === "intervention") {
+    void presentIntervention(message);
+  } else if (message.type === "interventions_paused") {
+    interventionsPaused = true;
+    updateInterventionPauseControl();
+    elements.intervention.hidden = true;
+    setStatus("系统提示已暂停，音视频采集仍在继续。", "warning");
+  } else if (message.type === "interventions_resumed") {
+    interventionsPaused = false;
+    updateInterventionPauseControl();
+    setStatus("系统提示已恢复。", "success");
+  } else if (message.type === "loop_error") {
+    setStatus(`采集继续，但本轮分析失败：${message.message}`, "warning");
+  } else if (message.type === "state_update" && captureActive) {
+    setStatus("正在采集并进行闭环分析。", "success");
+  }
 }
 
 function encodePacket(packetType, timestampMs, payload) {
@@ -227,6 +363,7 @@ function releaseMedia() {
   if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
   mediaStream = null;
   elements.video.srcObject = null;
+  releaseInterventionAudio();
 }
 
 async function startCapture() {
@@ -245,6 +382,7 @@ async function startCapture() {
   try {
     socket = new WebSocket(websocketUrl());
     socket.binaryType = "arraybuffer";
+    socket.addEventListener("message", handleServerMessage);
     await waitForSocketOpen(socket);
     socket.send(JSON.stringify({
       type: "hello",
@@ -271,7 +409,10 @@ async function startCapture() {
     droppedImages = 0;
     audioBackpressureStops = 0;
     captureActive = true;
+    interventionsPaused = false;
+    updateInterventionPauseControl();
     stopping = false;
+    elements.pauseInterventions.disabled = false;
     elements.stop.disabled = false;
     setStatus("正在采集。原始音视频不会保存在服务器。", "success");
     await captureImage();
@@ -294,6 +435,7 @@ async function stopCapture(normal = true, reason = null) {
   stopping = true;
   releaseMedia();
   elements.stop.disabled = true;
+  elements.pauseInterventions.disabled = true;
   setStatus(normal ? "正在结束并生成检查结果…" : reason, normal ? "working" : "error");
 
   try {
@@ -322,12 +464,19 @@ async function stopCapture(normal = true, reason = null) {
     negotiated = null;
     elements.session.textContent = makeSessionCode();
     elements.start.disabled = false;
+    interventionsPaused = false;
+    updateInterventionPauseControl();
     stopping = false;
   }
 }
 
 elements.session.textContent = makeSessionCode();
 elements.start.addEventListener("click", () => void startCapture());
+elements.pauseInterventions.addEventListener("click", toggleInterventions);
 elements.stop.addEventListener("click", () => void stopCapture(true));
+elements.dismissIntervention.addEventListener("click", () => {
+  elements.intervention.hidden = true;
+});
 window.addEventListener("pagehide", releaseMedia);
 updateCounters();
+updateInterventionPauseControl();

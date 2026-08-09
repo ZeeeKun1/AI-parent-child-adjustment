@@ -22,6 +22,7 @@ from coregulation_poc.paths import (
     STATE_CODEBOOK_PATH,
     STRATEGY_CARDS_PATH,
 )
+from coregulation_poc.runtime import RealtimeLoopConfig, build_realtime_session_factory
 from coregulation_poc.settings import Settings
 from coregulation_poc.strategy_test import run_strategy_test
 from coregulation_poc.trajectory_test import run_trajectory_test
@@ -116,6 +117,19 @@ def main() -> None:
     web_live_parser.add_argument("--port", type=int, default=8000)
     web_live_parser.add_argument("--output-dir", type=Path)
     web_live_parser.add_argument(
+        "--enable-closed-loop",
+        action="store_true",
+        help="Enable paid multimodal assessments and intervention feedback",
+    )
+    web_live_parser.add_argument(
+        "--enable-voice",
+        action="store_true",
+        help="Generate Maia intervention audio; requires --enable-closed-loop",
+    )
+    web_live_parser.add_argument("--window-seconds", type=float, default=12.0)
+    web_live_parser.add_argument("--assessment-interval-seconds", type=float, default=12.0)
+    web_live_parser.add_argument("--max-assessments", type=int, default=30)
+    web_live_parser.add_argument(
         "--log-level",
         choices=("critical", "error", "warning", "info", "debug"),
         default="info",
@@ -168,6 +182,14 @@ def main() -> None:
         if not 1 <= args.port <= 65535:
             parser.error("--port must be between 1 and 65535")
         settings = Settings()
+        if args.enable_voice and not args.enable_closed_loop:
+            parser.error("--enable-voice requires --enable-closed-loop")
+        if args.window_seconds < 3:
+            parser.error("--window-seconds must be at least 3")
+        if args.assessment_interval_seconds < 1:
+            parser.error("--assessment-interval-seconds must be at least 1")
+        if args.max_assessments < 1:
+            parser.error("--max-assessments must be positive")
         output_dir = args.output_dir or settings.output_dir
         if not output_dir.is_absolute():
             parser.error("--output-dir must be an absolute path")
@@ -183,6 +205,23 @@ def main() -> None:
             )
         if access_token is not None and len(access_token) < 12:
             parser.error("BROWSER_CAPTURE_ACCESS_TOKEN must contain at least 12 characters")
+        media_format = MediaFormat()
+        session_factory = None
+        if args.enable_closed_loop:
+            try:
+                loop_config = RealtimeLoopConfig(
+                    window_duration_ms=round(args.window_seconds * 1000),
+                    assessment_interval_ms=round(args.assessment_interval_seconds * 1000),
+                    max_assessments_per_session=args.max_assessments,
+                    voice_enabled=args.enable_voice,
+                )
+                session_factory = build_realtime_session_factory(
+                    settings=settings,
+                    media_format=media_format,
+                    config=loop_config,
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
         print(
             json.dumps(
                 {
@@ -190,7 +229,11 @@ def main() -> None:
                     "open": f"http://{args.host}:{args.port}",
                     "https_required_outside_localhost": True,
                     "raw_media_saved": False,
-                    "api_called": False,
+                    "api_calls_enabled": args.enable_closed_loop,
+                    "voice_api_enabled": args.enable_voice,
+                    "max_assessments_per_session": (
+                        args.max_assessments if args.enable_closed_loop else 0
+                    ),
                     "access_control_required": access_token is not None,
                 },
                 ensure_ascii=False,
@@ -204,6 +247,7 @@ def main() -> None:
                 output_dir=output_dir,
                 access_token=access_token,
                 log_level=args.log_level,
+                session_factory=session_factory,
             )
         except OSError as exc:
             parser.exit(2, f"Browser capture server failed: {exc}\n")

@@ -17,12 +17,20 @@ research_basis:
   high_risk_requires_history: >-
     High risk describes a persistent controlling-dependent pattern or sustained
     strong task resistance and cannot be inferred from one isolated observation.
+  post_intervention_response_timeout: >-
+    If the dyad does not produce an observable response after repeated assessments,
+    the system must re-evaluate the current state rather than wait indefinitely.
+  reinforce_positive_coordination: >-
+    Positive reinforcement may maintain a constructive interaction loop, but it
+    should be used only after an observable positive event or self-recovery and at
+    a natural pause so that it does not become continuous praise or interruption.
 
 principles:
   use_hard_time_or_count_thresholds: false
   use_single_signal_as_trigger: false
   require_natural_turn_boundary_for_intervention: true
   require_post_intervention_response_before_repeat: true
+  post_intervention_max_wait_count: 3
   low_confidence_action: hold
   insufficient_evidence_action: hold
 
@@ -61,6 +69,23 @@ guard_actions:
     rationale: >-
       High-risk classification requires interaction history and cannot trigger a
       progressive support path from one isolated observation.
+
+positive_maintenance:
+  action: reinforce
+  reason_code: positive_maintenance_opportunity
+  allowed_states: [normal]
+  explicit_trigger_performances:
+    - "task completion"
+    - "positive dyadic exchange"
+    - "active child participation"
+    - "supportive parental guidance"
+  recovery_transition_states: [fluctuation]
+  requires_natural_turn_boundary: true
+  research_basis: [protect_natural_rhythm, reinforce_positive_coordination]
+  rationale: >-
+    A clearly positive event or self-recovery provides a bounded opportunity to
+    reinforce effective coordination without turning normal activity into constant
+    system intervention.
 
 state_actions:
   normal:

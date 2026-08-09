@@ -31,6 +31,7 @@
           </label>
           <div class="actions">
             <button id="start-button" type="button">开始采集</button>
+            <button id="pause-interventions-button" type="button" disabled>暂停提示</button>
             <button id="stop-button" type="button" disabled>结束采集</button>
           </div>
           <p id="status" role="status" aria-live="polite">等待开始。</p>
@@ -42,6 +43,16 @@
           <p class="session-line">本次技术会话：<span id="session-code"></span></p>
           <p id="summary" hidden></p>
         </aside>
+      </section>
+
+      <section id="intervention" class="intervention" role="dialog" aria-live="assertive" hidden>
+        <div>
+          <p id="intervention-target" class="intervention-target"></p>
+          <h2 id="intervention-heading"></h2>
+          <p id="intervention-message" class="intervention-message"></p>
+          <p id="intervention-channel" class="intervention-channel"></p>
+        </div>
+        <button id="dismiss-intervention" type="button">知道了</button>
       </section>
     </main>
     <script src="/static/app.js" defer></script>

@@ -91,7 +91,7 @@ def _selector() -> StrategySelector:
     return StrategySelector(load_strategy_library())
 
 
-def test_library_separates_parent_child_and_both_cards() -> None:
+def test_library_contains_parent_child_and_dyadic_cards() -> None:
     library = load_strategy_library()
 
     assert {card.target_actor for card in library.cards} == {
@@ -99,11 +99,7 @@ def test_library_separates_parent_child_and_both_cards() -> None:
         Actor.CHILD,
         Actor.BOTH,
     }
-    assert all(
-        state.value not in {"normal", "fluctuation"}
-        for card in library.cards
-        for state in card.states
-    )
+    assert len(library.cards) == 21
 
 
 def test_module_three_does_not_override_module_two_non_intervention() -> None:
@@ -144,7 +140,7 @@ def test_parent_pace_evidence_selects_parent_strategy() -> None:
     assert all(result.plan.validation_checks.values())
 
 
-def test_unknown_actor_uses_neutral_dyadic_fallback() -> None:
+def test_unknown_actor_holds_without_evidence() -> None:
     observation = _observation(
         state="dysregulation",
         performance="pace conflict",
@@ -158,12 +154,11 @@ def test_unknown_actor_uses_neutral_dyadic_fallback() -> None:
         decision=decision,
     )
 
-    assert result.plan is not None
-    assert result.plan.strategy_id == "DYAD_PACE_RESET"
-    assert result.plan.target_actor is Actor.BOTH
+    assert result.status is StrategySelectionStatus.HELD
+    assert result.hold_reason == "target_actor_evidence_insufficient"
 
 
-def test_child_task_evidence_selects_child_needs_card() -> None:
+def test_child_task_stall_first_clarifies_need() -> None:
     observation = _observation(
         state="dysregulation",
         performance="sustained task stall",
@@ -180,6 +175,98 @@ def test_child_task_evidence_selects_child_needs_card() -> None:
     assert result.plan is not None
     assert result.plan.strategy_id == "CHILD_NEEDS_INQUIRY"
     assert result.plan.target_actor is Actor.CHILD
+
+
+def test_child_task_support_follows_unresolved_needs_inquiry() -> None:
+    controller = _controller()
+    selector = _selector()
+    first_observation = _observation(
+        state="dysregulation",
+        performance="sustained task stall",
+        actor="child",
+        assessed_at_ms=1000,
+    )
+    first_decision = controller.ingest(first_observation)
+    first = selector.select(
+        assessment=first_observation.assessment,
+        decision=first_decision,
+    )
+    assert first.plan is not None
+    assert first.plan.strategy_id == "CHILD_NEEDS_INQUIRY"
+
+    second_observation = _observation(
+        state="dysregulation",
+        performance="sustained task stall",
+        actor="child",
+        assessed_at_ms=2000,
+        response_observed=True,
+        history_available=True,
+    )
+    second_decision = controller.ingest(second_observation)
+    second = selector.select(
+        assessment=second_observation.assessment,
+        decision=second_decision,
+        previous_plan=first.plan,
+    )
+
+    assert second.plan is not None
+    assert second.plan.strategy_id == "CHILD_STRATEGY_SUPPORT"
+
+
+def test_both_actor_evidence_uses_dyadic_card_not_single_actor_card() -> None:
+    observation = _observation(
+        state="dysregulation",
+        performance="misaligned understanding",
+        actor="both",
+        assessed_at_ms=1000,
+    )
+    decision = _controller().ingest(observation)
+
+    result = _selector().select(
+        assessment=observation.assessment,
+        decision=decision,
+    )
+
+    assert result.plan is not None
+    assert result.plan.strategy_id == "DYAD_RELATIONSHIP_RESET"
+    assert result.plan.target_actor is Actor.BOTH
+
+
+def test_both_actor_evidence_cannot_authorize_single_actor_card() -> None:
+    observation = _observation(
+        state="dysregulation",
+        performance="pace conflict",
+        actor="both",
+        assessed_at_ms=1000,
+    )
+    decision = _controller().ingest(observation)
+
+    result = _selector().select(
+        assessment=observation.assessment,
+        decision=decision,
+    )
+
+    assert result.status is StrategySelectionStatus.HELD
+    assert result.hold_reason == "target_actor_evidence_insufficient"
+
+
+def test_positive_event_authorizes_bounded_positive_reinforcement() -> None:
+    observation = _observation(
+        state="normal",
+        performance="active child participation",
+        actor="child",
+        assessed_at_ms=1000,
+    )
+    decision = _controller().ingest(observation)
+
+    result = _selector().select(
+        assessment=observation.assessment,
+        decision=decision,
+    )
+
+    assert decision.action.value == "reinforce"
+    assert result.plan is not None
+    assert result.plan.strategy_id == "CHILD_POSITIVE_AFFIRM"
 
 
 def test_child_escalation_selects_child_support_without_guessing_parent() -> None:
@@ -236,11 +323,11 @@ def test_high_risk_progresses_only_after_observed_non_recovery() -> None:
 
     assert second_decision.recovery_status is RecoveryStatus.NOT_RECOVERED
     assert second.plan is not None
-    assert second.plan.strategy_id == "DYAD_ROLE_RESTART"
+    assert second.plan.strategy_id == "PARENT_BOUNDARY_SET"
     assert second.plan.previous_strategy_id == "PARENT_AUTONOMY_SPACE"
 
 
-def test_deterioration_uses_approved_dyadic_brake() -> None:
+def test_deterioration_selects_de_escalation_card() -> None:
     controller = _controller()
     selector = _selector()
     first_observation = _observation(
@@ -273,7 +360,8 @@ def test_deterioration_uses_approved_dyadic_brake() -> None:
 
     assert second_decision.recovery_status is RecoveryStatus.DETERIORATED
     assert second.plan is not None
-    assert second.plan.strategy_id == "DYAD_AFFECT_BRAKE"
+    assert second.plan.strategy_id == "CHILD_PACE_RESET"
+    assert second.plan.target_actor is Actor.CHILD
 
 
 def test_strategy_replay_writes_auditable_plans(tmp_path: Path) -> None:

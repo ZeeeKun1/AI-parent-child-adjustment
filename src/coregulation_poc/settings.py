@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     tts_realtime_base_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
     connection_timeout_seconds: int = Field(default=20, ge=5, le=120)
     response_timeout_seconds: int = Field(default=90, ge=10, le=300)
-    browser_capture_access_token: SecretStr | None = None
+
+    text_chat_model: str = "qwen-plus"
+    text_chat_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    text_chat_max_tokens: int = Field(default=128, ge=16, le=1024)
+    text_chat_timeout_seconds: float = Field(default=10, ge=3, le=60)
 
     input_dir: Path = Field(default=DEFAULT_INPUT_DIR)
     output_dir: Path = Field(default=DEFAULT_OUTPUT_DIR)
@@ -68,3 +72,9 @@ class Settings(BaseSettings):
                 "api-ws/v1/realtime"
             )
         return self.tts_realtime_base_url
+
+    def text_chat_api_key(self) -> str | None:
+        """Return the API key for text chat, or None if not configured."""
+        if self.dashscope_api_key is None:
+            return None
+        return self.dashscope_api_key.get_secret_value()

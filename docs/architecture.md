@@ -43,9 +43,11 @@ After real-device dry-run validation, the same media chunks can be forwarded to 
 3. The browser sends a small binary protocol over a same-origin WebSocket. Audio backpressure stops explicitly; image overload skips frames and reports the count.
 4. `web/protocol.py` validates payload type, size, JPEG dimensions and timestamps, then emits the same `MediaChunk` used by local replay and DirectShow capture.
 5. `web/app.py` enforces session identifiers, optional experiment access codes, same-origin WebSockets and a maximum session duration. Non-local CLI binding requires an access code.
-6. Browser capture run artifacts contain metadata and metrics only. They exclude PCM, JPEG, device identifiers, remote IPs, access codes and API secrets.
+6. With explicit closed-loop enablement, `runtime/window.py` keeps a bounded in-memory multimodal window and `runtime/session.py` coordinates recognition, trajectory control, strategy selection, delivery, frontend execution acknowledgement and post-intervention observation.
+7. `runtime/recognition.py` creates a separate, traceable Qwen assessment request for each scheduled window. The CLI caps assessments per session; these scheduling values are engineering parameters, not state thresholds.
+8. Browser capture run artifacts contain metadata and metrics only. They exclude PCM, JPEG, device identifiers, remote IPs, access codes and API secrets, while recording actual API-call counts.
 
-The current browser server is a capture dry-run. Its per-session chunk hook is the boundary for the next Qwen integration; it does not yet generate state assessments or interventions.
+The browser server remains a capture-only dry-run by default. Paid recognition is reachable only through the explicit `--enable-closed-loop` flag, and realtime Maia synthesis requires the additional `--enable-voice` flag.
 
 ## Continuous trajectory control path
 

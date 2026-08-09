@@ -38,6 +38,7 @@ class ConfidenceLevel(StrEnum):
 class InterventionAction(StrEnum):
     NO_INTERVENTION = "no_intervention"
     OBSERVE = "observe"
+    REINFORCE = "reinforce"
     INTERVENE = "intervene"
     PROGRESSIVE_SUPPORT = "progressive_support"
     HOLD = "hold"
@@ -46,6 +47,7 @@ class InterventionAction(StrEnum):
 class InterventionDecisionReason(StrEnum):
     NORMAL_COORDINATION = "normal_coordination"
     SELF_RECOVERY_POSSIBLE = "self_recovery_possible"
+    POSITIVE_MAINTENANCE_OPPORTUNITY = "positive_maintenance_opportunity"
     DYAD_CANNOT_SELF_RECOVER = "dyad_cannot_self_recover"
     PERSISTENT_HIGH_RISK_PATTERN = "persistent_high_risk_pattern"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
@@ -63,6 +65,7 @@ class RecoveryStatus(StrEnum):
     NOT_RECOVERED = "not_recovered"
     DETERIORATED = "deteriorated"
     INDETERMINATE = "indeterminate"
+    TIMEOUT = "timeout"
 
 
 class TimedEvent(BaseModel):

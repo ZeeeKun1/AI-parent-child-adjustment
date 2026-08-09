@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -39,6 +41,7 @@ def test_browser_page_and_health_are_served(tmp_path: Path) -> None:
     assert page.status_code == 200
     assert "亲子共调节实时采集" in page.text
     assert "/static/app.js" in page.text
+    assert 'id="pause-interventions-button"' in page.text
     assert health.json()["raw_media_saved"] is False
 
 
@@ -142,3 +145,94 @@ def test_browser_rejects_cross_origin_websocket(tmp_path: Path) -> None:
 
     assert exc_info.value.code == 1008
     assert not (tmp_path / "output" / "runs").exists()
+
+
+def test_browser_routes_media_and_delivery_control_to_realtime_session(
+    tmp_path: Path,
+) -> None:
+    sessions: list[object] = []
+
+    class FakeSession:
+        def __init__(
+            self,
+            send_event: Callable[[dict[str, Any]], Awaitable[None]],
+        ) -> None:
+            self.send_event = send_event
+            self.started = False
+            self.chunks: list[MediaChunk] = []
+            self.controls: list[dict[str, object]] = []
+            self.stopped_with: list[str] = []
+
+        @property
+        def api_call_count(self) -> int:
+            return 0
+
+        async def start(self) -> None:
+            self.started = True
+            await self.send_event(
+                {
+                    "type": "intervention",
+                    "delivery_id": "delivery-1",
+                    "message": "approved test message",
+                    "audio_base64": "must-not-be-saved",
+                }
+            )
+
+        async def accept_chunk(self, chunk: MediaChunk) -> None:
+            self.chunks.append(chunk)
+
+        async def handle_control(self, control: dict[str, object]) -> bool:
+            if control.get("type") != "delivery_execution":
+                return False
+            self.controls.append(control)
+            await self.send_event({"type": "delivery_execution_received"})
+            return True
+
+        async def stop(self, status: str) -> None:
+            self.stopped_with.append(status)
+
+    def factory(
+        session_id: str,
+        send_event: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> FakeSession:
+        assert session_id == "loop_websocket_test"
+        session = FakeSession(send_event)
+        sessions.append(session)
+        return session
+
+    config = BrowserServerConfig(output_dir=tmp_path / "output")
+    app = create_browser_capture_app(config, session_factory=factory)
+    media_format = MediaFormat()
+    jpeg = encode_timestamped_jpeg(
+        np.full((120, 160, 3), 80, dtype=np.uint8),
+        timestamp_ms=101,
+        max_bytes=config.max_image_bytes,
+    )
+
+    with TestClient(app).websocket_connect("/ws/live") as websocket:
+        websocket.send_json(_hello("loop_websocket_test"))
+        assert websocket.receive_json()["type"] == "ready"
+        websocket.send_json({"type": "start"})
+        assert websocket.receive_json()["type"] == "started"
+        assert websocket.receive_json()["type"] == "intervention"
+        websocket.send_bytes(
+            encode_binary_packet(
+                MediaChunk(MediaKind.AUDIO, 100, b"\x00" * media_format.audio_chunk_bytes)
+            )
+        )
+        websocket.send_bytes(encode_binary_packet(MediaChunk(MediaKind.IMAGE, 101, jpeg)))
+        websocket.send_json({"type": "delivery_execution", "delivery_id": "delivery-1"})
+        assert websocket.receive_json()["type"] == "delivery_execution_received"
+        websocket.send_json({"type": "stop"})
+        assert websocket.receive_json()["type"] == "summary"
+
+    session = sessions[0]
+    assert isinstance(session, FakeSession)
+    assert session.started is True
+    assert [chunk.kind for chunk in session.chunks] == [MediaKind.AUDIO, MediaKind.IMAGE]
+    assert session.controls[0]["delivery_id"] == "delivery-1"
+    assert session.stopped_with == ["completed"]
+    run_dir = next((tmp_path / "output" / "runs").iterdir())
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert "must-not-be-saved" not in events
+    assert '"audio_attached_to_browser_message": true' in events

@@ -40,6 +40,7 @@ class BrowserCaptureSummary:
     first_timestamp_ms: int | None
     last_timestamp_ms: int | None
     normalized_timestamp_count: int
+    api_call_count: int
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
@@ -54,7 +55,8 @@ class BrowserCaptureSummary:
                 else self.last_timestamp_ms - self.first_timestamp_ms
             ),
             "raw_media_saved": False,
-            "api_called": False,
+            "api_called": self.api_call_count > 0,
+            "api_call_count": self.api_call_count,
         }
 
 
@@ -109,6 +111,7 @@ class BrowserCaptureRecorder:
         self.first_timestamp_ms: int | None = None
         self.last_timestamp_ms: int | None = None
         self.normalized_timestamp_count = 0
+        self.api_call_count = 0
         self._write_manifest(client_capabilities or {})
 
     @property
@@ -232,6 +235,7 @@ class BrowserCaptureRecorder:
         status: str,
         error: str | None = None,
         client_metrics: dict[str, Any] | None = None,
+        runtime_metrics: dict[str, Any] | None = None,
     ) -> BrowserCaptureSummary:
         if self.finished:
             return self.summary(status=status)
@@ -243,6 +247,26 @@ class BrowserCaptureRecorder:
             if key in {"dropped_images", "audio_backpressure_stops", "capture_duration_ms"}
             and isinstance(value, (int, float))
         }
+        public_runtime_metrics = {
+            key: value
+            for key, value in (runtime_metrics or {}).items()
+            if key
+            in {
+                "assessment_count",
+                "api_call_count",
+                "delivery_report_count",
+                "analysis_error_count",
+                "awaiting_post_intervention_response",
+                "voice_enabled",
+            }
+            and isinstance(value, (int, bool))
+        }
+        api_call_count = public_runtime_metrics.get("api_call_count", 0)
+        self.api_call_count = (
+            api_call_count
+            if isinstance(api_call_count, int) and not isinstance(api_call_count, bool)
+            else 0
+        )
         metrics = {
             "audio_chunk_count": self.audio_chunk_count,
             "image_chunk_count": self.image_chunk_count,
@@ -253,6 +277,7 @@ class BrowserCaptureRecorder:
             "timestamps_strictly_increasing": True,
             "normalized_timestamp_count": self.normalized_timestamp_count,
             "client_metrics": public_client_metrics,
+            "realtime_loop": public_runtime_metrics,
             "raw_media_saved": False,
         }
         self.store.write_json("metrics.json", metrics)
@@ -262,7 +287,8 @@ class BrowserCaptureRecorder:
                 "status": status,
                 "valid": valid,
                 "error": error,
-                "api_called": False,
+                "api_called": self.api_call_count > 0,
+                "api_call_count": self.api_call_count,
                 "raw_media_saved": False,
                 "finished_at": datetime.now(UTC).isoformat(),
             },
@@ -290,4 +316,5 @@ class BrowserCaptureRecorder:
             first_timestamp_ms=self.first_timestamp_ms,
             last_timestamp_ms=self.last_timestamp_ms,
             normalized_timestamp_count=self.normalized_timestamp_count,
+            api_call_count=self.api_call_count,
         )

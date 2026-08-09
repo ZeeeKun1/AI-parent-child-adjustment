@@ -135,6 +135,8 @@ button {
 }
 
 #start-button { background: #235b3c; color: white; }
+#pause-interventions-button { background: #fff3d9; color: #765415; }
+#pause-interventions-button[data-paused="true"] { background: #e7eef8; color: #28547a; }
 #stop-button { background: #e7ebe7; color: #25342b; }
 button:disabled { cursor: not-allowed; opacity: .45; }
 
@@ -182,9 +184,59 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   line-height: 1.55;
 }
 
+.intervention {
+  position: fixed;
+  z-index: 10;
+  right: 22px;
+  bottom: 22px;
+  width: min(520px, calc(100% - 44px));
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 22px;
+  align-items: end;
+  padding: 22px 24px;
+  border: 2px solid #235b3c;
+  border-radius: 18px;
+  background: #fffdf5;
+  box-shadow: 0 14px 44px rgba(23, 33, 27, .18);
+}
+
+.intervention[hidden] { display: none; }
+
+.intervention-target {
+  margin: 0 0 6px;
+  color: #557060;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+
+.intervention h2 { margin-bottom: 8px; }
+
+.intervention-message {
+  margin: 0;
+  color: #17211b;
+  font-size: clamp(20px, 3vw, 28px);
+  font-weight: 750;
+  line-height: 1.5;
+}
+
+.intervention-channel {
+  margin: 10px 0 0;
+  color: #68746c;
+  font-size: 12px;
+}
+
+#dismiss-intervention {
+  min-width: 92px;
+  background: #235b3c;
+  color: white;
+}
+
 @media (max-width: 760px) {
   main { width: min(100% - 20px, 560px); padding-top: 24px; }
   .grid { grid-template-columns: 1fr; }
   .preview-wrap { min-height: 240px; }
   .metrics { grid-template-columns: 1fr; }
+  .intervention { grid-template-columns: 1fr; right: 10px; bottom: 10px; width: calc(100% - 20px); }
 }
