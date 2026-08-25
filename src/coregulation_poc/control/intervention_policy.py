@@ -16,7 +16,8 @@ from coregulation_poc.paths import INTERVENTION_POLICY_PATH, resolve_project_pat
 class PolicyPrinciples(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    use_hard_time_or_count_thresholds: bool
+    use_data_derived_operational_thresholds: bool
+    require_corroborating_signal_for_dysregulation: bool
     use_single_signal_as_trigger: bool
     require_natural_turn_boundary_for_intervention: bool
     require_post_intervention_response_before_repeat: bool
@@ -99,7 +100,9 @@ class InterventionPolicy(BaseModel):
             raise ValueError("positive maintenance must use its dedicated reason code")
         if set(self.positive_maintenance.allowed_states) != {CoregulationState.NORMAL}:
             raise ValueError("positive maintenance is limited to the normal state")
-        if set(self.positive_maintenance.recovery_transition_states) != {CoregulationState.FLUCTUATION}:
+        if set(self.positive_maintenance.recovery_transition_states) != {
+            CoregulationState.FLUCTUATION
+        }:
             raise ValueError("positive maintenance recovery transitions are limited to fluctuation")
         if not self.positive_maintenance.requires_natural_turn_boundary:
             raise ValueError("positive maintenance must wait for a natural turn boundary")
@@ -117,8 +120,10 @@ class InterventionPolicy(BaseModel):
         if not self.principles.fluctuation_no_reinforcement:
             raise ValueError("fluctuation must not be reinforced")
 
-        if self.principles.use_hard_time_or_count_thresholds:
-            raise ValueError("hard time or count thresholds are not supported by the research")
+        if not self.principles.use_data_derived_operational_thresholds:
+            raise ValueError("classification must apply the data-derived operational thresholds")
+        if not self.principles.require_corroborating_signal_for_dysregulation:
+            raise ValueError("dysregulation requires a corroborating signal")
         if self.principles.use_single_signal_as_trigger:
             raise ValueError("a single signal cannot trigger intervention")
         if not self.principles.require_natural_turn_boundary_for_intervention:

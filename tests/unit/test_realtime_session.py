@@ -201,6 +201,9 @@ async def _exercise_four_module_loop() -> None:
 
     updates = [event for event in events if event["type"] == "state_update"]
     assert updates[-1]["state"] == "normal"
+    assert updates[-1]["model_state"] == "normal"
+    assert updates[-1]["boundary_rule_applied"] is False
+    assert "boundary_signals" in updates[-1]
     assert updates[-1]["recovery_status"] == "recovered"
     assert updates[-1]["post_intervention_response_observed"] is True
     assert session.controller.awaiting_post_intervention_response is False

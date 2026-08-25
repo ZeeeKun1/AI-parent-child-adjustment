@@ -64,7 +64,12 @@ def _format_acoustic_features(features: AcousticFeatures) -> str:
     if features.segments:
         lines.append("\nVOICED SEGMENTS:")
         for i, seg in enumerate(features.segments, 1):
-            f0_str = f"mean_F0={seg.mean_f0_hz:.0f} Hz, median_F0={seg.median_f0_hz:.0f} Hz" if seg.mean_f0_hz else "F0=N/A"
+            f0_str = (
+                f"mean_F0={seg.mean_f0_hz:.0f} Hz, "
+                f"median_F0={seg.median_f0_hz:.0f} Hz"
+                if seg.mean_f0_hz
+                else "F0=N/A"
+            )
             text_str = f", text=\"{seg.text}\"" if seg.text else ""
             lines.append(
                 f"  {i}. [{seg.start_ms}-{seg.end_ms} ms] "
@@ -111,7 +116,7 @@ def build_judgment_system_prompt(
             (
                 "You receive a perception report (speech turns and visual "
                 "observations) and acoustic features (F0, RMS energy, silence "
-                "gaps) extracted from a 12-second observation window. Your task "
+                "gaps) extracted from a 10-second observation window. Your task "
                 "is to classify the dyadic coregulation state using the supplied "
                 "formative-study codebook."
             ),
@@ -230,6 +235,31 @@ def build_judgment_system_prompt(
                 "field."
             ),
             (
+                "DATA-DERIVED BOUNDARY SIGNALS:\n"
+                "Return boundary_signals for every window using only directly "
+                "observable current-window evidence. These fields are consumed by "
+                "a deterministic cross-window boundary tracker.\n"
+                "1. task_stall_observed: true only when the task makes no meaningful "
+                "progress during the window; false when progress is directly "
+                "observed; null when task progress cannot be determined.\n"
+                "2. parental_prompt_count: count only direct parental urging, repeated "
+                "commands, or repeated questions used to push the child forward. Do "
+                "not count neutral explanation, praise, or one supportive question. "
+                "Use null when the parent cannot be identified or speech evidence is "
+                "insufficient.\n"
+                "3. conflict_action_observed: true only for a directly observed "
+                "physical conflict action such as forceful pointing, throwing a pen, "
+                "or tearing an eraser; false only when the relevant behavior is "
+                "visible throughout; otherwise null.\n"
+                "4. child_disengaged_observed: true only when the child is directly "
+                "observed withdrawing attention or participation from the homework; "
+                "do not equate ordinary thinking silence with disengagement.\n"
+                "5. regulation_balance: both_stable, one_stable, both_crossed, or "
+                "unclear. one_stable means one participant still maintains a rational, "
+                "task-oriented response while the other deviates. both_crossed means "
+                "both participants show observable loss of coordination."
+            ),
+            (
                 "JUDGMENT BOUNDARIES:\n"
                 "1. Do not classify the state from a single pitch, volume, or "
                 "facial expression; integrate multiple cues across the window.\n"
@@ -241,7 +271,13 @@ def build_judgment_system_prompt(
                 "5. The support_target must be supported by observable evidence; "
                 "do not guess.\n"
                 "6. Do not output intervention actions or intervention scripts; "
-                "assess only the observable state and its attributes."
+                "assess only the observable state and its attributes.\n"
+                "7. Use the codebook's operational_boundary as a trajectory-level "
+                "anchor: 10-to-30-second stalls with one participant stable support "
+                "fluctuation; at least 30 seconds without spontaneous recovery plus "
+                "corroborating evidence supports dysregulation. The runtime performs "
+                "the final cross-window calculation, so never invent missing duration "
+                "or counts."
             ),
             "Return exactly one JSON object. Do not use Markdown or add commentary.",
             (
@@ -269,6 +305,9 @@ def build_judgment_system_prompt(
             - task_process: smooth_progress
             - support_need: positive_reinforcement
             - support_target: both
+            - boundary_signals: task_stall_observed=false,
+              parental_prompt_count=0, conflict_action_observed=false,
+              child_disengaged_observed=false, regulation_balance=both_stable
 
             Reason:
             The child participates actively, the parent responds supportively, and
@@ -290,6 +329,9 @@ def build_judgment_system_prompt(
             - task_process: pace_mismatch
             - support_need: task_pacing
             - support_target: parent
+            - boundary_signals: task_stall_observed=true,
+              parental_prompt_count=0, conflict_action_observed=false,
+              child_disengaged_observed=false, regulation_balance=one_stable
 
             Reason:
             Coordination is temporarily uneven, but task engagement and the capacity
@@ -314,6 +356,9 @@ def build_judgment_system_prompt(
             - task_process: sustained_stall
             - support_need: mutual_understanding
             - support_target: both
+            - boundary_signals: task_stall_observed=true,
+              parental_prompt_count=3, conflict_action_observed=false,
+              child_disengaged_observed=true, regulation_balance=both_crossed
 
             Reason:
             The sequence shows a sustained task stall, pace conflict, rising tension,
@@ -339,6 +384,9 @@ def build_judgment_system_prompt(
             - task_process: over_assistance
             - support_need: autonomy_support
             - support_target: parent
+            - boundary_signals: task_stall_observed=true,
+              parental_prompt_count=null, conflict_action_observed=false,
+              child_disengaged_observed=false, regulation_balance=one_stable
 
             Reason:
             Current evidence and interaction history jointly demonstrate a persistent
@@ -409,7 +457,7 @@ def build_judgment_user_prompt(
                 "Compact prior assessment history (context only; current-window "
                 "evidence is still required). Each entry includes state, "
                 "confidence, interaction_performance, task_process, "
-                "support_need, and trajectory: "
+                "support_need, trajectory, and boundary_signals: "
                 + json.dumps(history_summary, ensure_ascii=False)
             ),
             (

@@ -243,6 +243,7 @@ class QwenWindowRecognizer:
                     item.support_need.value if item.support_need is not None else None
                 ),
                 "trajectory": item.trajectory.value,
+                "boundary_signals": item.boundary_signals.model_dump(mode="json"),
             }
             for item in history
         ]

@@ -219,6 +219,16 @@ function speakerBindingLabel(binding) {
 function describeEvent(event) {
   if (event.type === "state_update") {
     const parts = [stateLabels[event.state] || "未确定"];
+    if (event.model_state && event.model_state !== event.state) {
+      parts.push(`规则校正: ${stateLabels[event.model_state] || event.model_state} → ${stateLabels[event.state] || event.state}`);
+    }
+    if (Number.isFinite(event.active_stall_duration_ms)) {
+      parts.push(`连续停滞: ${Math.round(event.active_stall_duration_ms / 1000)}秒`);
+    }
+    if (Number.isFinite(event.rolling_parental_prompt_rate_per_minute)) {
+      parts.push(`催促频率: ${event.rolling_parental_prompt_rate_per_minute}/分钟`);
+    }
+    if (event.spontaneous_recovery) parts.push("30秒内自行恢复");
     if (event.trajectory) parts.push(`轨迹: ${trajectoryLabels[event.trajectory] || event.trajectory}`);
     if (event.task_process) parts.push(`任务: ${taskProcessLabels[event.task_process] || event.task_process}`);
     if (event.support_need) parts.push(`需要: ${supportNeedLabels[event.support_need] || event.support_need}`);

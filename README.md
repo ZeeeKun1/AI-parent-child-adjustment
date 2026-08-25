@@ -30,7 +30,7 @@ python -m coregulation_poc web-live `
   --max-assessments 3
 ```
 
-加`--enable-voice`才会额外调用固定 Qwen TTS 与 Maia 音色。`--window-seconds`、`--assessment-interval-seconds`和`--max-assessments`是额度与调度用的可配置工程参数，不是形成性研究中的状态阈值。
+加`--enable-voice`才会额外调用固定 Qwen TTS 与 Maia 音色。正式默认每10秒判断一次，最多180次，覆盖30分钟实验。窗口负责技术调度；状态边界由形成性研究中的操作化规则跨窗口累计实际停滞时长，并要求辅助证据，不能由一个窗口或一个信号单独决定。
 
 浏览器将音频转换为16 kHz单声道PCM16、约100 ms一块，将视频约每秒压缩为一张最大1280×720且带`frame_time_ms`的JPEG。服务器仅保存协议、格式、时间戳、块大小、数量、丢帧和错误，不保存PCM、JPEG、设备标识、远程IP、访问码或API密钥。详细说明见[浏览器服务器部署说明](docs/browser-deployment.md)。
 

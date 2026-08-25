@@ -108,6 +108,15 @@ class InteractionTrajectory(StrEnum):
     UNCLEAR = "unclear"
 
 
+class RegulationBalance(StrEnum):
+    """Observable balance between the two participants in the current window."""
+
+    BOTH_STABLE = "both_stable"
+    ONE_STABLE = "one_stable"
+    BOTH_CROSSED = "both_crossed"
+    UNCLEAR = "unclear"
+
+
 class TaskType(StrEnum):
     CHINESE = "chinese"
     MATHEMATICS = "mathematics"
@@ -246,6 +255,18 @@ class TaskContext(BaseModel):
     child_grade: str = Field(min_length=1, max_length=50)
 
 
+class BoundarySignals(BaseModel):
+    """Directly observable inputs for the data-derived state boundary rules."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_stall_observed: bool | None = None
+    parental_prompt_count: int | None = Field(default=None, ge=0)
+    conflict_action_observed: bool | None = None
+    child_disengaged_observed: bool | None = None
+    regulation_balance: RegulationBalance = RegulationBalance.UNCLEAR
+
+
 class StateAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -266,6 +287,7 @@ class StateAssessment(BaseModel):
     support_need: SupportNeed | None
     support_target: Actor
     interruptibility: Interruptibility
+    boundary_signals: BoundarySignals = Field(default_factory=BoundarySignals)
 
     modality_evidence: EvidenceByModality
     reason: str = Field(min_length=1)

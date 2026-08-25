@@ -22,7 +22,8 @@ def test_policy_maps_all_four_research_states() -> None:
 def test_policy_preserves_research_boundaries() -> None:
     policy = load_intervention_policy()
 
-    assert policy.principles.use_hard_time_or_count_thresholds is False
+    assert policy.principles.use_data_derived_operational_thresholds is True
+    assert policy.principles.require_corroborating_signal_for_dysregulation is True
     assert policy.principles.use_single_signal_as_trigger is False
     assert policy.principles.require_natural_turn_boundary_for_intervention is True
     assert policy.principles.require_post_intervention_response_before_repeat is True

@@ -14,7 +14,12 @@ import numpy as np
 
 from coregulation_poc.acoustics.tencent_voiceprint import SpeakerEnrollmentRecord
 from coregulation_poc.capture.media import MediaChunk
-from coregulation_poc.control import STATE_RANK, StateTrajectoryController, load_intervention_policy
+from coregulation_poc.control import (
+    STATE_RANK,
+    BoundaryStateTracker,
+    StateTrajectoryController,
+    load_intervention_policy,
+)
 from coregulation_poc.delivery import (
     ChannelExecution,
     DeliveryCoordinator,
@@ -39,10 +44,10 @@ TurnBoundaryDetector = Callable[[MediaWindow], bool]
 class RealtimeLoopConfig:
     """Engineering cadence controls; none of these values classify dyadic state."""
 
-    window_duration_ms: int = 12_000
-    assessment_interval_ms: int = 12_000
+    window_duration_ms: int = 10_000
+    assessment_interval_ms: int = 10_000
     post_intervention_observation_ms: int = 4_000
-    max_assessments_per_session: int = 150
+    max_assessments_per_session: int = 180
     history_assessments: int = 4
     voice_enabled: bool = False
 
@@ -141,6 +146,7 @@ class RealtimeSession:
         self.turn_boundary_detector = turn_boundary_detector
         self.window = RollingMediaWindow(duration_ms=self.config.window_duration_ms)
         self.controller = StateTrajectoryController(load_intervention_policy())
+        self.boundary_tracker = BoundaryStateTracker.from_codebook()
         self.strategy_library = load_strategy_library()
         message_generator = None
         if text_chat_provider is not None:
@@ -174,6 +180,8 @@ class RealtimeSession:
         self._analysis_error_count = 0
         self._speaker_binding_count = 0
         self._speaker_binding_success_count = 0
+        self._boundary_adjustment_count = 0
+        self._spontaneous_recovery_count = 0
         self._interventions_paused = False
         self._expert_takeover_active = False
         self._expert_pending: dict[str, Any] | None = None
@@ -208,6 +216,8 @@ class RealtimeSession:
             "analysis_error_count": self._analysis_error_count,
             "speaker_binding_count": self._speaker_binding_count,
             "speaker_binding_success_count": self._speaker_binding_success_count,
+            "boundary_adjustment_count": self._boundary_adjustment_count,
+            "spontaneous_recovery_count": self._spontaneous_recovery_count,
             "awaiting_post_intervention_response": (
                 self.controller.awaiting_post_intervention_response
             ),
@@ -351,13 +361,23 @@ class RealtimeSession:
                     "window_end_ms": snapshot.end_ms,
                 }
             )
-            assessment = await self.recognizer.assess(
+            model_assessment = await self.recognizer.assess(
                 session_id=self.session_id,
                 window=snapshot,
                 previous_state=self.previous_state,
                 history=history,
                 history_available=history_available,
             )
+            boundary_resolution = self.boundary_tracker.resolve(
+                model_assessment,
+                window_start_ms=snapshot.start_ms,
+                window_end_ms=snapshot.end_ms,
+            )
+            assessment = boundary_resolution.assessment
+            if boundary_resolution.rule_applied:
+                self._boundary_adjustment_count += 1
+            if boundary_resolution.spontaneous_recovery:
+                self._spontaneous_recovery_count += 1
             binding_event = self._speaker_binding_event(snapshot)
             if binding_event is not None:
                 await self.send_event(binding_event)
@@ -416,6 +436,7 @@ class RealtimeSession:
                     "support_target": assessment.support_target.value,
                     "interruptibility": assessment.interruptibility.value,
                     "interaction_performance": list(assessment.interaction_performance),
+                    **boundary_resolution.as_event_fields(),
                 }
             )
             selection = self.selector.select(

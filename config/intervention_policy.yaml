@@ -26,7 +26,8 @@ research_basis:
     a natural pause so that it does not become continuous praise or interruption.
 
 principles:
-  use_hard_time_or_count_thresholds: false
+  use_data_derived_operational_thresholds: true
+  require_corroborating_signal_for_dysregulation: true
   use_single_signal_as_trigger: false
   require_natural_turn_boundary_for_intervention: true
   require_post_intervention_response_before_repeat: true

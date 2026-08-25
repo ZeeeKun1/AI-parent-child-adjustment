@@ -156,9 +156,9 @@ def main() -> None:
         action="store_true",
         help="Generate Maia intervention audio; requires --enable-closed-loop",
     )
-    web_live_parser.add_argument("--window-seconds", type=float, default=12.0)
-    web_live_parser.add_argument("--assessment-interval-seconds", type=float, default=12.0)
-    web_live_parser.add_argument("--max-assessments", type=int, default=150)
+    web_live_parser.add_argument("--window-seconds", type=float, default=10.0)
+    web_live_parser.add_argument("--assessment-interval-seconds", type=float, default=10.0)
+    web_live_parser.add_argument("--max-assessments", type=int, default=180)
     web_live_parser.add_argument(
         "--log-level",
         choices=("critical", "error", "warning", "info", "debug"),
@@ -215,8 +215,8 @@ def main() -> None:
         action="store_true",
         help="Do not auto-confirm deliveries; interventions will be held pending",
     )
-    pipeline_parser.add_argument("--window-seconds", type=float, default=12.0)
-    pipeline_parser.add_argument("--assessment-interval-seconds", type=float, default=12.0)
+    pipeline_parser.add_argument("--window-seconds", type=float, default=10.0)
+    pipeline_parser.add_argument("--assessment-interval-seconds", type=float, default=10.0)
     pipeline_parser.add_argument("--max-assessments", type=int, default=0,
         help="Max assessments per session (0 = unlimited, run until video ends)")
     args = parser.parse_args()

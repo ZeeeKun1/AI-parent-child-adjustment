@@ -61,9 +61,9 @@ coregulation-poc web-live \
   --port 8766 \
   --enable-closed-loop \
   --enable-voice \
-  --window-seconds 12 \
-  --assessment-interval-seconds 12 \
-  --max-assessments 150
+  --window-seconds 10 \
+  --assessment-interval-seconds 10 \
+  --max-assessments 180
 ```
 
 不要漏掉 `--enable-closed-loop`，否则只有界面预览，不会调用模型判断状态。建议用 systemd 托管上述单进程命令，并设置失败自动重启。

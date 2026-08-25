@@ -56,14 +56,14 @@ python -m coregulation_poc web-live `
   --host 127.0.0.1 `
   --port 8000 `
   --enable-closed-loop `
-  --window-seconds 12 `
-  --assessment-interval-seconds 12 `
+  --window-seconds 10 `
+  --assessment-interval-seconds 10 `
   --max-assessments 3
 ```
 
 默认不启用语音，因此模块四使用可审计的文字降级路径。只有再加`--enable-voice`才会为每条实际干预调用 Qwen TTS 并在浏览器自动播放 Maia 音频。状态识别和语音都只由服务器持有密钥；音频只在内存中转换为 WAV 并发送给当前浏览器，不写入采集目录。
 
-`window`与`interval`控制技术调度，`max-assessments`限制单会话模型调用上限。这些值不参与四状态语义判断，也不应作为论文中的形成性研究阈值。
+`window`与`interval`控制技术调度，`max-assessments`限制单会话模型调用上限。默认10秒窗口与数据导出的操作化边界对齐：程序跨窗口累计实际停滞时长，并在达到30秒且出现辅助证据时才把边界规则用于失调判断。
 
 ## 服务器部署要求
 

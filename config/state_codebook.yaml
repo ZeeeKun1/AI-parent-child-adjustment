@@ -1,15 +1,40 @@
-version: 2
+version: 3
 source: "Formative study: 63 WOZ intervention episodes and expert interviews"
 
 classification_principles:
   boundary_basis: "Three-stage thematic analysis and formative study"
-  use_hard_time_or_count_thresholds: false
+  use_data_derived_operational_thresholds: true
+  thresholds_require_corroborating_evidence: true
   assess_whole_sequence: true
   preserve_boundary_uncertainty: true
   allow_alternative_state: true
   guidance: >-
     Classify dynamic interaction patterns from the observed trajectory rather than
     from one isolated error, utterance, gesture, duration threshold, or event count.
+
+operational_boundary:
+  source: "Data-derived temporal, behavioral, and dyadic boundary table"
+  expected_window_ms: 10000
+  fluctuation_stagnation_minimum_ms: 10000
+  dysregulation_stagnation_minimum_ms: 30000
+  spontaneous_recovery_window_ms: 30000
+  parental_prompt_rate_window_ms: 60000
+  high_parental_prompt_rate_per_minute_exclusive: 4.0
+  required_corroborating_signal_count: 1
+  corroborating_signals:
+    - "high_parental_prompt_rate"
+    - "conflict_action"
+    - "child_disengagement"
+    - "both_crossed"
+  guidance: >-
+    A continuously observed task stall between 10 and 30 seconds supports
+    fluctuation when one participant remains stable. A continuously observed stall
+    of at least 30 seconds supports dysregulation only when self-recovery is not
+    observed and at least one corroborating signal is present. A return to effective
+    task progress within 30 seconds is recorded as spontaneous recovery. Absolute
+    sound-pressure, numeric pose-angle, and numeric gaze thresholds are deferred
+    until the live measurement pipeline uses the same calibrated measurement
+    protocol as the source data.
 
 decision_dimensions:
   coordination_disruption:
@@ -52,8 +77,9 @@ states:
   fluctuation:
     label: "Fluctuation"
     definition: >-
-      Coordination becomes temporarily uneven, but at least one participant
-      remains stable and the dyad retains the capacity to recover without intervention.
+      Coordination becomes temporarily uneven during a 10-to-30-second task stall,
+      but at least one participant remains stable and the dyad retains the capacity
+      to recover without intervention.
     interaction_performance:
       - "brief task stall"
       - "child comprehension difficulty"
@@ -64,8 +90,10 @@ states:
   dysregulation:
     label: "Dysregulation"
     definition: >-
-      The dyad cannot restore effective interaction on its own, and the child's
-      attention has clearly shifted away from the homework task.
+      A task stall has persisted for at least 30 seconds without spontaneous
+      recovery, and the sequence contains corroborating evidence such as high-rate
+      parental prompting, child disengagement, conflict action, or both participants
+      crossing the regulation boundary.
     interaction_performance:
       - "sustained task stall"
       - "pace conflict"
