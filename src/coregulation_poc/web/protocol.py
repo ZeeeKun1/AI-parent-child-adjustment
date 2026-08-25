@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,8 @@ AUDIO_PACKET = 1
 IMAGE_PACKET = 2
 PACKET_HEADER = struct.Struct(">BQ")
 MAX_SESSION_TIMESTAMP_MS = 8 * 60 * 60 * 1_000
+STUDY_TIMEZONE_NAME = "Asia/Shanghai"
+STUDY_TIMEZONE = timezone(timedelta(hours=8), name=STUDY_TIMEZONE_NAME)
 
 
 class BrowserProtocolError(ValueError):
@@ -95,10 +97,14 @@ class BrowserCaptureRecorder:
         media_format: MediaFormat,
         max_image_bytes: int,
         client_capabilities: dict[str, Any] | None = None,
+        study_context: dict[str, Any] | None = None,
     ) -> None:
         if max_image_bytes < 1:
             raise ValueError("max_image_bytes must be positive")
-        self.store = RunArtifactStore(output_dir, session_id)
+        self.study_context = dict(study_context or {})
+        self.created_at_local = datetime.now(STUDY_TIMEZONE)
+        run_name = self._study_run_name() if self.study_context else None
+        self.store = RunArtifactStore(output_dir, session_id, run_name=run_name)
         self.media_format = media_format
         self.max_image_bytes = max_image_bytes
         self.normalizer = StrictTimestampNormalizer()
@@ -113,6 +119,16 @@ class BrowserCaptureRecorder:
         self.normalized_timestamp_count = 0
         self.api_call_count = 0
         self._write_manifest(client_capabilities or {})
+
+    def _study_run_name(self) -> str:
+        return "_".join(
+            (
+                self.study_context["participant_id"],
+                self.created_at_local.strftime("%Y%m%d_%H%M%S"),
+                self.study_context["experiment_label"],
+                self.study_context["session_round"],
+            )
+        )
 
     @property
     def run_dir(self) -> Path:
@@ -137,6 +153,9 @@ class BrowserCaptureRecorder:
                 "source_type": "browser_camera_microphone",
                 "protocol_version": PROTOCOL_VERSION,
                 "created_at": datetime.now(UTC).isoformat(),
+                "created_at_local": self.created_at_local.isoformat(),
+                "study_timezone": STUDY_TIMEZONE_NAME,
+                "study_context": self.study_context,
                 "media_format": asdict(self.media_format),
                 "client_capabilities": allowed_capabilities,
                 "privacy": {
@@ -244,7 +263,14 @@ class BrowserCaptureRecorder:
         public_client_metrics = {
             key: value
             for key, value in (client_metrics or {}).items()
-            if key in {"dropped_images", "audio_backpressure_stops", "capture_duration_ms"}
+            if key
+            in {
+                "dropped_images",
+                "audio_backpressure_stops",
+                "camera_health_failures",
+                "microphone_health_failures",
+                "capture_duration_ms",
+            }
             and isinstance(value, (int, float))
         }
         public_runtime_metrics = {
@@ -254,8 +280,11 @@ class BrowserCaptureRecorder:
             in {
                 "assessment_count",
                 "api_call_count",
+                "voiceprint_api_call_count",
                 "delivery_report_count",
                 "analysis_error_count",
+                "speaker_binding_count",
+                "speaker_binding_success_count",
                 "awaiting_post_intervention_response",
                 "voice_enabled",
             }

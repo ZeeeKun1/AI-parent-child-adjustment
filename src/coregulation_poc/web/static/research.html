@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' ws: wss:">
+    <title>研究控制台 · 一起完成</title>
+    <link rel="stylesheet" href="/static/research.css">
+  </head>
+  <body>
+    <section id="login-view" class="login-view">
+      <form id="login-form" class="login-card">
+        <p class="eyebrow">RESEARCH CONSOLE</p>
+        <h1>研究控制台</h1>
+        <p>查看会话状态、干预时间线，并在必要时以专家身份明确接管。</p>
+        <label>
+          <span>研究端访问码</span>
+          <input id="research-code" type="password" autocomplete="current-password" placeholder="输入研究端访问码">
+        </label>
+        <button type="submit">进入控制台</button>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+    </section>
+
+    <main id="console-view" class="console-shell" hidden>
+      <header class="console-header">
+        <div>
+          <p class="eyebrow">RESEARCH CONSOLE</p>
+          <h1>实时会话</h1>
+        </div>
+        <div class="connection-state" id="connection-state"><span></span>已连接</div>
+      </header>
+
+      <div class="console-grid">
+        <aside class="session-panel panel">
+          <div class="panel-heading">
+            <h2>家庭会话</h2>
+            <span id="session-count">0</span>
+          </div>
+          <div id="session-list" class="session-list">
+            <p class="empty">等待家庭端连接…</p>
+          </div>
+        </aside>
+
+        <section class="observation-panel panel">
+          <div id="no-selection" class="empty-state">
+            <strong>选择一个会话</strong>
+            <p>这里会显示识别状态、系统动作和干预记录。</p>
+          </div>
+          <div id="session-detail" hidden>
+            <div class="detail-header">
+              <div>
+                <p class="eyebrow">SELECTED SESSION</p>
+                <h2 id="detail-session-id"></h2>
+              </div>
+              <span id="detail-status" class="status-badge"></span>
+            </div>
+            <div class="state-strip">
+              <div><span>当前状态</span><strong id="current-state">尚无结果</strong></div>
+              <div><span>轨迹</span><strong id="current-trajectory">—</strong></div>
+              <div><span>任务过程</span><strong id="current-task-process">—</strong></div>
+              <div><span>支持需要</span><strong id="current-support-need">—</strong></div>
+              <div><span>支持对象</span><strong id="current-support-target">—</strong></div>
+              <div><span>说话人区分</span><strong id="current-speaker-binding">等待录音</strong></div>
+              <div><span>系统动作</span><strong id="current-action">观察中</strong></div>
+            </div>
+            <div class="privacy-note">研究端不接收可回放的原始音视频；这里只呈现系统状态与审计事件。</div>
+            <div class="timeline-heading"><h3>事件时间线</h3><button id="refresh-button" type="button">刷新</button></div>
+            <ol id="timeline" class="timeline"></ol>
+          </div>
+        </section>
+
+        <aside class="expert-panel panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">HUMAN OVERRIDE</p><h2>专家接管</h2></div>
+            <span id="takeover-state" class="status-badge">未接管</span>
+          </div>
+          <p class="panel-copy">接管会暂停 AI 自动提示。家庭端会明确看到“专家支持”，所有操作都会留痕。</p>
+          <label>
+            <span>专家标识</span>
+            <input id="operator" type="text" maxlength="80" placeholder="如：E01">
+          </label>
+          <label>
+            <span>接管或操作原因</span>
+            <textarea id="reason" maxlength="300" rows="3" placeholder="说明为何需要人工介入"></textarea>
+          </label>
+          <div class="takeover-actions">
+            <button id="takeover-button" class="primary" type="button" disabled>开始接管</button>
+            <button id="release-button" class="secondary" type="button" disabled>结束接管</button>
+          </div>
+          <hr>
+          <label>
+            <span>已审核策略</span>
+            <select id="strategy" disabled><option value="">请选择策略</option></select>
+          </label>
+          <label>
+            <span>发送给家庭的提示</span>
+            <textarea id="expert-message" maxlength="90" rows="4" placeholder="选择策略后可在约束内调整措辞" disabled></textarea>
+          </label>
+          <button id="send-intervention-button" class="primary" type="button" disabled>发送专家提示</button>
+          <p id="expert-feedback" class="form-feedback" role="status"></p>
+        </aside>
+      </div>
+    </main>
+    <script src="/static/research.js?v=2" defer></script>
+  </body>
+</html>

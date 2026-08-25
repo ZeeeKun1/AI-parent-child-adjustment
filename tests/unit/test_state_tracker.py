@@ -6,10 +6,14 @@ from coregulation_poc.control.intervention_policy import load_intervention_polic
 from coregulation_poc.control.state_tracker import StateTrajectoryController
 from coregulation_poc.models import (
     ControlObservation,
+    InteractionTrajectory,
     InterventionAction,
     InterventionDecisionReason,
+    Interruptibility,
     RecoveryStatus,
     StateAssessment,
+    SupportNeed,
+    TaskProcess,
 )
 
 
@@ -26,21 +30,28 @@ def _assessment(
     evidence_sufficient: bool = True,
     previous_state: str | None = None,
     performance: str | None = None,
+    trajectory: str = "stable",
+    interruptibility: str = "natural_pause",
 ) -> StateAssessment:
     if not evidence_sufficient:
         return StateAssessment(
             session_id=session_id,
             assessed_at_ms=assessed_at_ms,
             state=None,
+            previous_state=None,
+            trajectory="unclear",
             evidence_sufficiency="insufficient",
             confidence="low",
             ambiguity_reason="Observable evidence is insufficient.",
             interaction_performance=[],
+            task_process=None,
+            support_need=None,
+            support_target="unknown",
+            interruptibility="unclear",
             modality_evidence={
                 "audio": _insufficient_modality("Audio evidence is insufficient."),
                 "video": _insufficient_modality("Video evidence is insufficient."),
             },
-            previous_state=previous_state,
             reason="No state can be supported.",
         )
 
@@ -50,15 +61,35 @@ def _assessment(
         "dysregulation": ["pace conflict"],
         "high_risk": ["persistent interaction imbalance"],
     }
+    _task_process_defaults = {
+        "normal": "smooth_progress",
+        "fluctuation": "brief_stall",
+        "dysregulation": "pace_mismatch",
+        "high_risk": "unclear",
+    }
+    _support_need_defaults = {
+        "normal": "positive_reinforcement",
+        "fluctuation": "none",
+        "dysregulation": "emotional_support",
+        "high_risk": "autonomy_support",
+    }
+    task_process = _task_process_defaults.get(state, "unclear") if state else None
+    support_need = _support_need_defaults.get(state, "unclear") if state else None
     ambiguity_reason = None if confidence == "high" else "The state boundary is uncertain."
     return StateAssessment(
         session_id=session_id,
         assessed_at_ms=assessed_at_ms,
         state=state,
+        previous_state=previous_state,
+        trajectory=trajectory,
         evidence_sufficiency="sufficient",
         confidence=confidence,
         ambiguity_reason=ambiguity_reason,
         interaction_performance=[performance] if performance else performances[state],
+        task_process=task_process,
+        support_need=support_need,
+        support_target="parent",
+        interruptibility=interruptibility,
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -76,7 +107,6 @@ def _assessment(
             },
             "video": _insufficient_modality("Relevant behavior is outside the frame."),
         },
-        previous_state=previous_state,
         reason="The observed trajectory supports the selected state.",
     )
 
@@ -93,6 +123,8 @@ def _observation(
     session_id: str = "demo",
     previous_state: str | None = None,
     performance: str | None = None,
+    trajectory: str = "stable",
+    interruptibility: str = "natural_pause",
 ) -> ControlObservation:
     return ControlObservation(
         assessment=_assessment(
@@ -103,6 +135,8 @@ def _observation(
             evidence_sufficient=evidence_sufficient,
             previous_state=previous_state,
             performance=performance,
+            trajectory=trajectory,
+            interruptibility=interruptibility,
         ),
         natural_turn_boundary=boundary,
         post_intervention_response_observed=response_observed,
@@ -117,8 +151,8 @@ def _controller() -> StateTrajectoryController:
 @pytest.mark.parametrize(
     ("state", "expected_action", "expected_reason"),
     [
-        ("normal", InterventionAction.NO_INTERVENTION, "normal_coordination"),
-        ("fluctuation", InterventionAction.OBSERVE, "self_recovery_possible"),
+        ("normal", InterventionAction.HOLD, "waiting_for_natural_turn_boundary"),
+        ("fluctuation", InterventionAction.NO_INTERVENTION, "self_recovery_possible"),
     ],
 )
 def test_normal_and_fluctuation_do_not_intervene(
@@ -171,7 +205,9 @@ def test_self_recovery_from_fluctuation_can_be_reinforced() -> None:
     controller = _controller()
     controller.ingest(_observation("fluctuation", 1000, boundary=False))
 
-    decision = controller.ingest(_observation("normal", 2000, boundary=True))
+    decision = controller.ingest(
+        _observation("normal", 2000, boundary=True, trajectory="recovering")
+    )
 
     assert decision.action is InterventionAction.REINFORCE
     assert decision.reason_code is (
@@ -205,7 +241,7 @@ def test_controller_waits_for_response_then_records_recovery() -> None:
 
     assert waiting.action is InterventionAction.HOLD
     assert waiting.recovery_status is RecoveryStatus.PENDING
-    assert recovered.action is InterventionAction.NO_INTERVENTION
+    assert recovered.action is InterventionAction.HOLD
     assert recovered.recovery_status is RecoveryStatus.RECOVERED
     assert controller.awaiting_post_intervention_response is False
 

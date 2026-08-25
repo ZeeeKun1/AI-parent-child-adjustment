@@ -32,14 +32,23 @@ def _assessment(
     actor: str,
     assessed_at_ms: int,
     session_id: str = "strategy-demo",
+    task_process: str | None = None,
+    support_need: str | None = None,
+    support_target: str | None = None,
 ) -> StateAssessment:
     return StateAssessment(
         session_id=session_id,
         assessed_at_ms=assessed_at_ms,
         state=state,
+        previous_state=None,
+        trajectory="stable",
         evidence_sufficiency="sufficient",
         confidence="high",
         interaction_performance=[performance],
+        task_process=task_process,
+        support_need=support_need,
+        support_target=support_target if support_target is not None else actor,
+        interruptibility="natural_pause",
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -69,6 +78,9 @@ def _observation(
     assessed_at_ms: int,
     response_observed: bool = False,
     history_available: bool = False,
+    task_process: str | None = None,
+    support_need: str | None = None,
+    support_target: str | None = None,
 ) -> ControlObservation:
     return ControlObservation(
         assessment=_assessment(
@@ -76,6 +88,9 @@ def _observation(
             performance=performance,
             actor=actor,
             assessed_at_ms=assessed_at_ms,
+            task_process=task_process,
+            support_need=support_need,
+            support_target=support_target,
         ),
         natural_turn_boundary=True,
         post_intervention_response_observed=response_observed,
@@ -105,7 +120,7 @@ def test_library_contains_parent_child_and_dyadic_cards() -> None:
 def test_module_three_does_not_override_module_two_non_intervention() -> None:
     observation = _observation(
         state="normal",
-        performance="normal task progression",
+        performance="steady coordination",
         actor="both",
         assessed_at_ms=1000,
     )
@@ -126,6 +141,8 @@ def test_parent_pace_evidence_selects_parent_strategy() -> None:
         performance="pace conflict",
         actor="parent",
         assessed_at_ms=1000,
+        support_need="emotional_support",
+        task_process="pace_mismatch",
     )
     decision = _controller().ingest(observation)
 
@@ -146,6 +163,9 @@ def test_unknown_actor_holds_without_evidence() -> None:
         performance="pace conflict",
         actor="unknown",
         assessed_at_ms=1000,
+        support_target="both",
+        support_need="task_pacing",
+        task_process="pace_mismatch",
     )
     decision = _controller().ingest(observation)
 
@@ -164,6 +184,8 @@ def test_child_task_stall_first_clarifies_need() -> None:
         performance="sustained task stall",
         actor="child",
         assessed_at_ms=1000,
+        support_need="need_expression",
+        task_process="sustained_stall",
     )
     decision = _controller().ingest(observation)
 
@@ -185,6 +207,8 @@ def test_child_task_support_follows_unresolved_needs_inquiry() -> None:
         performance="sustained task stall",
         actor="child",
         assessed_at_ms=1000,
+        support_need="need_expression",
+        task_process="sustained_stall",
     )
     first_decision = controller.ingest(first_observation)
     first = selector.select(
@@ -201,6 +225,8 @@ def test_child_task_support_follows_unresolved_needs_inquiry() -> None:
         assessed_at_ms=2000,
         response_observed=True,
         history_available=True,
+        support_need="learning_support",
+        task_process="sustained_stall",
     )
     second_decision = controller.ingest(second_observation)
     second = selector.select(
@@ -219,6 +245,8 @@ def test_both_actor_evidence_uses_dyadic_card_not_single_actor_card() -> None:
         performance="misaligned understanding",
         actor="both",
         assessed_at_ms=1000,
+        support_need="mutual_understanding",
+        task_process="explanation_mismatch",
     )
     decision = _controller().ingest(observation)
 
@@ -238,6 +266,8 @@ def test_both_actor_evidence_cannot_authorize_single_actor_card() -> None:
         performance="pace conflict",
         actor="both",
         assessed_at_ms=1000,
+        support_need="task_pacing",
+        task_process="pace_mismatch",
     )
     decision = _controller().ingest(observation)
 
@@ -256,6 +286,7 @@ def test_positive_event_authorizes_bounded_positive_reinforcement() -> None:
         performance="active child participation",
         actor="child",
         assessed_at_ms=1000,
+        support_need="positive_reinforcement",
     )
     decision = _controller().ingest(observation)
 
@@ -275,6 +306,8 @@ def test_child_escalation_selects_child_support_without_guessing_parent() -> Non
         performance="escalating negative interaction",
         actor="child",
         assessed_at_ms=1000,
+        support_need="emotional_support",
+        task_process="sustained_stall",
     )
     decision = _controller().ingest(observation)
 
@@ -297,6 +330,8 @@ def test_high_risk_progresses_only_after_observed_non_recovery() -> None:
         actor="parent",
         assessed_at_ms=1000,
         history_available=True,
+        support_need="autonomy_support",
+        task_process="over_assistance",
     )
     first_decision = controller.ingest(first_observation)
     first = selector.select(
@@ -313,6 +348,8 @@ def test_high_risk_progresses_only_after_observed_non_recovery() -> None:
         assessed_at_ms=2000,
         response_observed=True,
         history_available=True,
+        support_need="autonomy_support",
+        task_process="over_assistance",
     )
     second_decision = controller.ingest(second_observation)
     second = selector.select(
@@ -335,6 +372,8 @@ def test_deterioration_selects_de_escalation_card() -> None:
         performance="pace conflict",
         actor="parent",
         assessed_at_ms=1000,
+        support_need="emotional_support",
+        task_process="pace_mismatch",
     )
     first_decision = controller.ingest(first_observation)
     first = selector.select(
@@ -350,6 +389,8 @@ def test_deterioration_selects_de_escalation_card() -> None:
         assessed_at_ms=2000,
         response_observed=True,
         history_available=True,
+        support_need="task_pacing",
+        task_process="pace_mismatch",
     )
     second_decision = controller.ingest(second_observation)
     second = selector.select(
@@ -368,7 +409,7 @@ def test_strategy_replay_writes_auditable_plans(tmp_path: Path) -> None:
     observations = [
         _observation(
             state="normal",
-            performance="normal task progression",
+            performance="steady coordination",
             actor="both",
             assessed_at_ms=1000,
         ),
@@ -377,6 +418,8 @@ def test_strategy_replay_writes_auditable_plans(tmp_path: Path) -> None:
             performance="pace conflict",
             actor="parent",
             assessed_at_ms=2000,
+            support_need="emotional_support",
+            task_process="pace_mismatch",
         ),
     ]
     request = TrajectoryReplayRequest(

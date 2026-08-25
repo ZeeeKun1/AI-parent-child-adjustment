@@ -18,6 +18,7 @@ dependencies = [
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "PyYAML>=6.0,<7",
+  "tencentcloud-sdk-python-asr>=3.1,<4",
   "uvicorn[standard]>=0.34,<1",
   "websocket-client>=1.8,<2",
 ]
@@ -27,6 +28,12 @@ dev = [
   "pytest>=8.3,<9",
   "pytest-asyncio>=0.25,<1",
   "ruff>=0.9,<1",
+]
+enrollment = [
+  "resemblyzer>=0.1.4,<1",
+  "librosa>=0.10,<1",
+  "typing>=3.7.4.3",
+  "webrtcvad>=2.0.10,<3",
 ]
 
 [project.scripts]
@@ -39,7 +46,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-"coregulation_poc.web" = ["static/*.html", "static/*.css", "static/*.js"]
+"coregulation_poc.web" = ["static/*.html", "static/*.css", "static/*.js", "static/img/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

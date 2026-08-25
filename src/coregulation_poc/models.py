@@ -55,6 +55,8 @@ class InterventionDecisionReason(StrEnum):
     WAITING_FOR_NATURAL_TURN_BOUNDARY = "waiting_for_natural_turn_boundary"
     WAITING_FOR_POST_INTERVENTION_RESPONSE = "waiting_for_post_intervention_response"
     HISTORY_REQUIRED = "history_required"
+    SUPPORT_NEED_NOT_IDENTIFIED = "support_need_not_identified"
+    SUPPORT_TARGET_UNIDENTIFIED = "support_target_unidentified"
 
 
 class RecoveryStatus(StrEnum):
@@ -66,6 +68,73 @@ class RecoveryStatus(StrEnum):
     DETERIORATED = "deteriorated"
     INDETERMINATE = "indeterminate"
     TIMEOUT = "timeout"
+
+
+class Interruptibility(StrEnum):
+    NATURAL_PAUSE = "natural_pause"
+    ACTIVE_SPEECH = "active_speech"
+    TASK_ENGAGED = "task_engaged"
+    UNCLEAR = "unclear"
+
+
+class TaskProcess(StrEnum):
+    SMOOTH_PROGRESS = "smooth_progress"
+    BRIEF_STALL = "brief_stall"
+    SUSTAINED_STALL = "sustained_stall"
+    PACE_MISMATCH = "pace_mismatch"
+    EXPLANATION_MISMATCH = "explanation_mismatch"
+    OVER_ASSISTANCE = "over_assistance"
+    DISENGAGED = "disengaged"
+    COMPLETION = "completion"
+    UNCLEAR = "unclear"
+
+
+class SupportNeed(StrEnum):
+    NONE = "none"
+    POSITIVE_REINFORCEMENT = "positive_reinforcement"
+    EMOTIONAL_SUPPORT = "emotional_support"
+    NEED_EXPRESSION = "need_expression"
+    MUTUAL_UNDERSTANDING = "mutual_understanding"
+    TASK_PACING = "task_pacing"
+    LEARNING_SUPPORT = "learning_support"
+    AUTONOMY_SUPPORT = "autonomy_support"
+    UNCLEAR = "unclear"
+
+
+class InteractionTrajectory(StrEnum):
+    STABLE = "stable"
+    WORSENING = "worsening"
+    RECOVERING = "recovering"
+    UNCLEAR = "unclear"
+
+
+class TaskType(StrEnum):
+    CHINESE = "chinese"
+    MATHEMATICS = "mathematics"
+    ENGLISH = "english"
+    MORALITY_AND_LAW = "morality_and_law"
+    SCIENCE = "science"
+    INFORMATION_TECHNOLOGY = "information_technology"
+    HISTORY = "history"
+    GEOGRAPHY = "geography"
+    PHYSICS = "physics"
+    CHEMISTRY = "chemistry"
+    BIOLOGY = "biology"
+
+    # Retain legacy values so existing study records and replays remain readable.
+    MATH_CALCULATION = "math_calculation"
+    MATH_WORD_PROBLEM = "math_word_problem"
+    READING_ALOUD = "reading_aloud"
+    DICTATION = "dictation"
+    READING = "reading"
+    OTHER = "other"
+
+
+class TaskDifficulty(StrEnum):
+    EASY = "easy"
+    MODERATE = "moderate"
+    CHALLENGING = "challenging"
+    UNKNOWN = "unknown"
 
 
 class TimedEvent(BaseModel):
@@ -166,23 +235,44 @@ class EvidenceByModality(BaseModel):
         return [*self.audio.items, *self.video.items]
 
 
+class TaskContext(BaseModel):
+    """Session-level task information provided before the session starts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_name: str = Field(min_length=1, max_length=200)
+    task_type: TaskType
+    task_difficulty: TaskDifficulty
+    child_grade: str = Field(min_length=1, max_length=50)
+
+
 class StateAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
     assessed_at_ms: int = Field(ge=0)
+
     state: CoregulationState | None
+    previous_state: CoregulationState | None
+    trajectory: InteractionTrajectory
+
     evidence_sufficiency: EvidenceSufficiency
     confidence: ConfidenceLevel
     alternative_state: CoregulationState | None = None
     ambiguity_reason: str | None = None
+
     interaction_performance: list[str]
+    task_process: TaskProcess | None
+    support_need: SupportNeed | None
+    support_target: Actor
+    interruptibility: Interruptibility
+
     modality_evidence: EvidenceByModality
-    previous_state: CoregulationState | None = None
     reason: str = Field(min_length=1)
+    limitations: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def require_state_only_with_evidence(self) -> StateAssessment:
+    def validate_assessment(self) -> StateAssessment:
         if self.evidence_sufficiency is EvidenceSufficiency.INSUFFICIENT and self.state is not None:
             raise ValueError("state must be null when evidence is insufficient")
         modality_sufficient = {
@@ -201,6 +291,8 @@ class StateAssessment(BaseModel):
                 raise ValueError("insufficient assessment must use low confidence")
             if self.alternative_state is not None:
                 raise ValueError("insufficient assessment cannot select an alternative state")
+            if self.support_target is not Actor.UNKNOWN:
+                raise ValueError("support_target must be unknown when evidence is insufficient")
         if self.evidence_sufficiency is EvidenceSufficiency.SUFFICIENT and self.state is None:
             raise ValueError("sufficient assessment requires a state")
         if self.alternative_state is not None:
@@ -211,7 +303,95 @@ class StateAssessment(BaseModel):
         if self.confidence is not ConfidenceLevel.HIGH:
             if self.ambiguity_reason is None or not self.ambiguity_reason.strip():
                 raise ValueError("low or medium confidence requires ambiguity_reason")
+        if self.support_target is Actor.PARENT:
+            if not any(item.actor is Actor.PARENT for item in self.modality_evidence.all_items):
+                raise ValueError("support_target=parent requires parent evidence")
+        if self.support_target is Actor.CHILD:
+            if not any(item.actor is Actor.CHILD for item in self.modality_evidence.all_items):
+                raise ValueError("support_target=child requires child evidence")
+        if self.support_need is SupportNeed.POSITIVE_REINFORCEMENT:
+            if self.state is not CoregulationState.NORMAL:
+                raise ValueError("positive_reinforcement is only allowed in normal state")
         return self
+
+
+class SpeechTurn(BaseModel):
+    """One transcribed speech turn from the perception stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speaker: Actor
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    text: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_time_order(self) -> SpeechTurn:
+        if self.end_ms < self.start_ms:
+            raise ValueError("end_ms must be >= start_ms")
+        return self
+
+
+class VisualObservation(BaseModel):
+    """One visual behavior observation from the perception stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp_ms: int = Field(ge=0)
+    actor: Actor
+    description: str = Field(min_length=1)
+
+
+class PerceptionReport(BaseModel):
+    """Stage-1 output: objective multimodal perception without state judgment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    speech_turns: list[SpeechTurn] = Field(default_factory=list)
+    visual_observations: list[VisualObservation] = Field(default_factory=list)
+    audio_limitation: str | None = None
+    video_limitation: str | None = None
+
+
+class AcousticSegment(BaseModel):
+    """One voiced segment enriched with acoustic features."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    speaker: str
+    mean_f0_hz: float | None = None
+    median_f0_hz: float | None = None
+    rms_energy: float = Field(ge=0.0, le=1.0)
+    text: str | None = None
+
+    @model_validator(mode="after")
+    def validate_time_order(self) -> AcousticSegment:
+        if self.end_ms < self.start_ms:
+            raise ValueError("end_ms must be >= start_ms")
+        return self
+
+
+class SilenceGap(BaseModel):
+    """A silence interval between two voiced segments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    duration_ms: int = Field(ge=0)
+
+
+class AcousticFeatures(BaseModel):
+    """Locally computed acoustic features for the judgment stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: list[AcousticSegment] = Field(default_factory=list)
+    silence_gaps: list[SilenceGap] = Field(default_factory=list)
+    total_speech_ms: int = Field(ge=0, default=0)
+    total_silence_ms: int = Field(ge=0, default=0)
 
 
 class ControlObservation(BaseModel):

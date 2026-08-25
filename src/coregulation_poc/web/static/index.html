@@ -4,57 +4,337 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:">
-    <title>亲子共调节实时采集</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <title>家庭作业亲子调节助手</title>
+    <link rel="stylesheet" href="/static/styles.css?v=10">
   </head>
-  <body>
-    <main>
-      <p class="eyebrow">REALTIME CAPTURE</p>
-      <h1>亲子共调节实时采集</h1>
-      <p class="lede">页面只在您明确允许后使用摄像头和麦克风。默认只保存采集状态、时间和数量，不保存可回放的原始音视频。</p>
-
-      <section class="grid" aria-label="实时采集控制">
-        <article class="card preview-wrap">
-          <video id="preview" muted playsinline aria-label="本地摄像头预览"></video>
-        </article>
-
-        <aside class="card panel">
-          <h2>开始前确认</h2>
-          <div class="notice">请确认摄像头能看到实验互动区域，麦克风能够同时听到家长和儿童。采集期间请保持本页面打开。</div>
-          <label class="consent">
-            <input id="consent" type="checkbox">
-            <span>我已理解本次采集会使用摄像头和麦克风，并愿意开始本次技术测试。</span>
-          </label>
-          <label class="access-code">
-            <span>实验访问码</span>
-            <input id="access-code" type="password" autocomplete="one-time-code" placeholder="由研究人员提供">
-          </label>
-          <div class="actions">
-            <button id="start-button" type="button">开始采集</button>
-            <button id="pause-interventions-button" type="button" disabled>暂停提示</button>
-            <button id="stop-button" type="button" disabled>结束采集</button>
-          </div>
-          <p id="status" role="status" aria-live="polite">等待开始。</p>
-          <div class="metrics" aria-label="实时采集指标">
-            <div class="metric"><span>音频块</span><strong id="audio-count">0</strong></div>
-            <div class="metric"><span>图像帧</span><strong id="image-count">0</strong></div>
-            <div class="metric"><span>已采集</span><strong id="elapsed">0 ms</strong></div>
-          </div>
-          <p class="session-line">本次技术会话：<span id="session-code"></span></p>
-          <p id="summary" hidden></p>
-        </aside>
-      </section>
-
-      <section id="intervention" class="intervention" role="dialog" aria-live="assertive" hidden>
+  <body data-phase="setup">
+    <header class="nav-bar">
+      <div class="nav-brand">
+        <img src="/static/img/companion-logo.png" alt="" class="brand-logo">
         <div>
-          <p id="intervention-target" class="intervention-target"></p>
-          <h2 id="intervention-heading"></h2>
-          <p id="intervention-message" class="intervention-message"></p>
-          <p id="intervention-channel" class="intervention-channel"></p>
+          <strong>家庭作业亲子调节助手</strong>
+          <small>陪你们按自己的节奏完成任务</small>
         </div>
-        <button id="dismiss-intervention" type="button">知道了</button>
+      </div>
+      <nav class="top-nav" aria-label="页面导航">
+        <button id="home-nav" class="nav-tab active" type="button" aria-current="page">首页</button>
+        <button id="record-nav" class="nav-tab" type="button" disabled>本次记录</button>
+      </nav>
+      <div class="family-display" aria-label="本次活动角色">
+        <span class="family-avatar placeholder" id="header-parent-avatar" aria-hidden="true"></span>
+        <span class="family-avatar placeholder" id="header-child-avatar" aria-hidden="true"></span>
+        <span id="header-family-label">共同可见</span>
+      </div>
+    </header>
+
+    <main class="main-stage" id="main-stage">
+      <section class="session-surface" aria-labelledby="stage-title">
+        <div class="stage-copy">
+          <div class="stage-state">
+            <span class="stage-indicator" aria-hidden="true"></span>
+            <span id="stage-label">准备中</span>
+          </div>
+          <div class="stage-target" id="stage-target" hidden>
+            <span class="target-avatars" id="stage-target-avatars" aria-hidden="true"></span>
+            <span id="stage-target-label"></span>
+          </div>
+          <h1 id="stage-title">准备开始</h1>
+          <p id="bubble-text" class="stage-message">完成准备后，一起开始今天的任务。</p>
+          <p id="stage-note" class="stage-note">页面会保持安静，只在需要时显示简短提示。</p>
+        </div>
+        <div class="stage-art" aria-hidden="true">
+          <img id="stage-mascot" src="/static/img/companion-observing.png" alt="">
+        </div>
       </section>
     </main>
-    <script src="/static/app.js" defer></script>
+
+    <div class="status-bar" id="session-controls" hidden>
+      <div class="live-state" id="live-state" data-active="false" data-state="idle">
+        <span class="dot" aria-hidden="true"></span><strong>尚未开始</strong>
+      </div>
+      <div class="live-device-health" aria-label="实时采集状态">
+        <div class="device-state compact" data-device-status="camera" data-state="unchecked">
+          <span class="device-state-dot" aria-hidden="true"></span><span>摄像头</span><strong>未检查</strong>
+        </div>
+        <div class="device-state compact" data-device-status="microphone" data-state="unchecked">
+          <span class="device-state-dot" aria-hidden="true"></span><span>麦克风</span><strong>未检查</strong>
+        </div>
+      </div>
+      <p id="status" role="status" aria-live="polite">等待开始。</p>
+      <div class="control-actions">
+        <button id="pause-interventions-button" class="ctrl-btn" type="button" disabled>暂停提示</button>
+        <button id="toggle-voice-button" class="ctrl-btn" type="button" disabled>关闭语音</button>
+        <button id="self-continue-button" class="ctrl-btn quiet" type="button" disabled>我们可以继续</button>
+        <button id="stop-button" class="ctrl-btn danger" type="button" disabled>结束活动</button>
+      </div>
+    </div>
+
+    <div class="modal-overlay" id="start-card">
+      <section class="modal-content" aria-labelledby="setup-title">
+        <header class="setup-hero">
+          <img src="/static/img/companion-logo.png" alt="" class="setup-logo">
+          <div>
+            <h2 id="setup-title">开始前，先准备一下</h2>
+            <p>活动中会使用摄像头和麦克风，并在需要时显示提示。提示可以忽略，活动也可以随时暂停或结束。</p>
+          </div>
+        </header>
+
+        <ol class="setup-steps" aria-label="准备步骤">
+          <li><span>1</span>填写信息</li>
+          <li><span>2</span>选择角色</li>
+          <li><span>3</span>录制声音</li>
+          <li><span>4</span>检查设备</li>
+          <li><span>5</span>确认开始</li>
+        </ol>
+
+        <section class="setup-section" aria-labelledby="basic-info-title">
+          <div class="section-heading">
+            <div>
+              <h3 id="basic-info-title">填写基本信息</h3>
+            </div>
+            <p>不需要填写姓名或联系方式。</p>
+          </div>
+          <div class="study-fields basic-fields">
+            <label class="form-field">
+              <span>家长年龄</span>
+              <input id="parent-age" type="number" min="18" max="80" inputmode="numeric" placeholder="18–80">
+            </label>
+            <label class="form-field">
+              <span>儿童年龄</span>
+              <input id="child-age" type="number" min="5" max="18" inputmode="numeric" placeholder="5–18">
+            </label>
+            <label class="form-field">
+              <span>儿童年级</span>
+              <input id="child-grade" type="text" maxlength="20" autocomplete="off" placeholder="如：三年级">
+            </label>
+          </div>
+        </section>
+
+        <section class="setup-section" aria-labelledby="family-role-title">
+          <div class="section-heading">
+            <div>
+              <h3 id="family-role-title">选择参与角色</h3>
+            </div>
+            <p>选好后，页面会显示对应的称呼和头像。</p>
+          </div>
+          <div class="role-selectors">
+            <fieldset class="role-selector" data-role-group="parent">
+              <legend>选择家长</legend>
+              <button class="role-option" type="button" data-role-group="parent" data-role="mother" data-label="妈妈" data-avatar="/static/img/avatar-mother.png" aria-pressed="false">
+                <img src="/static/img/avatar-mother.png" alt="">
+                <span>妈妈</span>
+              </button>
+              <button class="role-option" type="button" data-role-group="parent" data-role="father" data-label="爸爸" data-avatar="/static/img/avatar-father.png" aria-pressed="false">
+                <img src="/static/img/avatar-father.png" alt="">
+                <span>爸爸</span>
+              </button>
+            </fieldset>
+            <fieldset class="role-selector" data-role-group="child">
+              <legend>选择孩子</legend>
+              <button class="role-option" type="button" data-role-group="child" data-role="boy" data-label="儿子" data-avatar="/static/img/avatar-boy.png" aria-pressed="false">
+                <img src="/static/img/avatar-boy.png" alt="">
+                <span>儿子</span>
+              </button>
+              <button class="role-option" type="button" data-role-group="child" data-role="girl" data-label="女儿" data-avatar="/static/img/avatar-girl.png" aria-pressed="false">
+                <img src="/static/img/avatar-girl.png" alt="">
+                <span>女儿</span>
+              </button>
+            </fieldset>
+          </div>
+        </section>
+
+        <fieldset class="speaker-binding setup-section" id="speaker-binding">
+          <legend>声音绑定</legend>
+          <div class="section-heading binding-heading">
+            <div>
+              <h3>分别录一段声音</h3>
+            </div>
+            <span class="binding-count" id="binding-count">0 / 2</span>
+          </div>
+          <p class="binding-intro">请家长和孩子轮流朗读下面的句子，每段约 5 秒。录音会发送至腾讯云区分说话人，本地不保存，实验结束后删除云端声纹。</p>
+          <div class="binding-people">
+            <div class="binding-person" data-speaker="parent" data-bound="false">
+              <img id="parent-binding-avatar" class="binding-avatar" src="/static/img/avatar-mother.png" alt="">
+              <div class="binding-person-body">
+                <div class="binding-person-copy">
+                  <strong id="parent-role-label">家长</strong>
+                  <span id="parent-binding-status">未录音</span>
+                </div>
+                <p>请说：“我是今天陪孩子做作业的家长，我们准备开始了。”</p>
+                <button class="binding-button" type="button" data-speaker="parent">录家长声音</button>
+                <div class="binding-progress" aria-hidden="true"><span></span></div>
+              </div>
+            </div>
+            <div class="binding-person" data-speaker="child" data-bound="false">
+              <img id="child-binding-avatar" class="binding-avatar" src="/static/img/avatar-boy.png" alt="">
+              <div class="binding-person-body">
+                <div class="binding-person-copy">
+                  <strong id="child-role-label">孩子</strong>
+                  <span id="child-binding-status">未录音</span>
+                </div>
+                <p>请说：“我是今天要做作业的孩子，我们准备开始了。”</p>
+                <button class="binding-button" type="button" data-speaker="child">录孩子声音</button>
+                <div class="binding-progress" aria-hidden="true"><span></span></div>
+              </div>
+            </div>
+          </div>
+          <p class="binding-feedback" id="binding-feedback" role="status" aria-live="polite">选好角色后，分别录一段声音。</p>
+        </fieldset>
+
+        <section class="device-check setup-section" aria-labelledby="device-check-title">
+          <div class="section-heading device-check-heading">
+            <div>
+              <h3 id="device-check-title">检查摄像头和麦克风</h3>
+            </div>
+          </div>
+          <p class="device-check-intro">录好两段声音后进行检查。画面只用于确认采集范围，不在本地保存。</p>
+          <div class="device-check-layout">
+            <div class="device-preview" id="device-preview" data-active="false">
+              <video id="preview" muted playsinline aria-label="摄像头检查画面"></video>
+              <div class="device-preview-placeholder">检查后在这里确认画面范围</div>
+            </div>
+            <div class="device-state-list" aria-live="polite">
+              <div class="device-state" data-device-status="camera" data-state="unchecked">
+                <span class="device-state-dot" aria-hidden="true"></span>
+                <span>摄像头</span>
+                <strong>未检查</strong>
+              </div>
+              <div class="device-state" data-device-status="microphone" data-state="unchecked">
+                <span class="device-state-dot" aria-hidden="true"></span>
+                <span>麦克风</span>
+                <strong>未检查</strong>
+              </div>
+              <p id="device-check-feedback" class="device-check-feedback" role="status">请先完成家长和孩子的声音录制。</p>
+              <button id="device-check-button" class="secondary-action" type="button" disabled>录完声音后可检查</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="setup-section" aria-labelledby="task-context-title">
+          <div class="section-heading">
+            <div>
+              <h3 id="task-context-title">填写今天的作业</h3>
+            </div>
+            <p>填上作业内容、学科、难度和孩子的年级。</p>
+          </div>
+          <div class="study-fields task-fields">
+            <label class="form-field wide">
+              <span>任务名称</span>
+              <input id="task-name" type="text" maxlength="100" autocomplete="off" placeholder="如：数学练习册第 3 页">
+            </label>
+            <label class="form-field">
+              <span>作业学科</span>
+              <select id="task-type">
+                <option value="">请选择</option>
+                <option value="chinese">语文</option>
+                <option value="mathematics">数学</option>
+                <option value="english">英语</option>
+                <option value="morality_and_law">道德与法治</option>
+                <option value="science">科学</option>
+                <option value="information_technology">信息技术</option>
+                <option value="history">历史</option>
+                <option value="geography">地理</option>
+                <option value="physics">物理</option>
+                <option value="chemistry">化学</option>
+                <option value="biology">生物</option>
+                <option value="other">其他</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span>任务难度</span>
+              <select id="task-difficulty">
+                <option value="">请选择</option>
+                <option value="easy">较简单</option>
+                <option value="moderate">适中</option>
+                <option value="challenging">有挑战</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+
+        <footer class="setup-footer">
+          <label class="consent">
+            <input id="consent" type="checkbox">
+            <span>我们已了解采集说明，并同意开始本次活动。</span>
+          </label>
+          <p class="start-requirement" id="start-requirement">先选择家长和孩子，再录好两段声音。</p>
+          <button id="start-button" class="start-btn" type="button" disabled>开始活动</button>
+          <button id="dev-skip-button" class="dev-skip-btn" type="button" hidden>开发者直入</button>
+        </footer>
+      </section>
+    </div>
+
+    <section id="intervention" class="intervention-overlay" role="dialog" aria-modal="true" aria-live="assertive" hidden>
+      <div class="intervention-backdrop"></div>
+      <div class="intervention-content">
+        <div class="intervention-copy">
+          <div class="intervention-meta">
+            <span id="intervention-source" data-source="ai">AI 支持</span>
+            <div class="intervention-target-profile">
+              <span class="target-avatars" id="intervention-target-avatars" aria-hidden="true"></span>
+              <span id="intervention-target"></span>
+            </div>
+          </div>
+          <h2 id="intervention-heading"></h2>
+          <p id="intervention-message" class="intervention-message"></p>
+          <div id="difficulty-options" class="difficulty-options" hidden>
+            <p>现在的任务感觉怎么样？</p>
+            <div>
+              <button type="button" data-response="task_too_easy">有点简单</button>
+              <button type="button" data-response="task_just_right">刚刚好</button>
+              <button type="button" data-response="task_too_hard">有点难</button>
+            </div>
+          </div>
+          <p id="intervention-channel" class="intervention-channel"></p>
+          <button id="dismiss-intervention" class="start-btn" type="button">知道了，继续</button>
+        </div>
+        <div class="intervention-art" aria-hidden="true">
+          <img id="intervention-mascot" src="/static/img/companion-strategy.png" alt="">
+        </div>
+      </div>
+    </section>
+
+    <section id="session-summary" class="summary-overlay" aria-labelledby="summary-title" hidden>
+      <div class="summary-shell">
+        <header class="summary-hero">
+          <div class="summary-family" id="summary-family" aria-hidden="true"></div>
+          <div>
+            <p class="eyebrow">本次活动记录</p>
+            <h2 id="summary-title">今天的共同任务完成了</h2>
+            <p id="summary" role="status">正在整理本次记录。</p>
+          </div>
+          <img src="/static/img/companion-positive.png" alt="" class="summary-mascot">
+        </header>
+        <div class="summary-metrics" aria-label="本次活动数据">
+          <article><span>共同活动</span><strong id="summary-duration">0 分钟</strong></article>
+          <article><span>支持提示</span><strong id="summary-interventions">0 次</strong></article>
+          <article><span>积极肯定</span><strong id="summary-positive">0 次</strong></article>
+          <article><span>提示后观察到改善</span><strong id="summary-improvements">0 次</strong></article>
+        </div>
+        <section class="summary-support-card" aria-labelledby="support-summary-title">
+          <div>
+            <p class="section-kicker">支持内容</p>
+            <h3 id="support-summary-title">这次主要提供了哪些帮助？</h3>
+          </div>
+          <div id="summary-supports" class="support-bars"></div>
+        </section>
+        <p class="summary-caveat">这些数据是系统对本次过程的简要记录，不是对家长或孩子的评分。提示后的变化仅表示后续互动中观察到改善，不代表因果关系。</p>
+        <button id="new-session-button" class="start-btn summary-action" type="button">完成并返回准备页</button>
+      </div>
+    </section>
+
+    <details class="technical-details">
+      <summary>技术状态</summary>
+      <div class="metrics">
+        <div><span>音频块</span><strong id="audio-count">0</strong></div>
+        <div><span>图像帧</span><strong id="image-count">0</strong></div>
+        <div><span>已进行</span><strong id="elapsed">0:00</strong></div>
+      </div>
+      <p>会话编号：<span id="session-code"></span></p>
+      <div class="camera-empty" id="camera-empty" hidden>摄像头预览</div>
+    </details>
+
+    <script src="/static/app.js?v=12" defer></script>
   </body>
 </html>

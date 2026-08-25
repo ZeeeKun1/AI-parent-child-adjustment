@@ -16,7 +16,9 @@
 python -m coregulation_poc web-live --host 127.0.0.1 --port 8000
 ```
 
-然后在浏览器打开`http://127.0.0.1:8000`。服务器部署时必须配置`BROWSER_CAPTURE_ACCESS_TOKEN`，使用`--host 0.0.0.0`监听，并通过 HTTPS/WSS 反向代理提供服务；非本机监听而没有访问码时程序会拒绝启动。
+然后在共同观看的平板上打开`http://127.0.0.1:8000`，研究人员可在电脑打开`http://127.0.0.1:8000/research`。家庭端只呈现活动、必要提示与自主控制；研究端显示会话状态、事件时间线和专家接管面板，不接收可回放的原始音视频。
+
+服务器部署时，家庭端无需邀请码：填写基本信息、选择角色并完成两段声音采集后即可开始。服务器通过腾讯云官方 SDK 临时注册双方声纹，互动中使用1:N匹配区分家长与儿童，结束后删除云端声纹。腾讯密钥仅配置在服务器环境变量中。研究控制台仍使用独立的`RESEARCH_CONSOLE_ACCESS_TOKEN`。公网必须通过 HTTPS/WSS 访问，且启动命令需显式加入`--enable-closed-loop`；完整步骤见[阿里云部署说明](docs/aliyun-deployment.md)。
 
 完成本地采集验收后，可显式开启实时闭环；以下示例最多进行 3 次付费状态识别，语音保持关闭，干预使用文字回退：
 
@@ -31,6 +33,8 @@ python -m coregulation_poc web-live `
 加`--enable-voice`才会额外调用固定 Qwen TTS 与 Maia 音色。`--window-seconds`、`--assessment-interval-seconds`和`--max-assessments`是额度与调度用的可配置工程参数，不是形成性研究中的状态阈值。
 
 浏览器将音频转换为16 kHz单声道PCM16、约100 ms一块，将视频约每秒压缩为一张最大1280×720且带`frame_time_ms`的JPEG。服务器仅保存协议、格式、时间戳、块大小、数量、丢帧和错误，不保存PCM、JPEG、设备标识、远程IP、访问码或API密钥。详细说明见[浏览器服务器部署说明](docs/browser-deployment.md)。
+
+家庭只填写年龄、年级、参与角色和本次作业信息；匿名会话编号由页面自动生成。运行目录使用中国标准时间和该匿名编号命名，若同秒重名则自动追加序号。
 
 ## 实时摄像头与麦克风采集测试
 
@@ -81,7 +85,7 @@ python -m coregulation_poc video-test --video $videoPath --session-id P01_normal
 
 结构化结果将音频和视频证据分别记录。音频证据必须引用观察到的原话；视频证据必须引用画面中的`frame_time_ms`标签并描述直接可见的行为。任一模态均可单独标记为证据不足，不要求每次判断都同时具备两种模态证据。`audit.json`和`metrics.json`会将分类结构有效性与证据审计完整性分开报告；ASR失败不会再被隐藏为完全成功。
 
-本地声学层使用 Praat/Parselmouth 测量音高分布、有声帧比例、强度和 dBFS，不输出情绪或共调节状态。Qwen 输入转录事件中的情绪标签另存为辅助观察。当前回放音轨是未绑定说话者的混合单声道，因此声学结果标记为 `limited` 和 `actor=unknown`；待前端声纹绑定接入后再按家长、儿童片段计算说话者内变化。任何单一声学特征都不能触发状态分类。
+本地声学层使用 Praat/Parselmouth 测量音高分布、有声帧比例、强度和 dBFS，不输出情绪或共调节状态。浏览器实验通过腾讯云声纹匹配给连续语音片段绑定家长或儿童；低于阈值的结果仍选择最高分角色，但会保留低置信和强制归属标记。无法获得任何有效声纹结果时，本轮分析失败且不触发干预。任何单一声学特征都不能触发状态分类。
 
 主要产物包括：
 
@@ -156,7 +160,7 @@ tests/                     单元测试、集成测试和本地视频夹具
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,enrollment]"
 Copy-Item .env.example .env
 python -m coregulation_poc doctor
 pytest

@@ -11,12 +11,15 @@ from coregulation_poc.models import (
     ControlObservation,
     CoregulationState,
     EvidenceSufficiency,
+    InteractionTrajectory,
     InterventionAction,
     InterventionDecision,
     InterventionDecisionReason,
+    Interruptibility,
     RecoveryStatus,
     StateTrajectoryPoint,
     StateTrajectorySnapshot,
+    SupportNeed,
 )
 
 STATE_RANK = {
@@ -120,6 +123,14 @@ class StateTrajectoryController:
         )
         if positive_performances:
             rule = self.policy.positive_maintenance
+            if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                    recovery_status=recovery_status,
+                )
             if rule.requires_natural_turn_boundary and not observation.natural_turn_boundary:
                 return self._record_guard_decision(
                     observation=observation,
@@ -139,6 +150,28 @@ class StateTrajectoryController:
             return decision
 
         rule = self.policy.state_actions[assessment.state]
+
+        if assessment.state is CoregulationState.DYSREGULATION:
+            if assessment.support_need is None or assessment.support_need in (
+                SupportNeed.NONE,
+                SupportNeed.UNCLEAR,
+            ):
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
+                    recovery_status=recovery_status,
+                )
+            if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                    recovery_status=recovery_status,
+                )
+
         if rule.history_required and not observation.interaction_history_available:
             return self._record_guard_decision(
                 observation=observation,
@@ -147,6 +180,15 @@ class StateTrajectoryController:
                 reason=InterventionDecisionReason.HISTORY_REQUIRED,
                 recovery_status=recovery_status,
             )
+        if assessment.state is CoregulationState.HIGH_RISK:
+            if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
+                return self._record_guard_decision(
+                    observation=observation,
+                    previous_state=previous_state,
+                    sequence=sequence,
+                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                    recovery_status=recovery_status,
+                )
         if rule.requires_natural_turn_boundary and not observation.natural_turn_boundary:
             return self._record_guard_decision(
                 observation=observation,
@@ -176,16 +218,24 @@ class StateTrajectoryController:
         explicit = observed.intersection(rule.explicit_trigger_performances)
         self._reinforced_positive_performances.intersection_update(explicit)
 
-        transition = set()
+        candidates = set()
+
+        # Case 1: explicit positive reinforcement need in an allowed state.
+        if (
+            assessment.state in rule.allowed_states
+            and assessment.support_need is SupportNeed.POSITIVE_REINFORCEMENT
+        ):
+            candidates |= explicit
+
+        # Case 2: recovery from fluctuation confirmed by trajectory.
         if (
             assessment.state in rule.allowed_states
             and previous_state in rule.recovery_transition_states
+            and assessment.trajectory is InteractionTrajectory.RECOVERING
             and recovery_status is RecoveryStatus.NOT_APPLICABLE
-            and "normal task progression" in observed
         ):
-            transition.add("normal task progression")
+            candidates |= explicit
 
-        candidates = explicit | transition
         return candidates - self._reinforced_positive_performances
 
     def snapshot(self) -> StateTrajectorySnapshot:

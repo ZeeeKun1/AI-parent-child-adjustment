@@ -12,16 +12,27 @@ def build_state_assessment_prompt(
     codebook: dict[str, object],
     image_interval_ms: int,
     speaker_roles_bound: bool = False,
+    speaker_binding_description: str | None = None,
 ) -> str:
     schema = StateAssessment.model_json_schema()
-    speaker_instruction = (
-        "Parent and child speaker roles are externally bound; use only the supplied binding."
-        if speaker_roles_bound
-        else (
+    if speaker_roles_bound and speaker_binding_description:
+        speaker_instruction = (
+            "Speaker roles are bound by offline F0-based clustering. "
+            "Use the binding below to assign actor=parent or actor=child in evidence. "
+            "The binding is acoustic and probabilistic; if visual or content evidence "
+            "clearly contradicts it for a specific utterance, note the discrepancy but "
+            "still use the binding as the default.\n\n"
+            + speaker_binding_description
+        )
+    elif speaker_roles_bound:
+        speaker_instruction = (
+            "Parent and child speaker roles are externally bound; use only the supplied binding."
+        )
+    else:
+        speaker_instruction = (
             "No external speaker-role binding is available. Use actor=unknown unless the role "
             "is directly and unambiguously observable; never guess from content alone."
         )
-    )
     return "\n".join(
         [
             (

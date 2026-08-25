@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import secrets
 from pathlib import Path
 
+from coregulation_poc.acoustics.speaker_enrollment import enroll_from_file, load_enrollment
+from coregulation_poc.acoustics.tencent_voiceprint import TencentVoiceprintService
 from coregulation_poc.capture.devices import list_windows_media_devices
 from coregulation_poc.capture.media import MediaFormat, MediaSourceError
 from coregulation_poc.codebook import load_state_codebook
@@ -16,12 +19,14 @@ from coregulation_poc.diagnostics import run_all_diagnostics
 from coregulation_poc.intervention import load_strategy_library
 from coregulation_poc.live_test import run_live_test
 from coregulation_poc.paths import (
+    DEFAULT_ENROLLMENT_DIR,
     DELIVERY_POLICY_PATH,
     INTERVENTION_POLICY_PATH,
     PROJECT_ROOT,
     STATE_CODEBOOK_PATH,
     STRATEGY_CARDS_PATH,
 )
+from coregulation_poc.pipeline_test import run_pipeline_test
 from coregulation_poc.runtime import RealtimeLoopConfig, build_realtime_session_factory
 from coregulation_poc.settings import Settings
 from coregulation_poc.strategy_test import run_strategy_test
@@ -72,6 +77,13 @@ def doctor() -> int:
         "browser_capture_access_token_configured": (
             settings.browser_capture_access_token is not None
         ),
+        "tencent_voiceprint_configured": settings.tencent_voiceprint_configured,
+        "tencent_voiceprint_region": settings.tencent_voiceprint_region,
+        "tencent_voiceprint_minimum_score": (
+            settings.tencent_voiceprint_minimum_score
+        ),
+        "enrollment_dir": str(DEFAULT_ENROLLMENT_DIR),
+        "enroll_command": "enroll --audio <path> --speaker parent|child --family-id <id>",
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
@@ -81,6 +93,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Co-regulation realtime PoC utilities")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("doctor", help="Check local configuration")
+    enroll_parser = subparsers.add_parser(
+        "enroll",
+        help="Register a parent or child voiceprint for embedding-based speaker binding",
+    )
+    enroll_parser.add_argument("--audio", type=Path, required=True,
+        help="Path to the enrollment audio file (wav, mp3, etc.)")
+    enroll_parser.add_argument("--speaker", required=True,
+        choices=("parent", "child"),
+        help="Which speaker to register")
+    enroll_parser.add_argument("--family-id", required=True,
+        help="Family identifier used to group enrollments")
+    enroll_parser.add_argument("--enrollment-dir", type=Path, default=DEFAULT_ENROLLMENT_DIR,
+        help="Directory for enrollment JSON files (default: data/enrollments)")
     subparsers.add_parser("connection-test", help="Test WebSocket authentication only")
     diagnose_parser = subparsers.add_parser("diagnose", help="Run all preflight checks")
     diagnose_parser.add_argument("--video", type=Path, required=True)
@@ -122,17 +147,30 @@ def main() -> None:
         help="Enable paid multimodal assessments and intervention feedback",
     )
     web_live_parser.add_argument(
+        "--preview-only",
+        action="store_true",
+        help="Explicitly allow a public UI-only deployment without AI analysis",
+    )
+    web_live_parser.add_argument(
         "--enable-voice",
         action="store_true",
         help="Generate Maia intervention audio; requires --enable-closed-loop",
     )
     web_live_parser.add_argument("--window-seconds", type=float, default=12.0)
     web_live_parser.add_argument("--assessment-interval-seconds", type=float, default=12.0)
-    web_live_parser.add_argument("--max-assessments", type=int, default=30)
+    web_live_parser.add_argument("--max-assessments", type=int, default=150)
     web_live_parser.add_argument(
         "--log-level",
         choices=("critical", "error", "warning", "info", "debug"),
         default="info",
+    )
+    web_live_parser.add_argument(
+        "--family-id",
+        default=None,
+        help=(
+            "Family identifier for loading voiceprint enrollment "
+            "(enables embedding-based speaker binding)"
+        ),
     )
     trajectory_parser = subparsers.add_parser(
         "trajectory-test",
@@ -159,9 +197,64 @@ def main() -> None:
         action="store_true",
         help="Generate and save the approved message with Qwen realtime TTS and Maia",
     )
+    pipeline_parser = subparsers.add_parser(
+        "pipeline-test",
+        help="Replay one video clip through all four modules end-to-end",
+    )
+    pipeline_parser.add_argument("--video", type=Path, required=True)
+    pipeline_parser.add_argument("--session-id", default=None,
+        help="Session identifier (default: derived from video filename)")
+    pipeline_parser.add_argument("--dry-run", action="store_true")
+    pipeline_parser.add_argument(
+        "--enable-voice",
+        action="store_true",
+        help="Generate Maia intervention audio during delivery",
+    )
+    pipeline_parser.add_argument(
+        "--no-auto-acknowledge",
+        action="store_true",
+        help="Do not auto-confirm deliveries; interventions will be held pending",
+    )
+    pipeline_parser.add_argument("--window-seconds", type=float, default=12.0)
+    pipeline_parser.add_argument("--assessment-interval-seconds", type=float, default=12.0)
+    pipeline_parser.add_argument("--max-assessments", type=int, default=0,
+        help="Max assessments per session (0 = unlimited, run until video ends)")
     args = parser.parse_args()
     if args.command in {None, "doctor"}:
         raise SystemExit(doctor())
+    if args.command == "enroll":
+        if not args.audio.is_absolute():
+            parser.error("--audio must be an absolute path")
+        enrollment_dir = args.enrollment_dir
+        if not enrollment_dir.is_absolute():
+            enrollment_dir = (PROJECT_ROOT / enrollment_dir).resolve()
+        enrollment_dir.mkdir(parents=True, exist_ok=True)
+        enrollment = enroll_from_file(
+            audio_path=args.audio,
+            speaker_label=args.speaker,
+            family_id=args.family_id,
+            enrollment_dir=enrollment_dir,
+        )
+        status = {
+            "family_id": enrollment.family_id,
+            "is_complete": enrollment.is_complete,
+            "speakers": {
+                label: {
+                    "audio_source": spk.audio_source,
+                    "duration_ms": spk.duration_ms,
+                    "embedding_dim": len(spk.embedding),
+                }
+                for label, spk in enrollment.speakers.items()
+            },
+            "enrollment_file": str(enrollment_dir / f"{args.family_id}.json"),
+        }
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        if enrollment.is_complete:
+            print("Enrollment complete: both parent and child are registered.")
+        else:
+            missing = {"parent", "child"} - set(enrollment.speakers.keys())
+            print(f"Enrollment pending: still need to register {', '.join(missing)}.")
+        raise SystemExit(0)
     if args.command == "connection-test":
         result = check_realtime_connection(Settings())
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -184,12 +277,19 @@ def main() -> None:
         settings = Settings()
         if args.enable_voice and not args.enable_closed_loop:
             parser.error("--enable-voice requires --enable-closed-loop")
+        if args.preview_only and args.enable_closed_loop:
+            parser.error("--preview-only cannot be combined with --enable-closed-loop")
+        local_hosts = {"127.0.0.1", "localhost", "::1"}
+        if args.host not in local_hosts and not args.enable_closed_loop and not args.preview_only:
+            parser.error(
+                "Public deployment requires --enable-closed-loop (or explicit --preview-only)"
+            )
         if args.window_seconds < 3:
             parser.error("--window-seconds must be at least 3")
         if args.assessment_interval_seconds < 1:
             parser.error("--assessment-interval-seconds must be at least 1")
-        if args.max_assessments < 1:
-            parser.error("--max-assessments must be positive")
+        if args.max_assessments < 0:
+            parser.error("--max-assessments must be non-negative (0 = unlimited)")
         output_dir = args.output_dir or settings.output_dir
         if not output_dir.is_absolute():
             parser.error("--output-dir must be an absolute path")
@@ -198,14 +298,59 @@ def main() -> None:
             if settings.browser_capture_access_token is not None
             else None
         )
-        local_hosts = {"127.0.0.1", "localhost", "::1"}
+        research_access_token = (
+            settings.research_console_access_token.get_secret_value()
+            if settings.research_console_access_token is not None
+            else None
+        )
         if args.host not in local_hosts and access_token is None:
+            access_token = secrets.token_urlsafe(32)
+        if args.host not in local_hosts and research_access_token is None:
             parser.error(
-                "BROWSER_CAPTURE_ACCESS_TOKEN is required when --host is not localhost"
+                "RESEARCH_CONSOLE_ACCESS_TOKEN is required when --host is not localhost"
             )
         if access_token is not None and len(access_token) < 12:
             parser.error("BROWSER_CAPTURE_ACCESS_TOKEN must contain at least 12 characters")
+        if research_access_token is not None and len(research_access_token) < 12:
+            parser.error("RESEARCH_CONSOLE_ACCESS_TOKEN must contain at least 12 characters")
         media_format = MediaFormat()
+        # Load voiceprint enrollment when --family-id is provided
+        enrollment = None
+        if args.family_id is not None:
+            enrollment = load_enrollment(args.family_id, DEFAULT_ENROLLMENT_DIR)
+            if enrollment is None:
+                parser.error(
+                    f"No enrollment found for family '{args.family_id}' in "
+                    f"{DEFAULT_ENROLLMENT_DIR}. Run 'enroll --family-id {args.family_id}' first."
+                )
+            if not enrollment.is_complete:
+                parser.error(
+                    f"Enrollment for family '{args.family_id}' is incomplete "
+                    f"(only {', '.join(enrollment.speakers.keys())} registered). "
+                    "Register both parent and child before starting a session."
+                )
+        voiceprint_service = None
+        tencent_credential_started = (
+            settings.tencent_secret_id is not None
+            or settings.tencent_secret_key is not None
+        )
+        if tencent_credential_started:
+            try:
+                secret_id, secret_key = settings.require_tencent_voiceprint_credentials()
+                voiceprint_service = TencentVoiceprintService(
+                    secret_id=secret_id,
+                    secret_key=secret_key,
+                    region=settings.tencent_voiceprint_region,
+                    minimum_score=settings.tencent_voiceprint_minimum_score,
+                    timeout_seconds=settings.tencent_voiceprint_timeout_seconds,
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
+        elif args.enable_closed_loop and enrollment is None:
+            parser.error(
+                "TENCENT_SECRET_ID and TENCENT_SECRET_KEY are required for "
+                "automatic parent/child voice binding"
+            )
         session_factory = None
         if args.enable_closed_loop:
             try:
@@ -219,6 +364,8 @@ def main() -> None:
                     settings=settings,
                     media_format=media_format,
                     config=loop_config,
+                    enrollment=enrollment,
+                    voiceprint_service=voiceprint_service,
                 )
             except ValueError as exc:
                 parser.error(str(exc))
@@ -235,6 +382,17 @@ def main() -> None:
                         args.max_assessments if args.enable_closed_loop else 0
                     ),
                     "access_control_required": access_token is not None,
+                    "research_console": f"http://{args.host}:{args.port}/research",
+                    "research_access_control_required": research_access_token is not None,
+                    "speaker_binding_method": (
+                        "embedding_cosine" if enrollment is not None
+                        else (
+                            "tencent_voiceprint_1n"
+                            if voiceprint_service is not None
+                            else "local_development"
+                        )
+                    ),
+                    "enrollment_family_id": args.family_id,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -246,8 +404,10 @@ def main() -> None:
                 port=args.port,
                 output_dir=output_dir,
                 access_token=access_token,
+                research_access_token=research_access_token,
                 log_level=args.log_level,
                 session_factory=session_factory,
+                voiceprint_service=voiceprint_service,
             )
         except OSError as exc:
             parser.exit(2, f"Browser capture server failed: {exc}\n")
@@ -360,6 +520,41 @@ def main() -> None:
             )
         except (ValueError, OSError) as exc:
             parser.exit(2, f"Delivery test failed: {exc}\n")
+        print(
+            json.dumps(
+                {"run_dir": str(run_dir), "valid": valid},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise SystemExit(0 if valid else 2)
+    if args.command == "pipeline-test":
+        if not args.video.is_absolute():
+            parser.error("--video must be an absolute path")
+        if args.session_id is None:
+            args.session_id = args.video.stem
+        if args.window_seconds < 3:
+            parser.error("--window-seconds must be at least 3")
+        if args.assessment_interval_seconds < 1:
+            parser.error("--assessment-interval-seconds must be at least 1")
+        if args.max_assessments < 0:
+            parser.error("--max-assessments must be non-negative (0 = unlimited)")
+        try:
+            run_dir, valid = asyncio.run(
+                run_pipeline_test(
+                    video_path=args.video,
+                    session_id=args.session_id,
+                    settings=Settings(),
+                    dry_run=args.dry_run,
+                    voice_enabled=args.enable_voice,
+                    window_seconds=args.window_seconds,
+                    assessment_interval_seconds=args.assessment_interval_seconds,
+                    max_assessments=args.max_assessments,
+                    auto_acknowledge=not args.no_auto_acknowledge,
+                )
+            )
+        except (ValueError, OSError) as exc:
+            parser.exit(2, f"Pipeline test failed: {exc}\n")
         print(
             json.dumps(
                 {"run_dir": str(run_dir), "valid": valid},

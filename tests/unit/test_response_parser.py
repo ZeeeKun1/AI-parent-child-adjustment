@@ -15,17 +15,21 @@ def test_accumulator_parses_valid_assessment() -> None:
             "type": "response.text.delta",
             "delta": (
                 '{"session_id":"S01","assessed_at_ms":12000,'
-                '"state":"fluctuation","evidence_sufficiency":"sufficient",'
+                '"state":"fluctuation","previous_state":null,'
+                '"trajectory":"stable",'
+                '"evidence_sufficiency":"sufficient",'
                 '"confidence":"medium","alternative_state":"normal",'
                 '"ambiguity_reason":"The boundary with normal support is uncertain",'
                 '"interaction_performance":["brief task stall"],'
+                '"task_process":"brief_stall","support_need":"none",'
+                '"support_target":"unknown","interruptibility":"natural_pause",'
                 '"modality_evidence":{"audio":{"sufficiency":"sufficient","items":'
                 '[{"modality":"audio","actor":"unknown","start_ms":5000,'
                 '"end_ms":7000,"code":"brief task stall","observation":'
                 '"A wrong answer is followed by correction","quote":"three"}]},'
                 '"video":{"sufficiency":"insufficient","items":[],"limitation_reason":'
                 '"Relevant behavior is not visible"}},'
-                '"previous_state":null,"reason":"短暂波动，但仍可恢复"}'
+                '"reason":"短暂波动，但仍可恢复"}'
             ),
         }
     )
@@ -95,8 +99,11 @@ def test_context_validation_rejects_evidence_outside_clip() -> None:
             "type": "response.text.delta",
             "delta": (
                 '{"session_id":"S01","assessed_at_ms":12000,"state":"normal",'
+                '"previous_state":null,"trajectory":"stable",'
                 '"evidence_sufficiency":"sufficient","confidence":"high",'
                 '"interaction_performance":["normal task progression"],'
+                '"task_process":"smooth_progress","support_need":"none",'
+                '"support_target":"unknown","interruptibility":"natural_pause",'
                 '"modality_evidence":{"audio":{"sufficiency":"sufficient","items":'
                 '[{"modality":"audio","actor":"unknown","start_ms":11000,'
                 '"end_ms":13000,"code":"task_talk","observation":"Task talk",'

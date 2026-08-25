@@ -33,6 +33,9 @@ principles:
   post_intervention_max_wait_count: 3
   low_confidence_action: hold
   insufficient_evidence_action: hold
+  post_intervention_full_window_required: true
+  fluctuation_is_non_intervention: true
+  fluctuation_no_reinforcement: true
 
 guard_actions:
   insufficient_evidence:
@@ -69,6 +72,20 @@ guard_actions:
     rationale: >-
       High-risk classification requires interaction history and cannot trigger a
       progressive support path from one isolated observation.
+  support_need_not_identified:
+    action: hold
+    reason_code: support_need_not_identified
+    research_basis: [timing_by_state]
+    rationale: >-
+      The type of support needed is not identified or unclear, so the system
+      cannot select an appropriate strategy and holds.
+  support_target_unidentified:
+    action: hold
+    reason_code: support_target_unidentified
+    research_basis: [timing_by_state]
+    rationale: >-
+      The support target cannot be identified from evidence, so the system
+      cannot direct intervention and holds.
 
 positive_maintenance:
   action: reinforce
@@ -79,6 +96,7 @@ positive_maintenance:
     - "positive dyadic exchange"
     - "active child participation"
     - "supportive parental guidance"
+    - "normal task progression"
   recovery_transition_states: [fluctuation]
   requires_natural_turn_boundary: true
   research_basis: [protect_natural_rhythm, reinforce_positive_coordination]
@@ -98,14 +116,14 @@ state_actions:
       The dyad is coordinating around the homework task, so the system does not
       interrupt the interaction.
   fluctuation:
-    action: observe
+    action: no_intervention
     reason_code: self_recovery_possible
     requires_natural_turn_boundary: false
     history_required: false
     research_basis: [timing_by_state, protect_natural_rhythm]
     rationale: >-
       Coordination is temporarily uneven, but the dyad retains capacity to recover
-      without third-party intervention.
+      without third-party intervention. The system observes without intervening.
   dysregulation:
     action: intervene
     reason_code: dyad_cannot_self_recover

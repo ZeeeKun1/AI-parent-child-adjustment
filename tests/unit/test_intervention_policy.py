@@ -9,7 +9,7 @@ def test_policy_maps_all_four_research_states() -> None:
         InterventionAction.NO_INTERVENTION
     )
     assert policy.state_actions[CoregulationState.FLUCTUATION].action is (
-        InterventionAction.OBSERVE
+        InterventionAction.NO_INTERVENTION
     )
     assert policy.state_actions[CoregulationState.DYSREGULATION].action is (
         InterventionAction.INTERVENE

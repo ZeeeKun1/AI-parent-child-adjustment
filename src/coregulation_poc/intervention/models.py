@@ -55,7 +55,7 @@ class StrategyPrinciples(BaseModel):
     normal_requires_positive_maintenance_authorization: bool
     target_actor_must_be_explicit: bool
     one_card_one_primary_action: bool
-    llm_may_rephrase_but_must_not_change_strategy: bool
+    llm_generates_observation_only: bool
     approved_template_fallback_required: bool
     do_not_repeat_before_observing_response: bool
     maximum_message_characters: int = Field(gt=0)
@@ -78,6 +78,12 @@ class StrategyCard(BaseModel):
     states: list[CoregulationState] = Field(min_length=1)
     target_actor: Actor
     repair_target: RepairTarget
+    strategy_family: str = Field(min_length=1)
+    support_needs: list[str] = Field(default_factory=list)
+    task_processes: list[str] = Field(default_factory=list)
+    approved_action_clause: str = Field(min_length=1)
+    inactive: bool = False
+    priority: int = Field(default=0, ge=0)
     use_when: list[str] = Field(min_length=1)
     avoid_when: list[str] = Field(min_length=1)
     action: str = Field(min_length=1)
@@ -112,8 +118,8 @@ class StrategyLibraryConfig(BaseModel):
             ),
             "target_actor_must_be_explicit": self.principles.target_actor_must_be_explicit,
             "one_card_one_primary_action": self.principles.one_card_one_primary_action,
-            "llm_may_rephrase_but_must_not_change_strategy": (
-                self.principles.llm_may_rephrase_but_must_not_change_strategy
+            "llm_generates_observation_only": (
+                self.principles.llm_generates_observation_only
             ),
             "approved_template_fallback_required": (
                 self.principles.approved_template_fallback_required
@@ -137,6 +143,10 @@ class StrategyLibraryConfig(BaseModel):
             for strategy_id in rule.strategy_ids:
                 if strategy_id not in cards:
                     raise ValueError(f"routing rule references unknown strategy: {strategy_id}")
+                if cards[strategy_id].inactive:
+                    raise ValueError(
+                        f"routing rule references inactive strategy: {strategy_id}"
+                    )
                 if rule.state not in cards[strategy_id].states:
                     raise ValueError(
                         f"strategy {strategy_id} does not support state {rule.state.value}"

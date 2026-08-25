@@ -48,6 +48,11 @@ def test_browser_recorder_validates_both_modalities_without_saving_payloads(
             "page_version": "test",
             "device_label": "must-not-be-saved",
         },
+        study_context={
+            "participant_id": "P012",
+            "experiment_label": "正式实验",
+            "session_round": "T1",
+        },
     )
     recorder.start()
     audio = MediaChunk(
@@ -67,6 +72,10 @@ def test_browser_recorder_validates_both_modalities_without_saving_payloads(
     events = (summary.run_dir / "events.jsonl").read_text(encoding="utf-8")
     assert summary.valid is True
     assert summary.normalized_timestamp_count == 1
+    assert summary.run_dir.name.startswith("P012_")
+    assert summary.run_dir.name.endswith("_正式实验_T1")
+    assert manifest["study_context"]["participant_id"] == "P012"
+    assert manifest["study_timezone"] == "Asia/Shanghai"
     assert manifest["privacy"]["raw_media_saved"] is False
     assert "must-not-be-saved" not in json.dumps(manifest)
     assert result["api_called"] is False

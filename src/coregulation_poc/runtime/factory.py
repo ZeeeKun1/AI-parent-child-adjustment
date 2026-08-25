@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import asyncio
 
+from coregulation_poc.acoustics.tencent_voiceprint import (
+    SpeakerEnrollmentRecord,
+    TencentVoiceprintService,
+)
 from coregulation_poc.capture.media import MediaFormat
 from coregulation_poc.delivery import load_delivery_policy
+from coregulation_poc.providers.qwen_text_chat import QwenTextChatProvider
 from coregulation_poc.providers.qwen_tts_realtime import QwenRealtimeTTSProvider
 from coregulation_poc.runtime.recognition import QwenWindowRecognizer
 from coregulation_poc.runtime.session import (
@@ -56,6 +61,8 @@ def build_realtime_session_factory(
     settings: Settings,
     media_format: MediaFormat,
     config: RealtimeLoopConfig,
+    enrollment: SpeakerEnrollmentRecord | None = None,
+    voiceprint_service: TencentVoiceprintService | None = None,
 ) -> RealtimeSessionFactory:
     """Build per-browser sessions without making an API call at server startup."""
 
@@ -64,18 +71,32 @@ def build_realtime_session_factory(
     if not settings.aliyun_workspace_id or not settings.realtime_base_url:
         raise ValueError("ALIYUN_WORKSPACE_ID is required for the realtime closed loop")
 
-    def create(session_id: str, send_event: ServerEventSender) -> RealtimeSession:
+    def create(
+        session_id: str,
+        send_event: ServerEventSender,
+        session_enrollment: SpeakerEnrollmentRecord | None = None,
+    ) -> RealtimeSession:
         recognizer = QwenWindowRecognizer(
             settings=settings,
             image_interval_ms=media_format.image_interval_ms,
+            enrollment=session_enrollment or enrollment,
+            voiceprint_service=voiceprint_service,
         )
         voice = QwenVoiceSynthesizer(settings) if config.voice_enabled else None
+        text_chat_provider = QwenTextChatProvider(
+            api_key=settings.dashscope_api_key.get_secret_value(),
+            model=settings.text_chat_model,
+            temperature=settings.text_chat_temperature,
+            max_tokens=settings.text_chat_max_tokens,
+            timeout_seconds=settings.text_chat_timeout_seconds,
+        )
         return RealtimeSession(
             session_id=session_id,
             recognizer=recognizer,
             send_event=send_event,
             config=config,
             voice_synthesizer=voice,
+            text_chat_provider=text_chat_provider,
         )
 
     return create

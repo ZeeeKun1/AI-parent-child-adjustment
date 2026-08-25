@@ -17,6 +17,16 @@ def _assessment(
     actor: str,
     previous_state: CoregulationState | None,
 ) -> StateAssessment:
+    is_dysregulated = state == "dysregulation"
+    if performance == "pace conflict":
+        task_process = "pace_mismatch"
+        support_need = "emotional_support"
+    elif is_dysregulated:
+        task_process = "sustained_stall"
+        support_need = "task_pacing"
+    else:
+        task_process = "smooth_progress"
+        support_need = "none"
     return StateAssessment(
         session_id=session_id,
         assessed_at_ms=assessed_at_ms,
@@ -46,6 +56,11 @@ def _assessment(
             },
         },
         previous_state=previous_state,
+        trajectory="stable",
+        task_process=task_process,
+        support_need=support_need,
+        support_target=actor,
+        interruptibility="natural_pause",
         reason="The multimodal sequence supports this state.",
     )
 
@@ -80,7 +95,7 @@ class _SequenceRecognizer:
             session_id=session_id,
             assessed_at_ms=window.end_ms,
             state="normal",
-            performance="normal task progression",
+            performance="steady coordination",
             actor="both",
             previous_state=previous_state,
         )
@@ -195,7 +210,7 @@ async def _exercise_four_module_loop() -> None:
     assert outcome["strategy_id"] == "PARENT_TONE_AND_PACE"
     assert outcome["recovery_status"] == "recovered"
     assert outcome["effect_category"] == "positive"
-    assert outcome["observed_interaction_performance"] == ["normal task progression"]
+    assert outcome["observed_interaction_performance"] == ["steady coordination"]
     assert any(event["type"] == "intervention_outcome" for event in events)
 
 
@@ -305,3 +320,93 @@ async def _exercise_held_actor_routing() -> None:
     held = next(event for event in events if event["type"] == "intervention_held")
     assert held["reason"] == "target_actor_evidence_insufficient"
     assert session.controller.awaiting_post_intervention_response is False
+
+
+def test_expert_takeover_uses_approved_strategy_and_records_family_response() -> None:
+    asyncio.run(_exercise_expert_takeover())
+
+
+async def _exercise_expert_takeover() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    session = RealtimeSession(
+        session_id="expert_takeover_test",
+        recognizer=_SequenceRecognizer(),
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=20_000,
+            post_intervention_observation_ms=1_000,
+        ),
+        turn_boundary_detector=lambda _: True,
+    )
+    await session.start()
+    card = session.strategy_cards["PARENT_TONE_AND_PACE"]
+
+    assert await session.handle_control(
+        {
+            "type": "expert_takeover",
+            "operator": "E01",
+            "reason": "需要人工帮助家庭放慢互动节奏",
+            "recorded_at_ms": 10,
+        }
+    )
+    assert session.runtime_metrics["expert_takeover_active"] is True
+    assert session.runtime_metrics["interventions_paused"] is True
+
+    assert await session.handle_control(
+        {
+            "type": "expert_intervention",
+            "operator": "E01",
+            "reason": "当前节奏冲突持续",
+            "strategy_id": card.strategy_id,
+            "message": card.approved_template,
+        }
+    )
+    intervention = [event for event in events if event["type"] == "intervention"][-1]
+    assert intervention["source"] == "expert"
+    assert intervention["repair_target"] == "parent_regulation"
+
+    assert await session.handle_control(
+        {
+            "type": "delivery_execution",
+            "delivery_id": intervention["delivery_id"],
+            "recorded_at_ms": 100,
+            "visual": {
+                "status": "delivered",
+                "started_at_ms": 90,
+                "completed_at_ms": 90,
+                "provider": "browser_overlay",
+            },
+            "voice": {"status": "not_attempted"},
+        }
+    )
+    assert await session.handle_control(
+        {
+            "type": "family_response",
+            "response": "self_continue",
+            "delivery_id": intervention["delivery_id"],
+            "recorded_at_ms": 120,
+        }
+    )
+    assert session.family_responses[-1]["response"] == "self_continue"
+
+    await session.accept_chunk(_audio(1_200))
+    await session.accept_chunk(_image(1_201))
+    await session.analyze_now()
+    outcome = [event for event in events if event["type"] == "intervention_outcome"][-1]
+    assert outcome["source"] == "expert"
+    assert outcome["strategy_id"] == "PARENT_TONE_AND_PACE"
+
+    assert await session.handle_control(
+        {
+            "type": "expert_release",
+            "operator": "E01",
+            "reason": "家庭互动已经可以继续",
+            "recorded_at_ms": 1_300,
+        }
+    )
+    assert session.runtime_metrics["expert_takeover_active"] is False
+    assert session.runtime_metrics["expert_intervention_count"] == 1

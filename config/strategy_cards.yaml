@@ -9,7 +9,7 @@ principles:
   normal_requires_positive_maintenance_authorization: true
   target_actor_must_be_explicit: true
   one_card_one_primary_action: true
-  llm_may_rephrase_but_must_not_change_strategy: true
+  llm_generates_observation_only: true
   approved_template_fallback_required: true
   do_not_repeat_before_observing_response: true
   maximum_message_characters: 90
@@ -74,7 +74,7 @@ routing_rules:
     strategy_ids: ["CHILD_NEEDS_INQUIRY", "PARENT_SCAFFOLD_CHANGE", "CHILD_STRATEGY_SUPPORT"]
   - state: "high_risk"
     interaction_performance: "sustained strong resistance or withdrawal"
-    strategy_ids: ["CHILD_PACE_RESET", "CHILD_NEEDS_INQUIRY", "CHILD_BOUNDARY_SET"]
+    strategy_ids: ["CHILD_PACE_RESET", "CHILD_NEEDS_INQUIRY"]
   - state: "high_risk"
     interaction_performance: "parental over-helping or task takeover"
     strategy_ids: ["PARENT_AUTONOMY_SPACE", "PARENT_BOUNDARY_SET"]
@@ -83,7 +83,7 @@ routing_rules:
     strategy_ids: ["CHILD_AUTONOMY_SPACE", "PARENT_AUTONOMY_SPACE"]
   - state: "high_risk"
     interaction_performance: "persistent interaction imbalance"
-    strategy_ids: ["PARENT_AUTONOMY_SPACE", "PARENT_BOUNDARY_SET", "CHILD_BOUNDARY_SET"]
+    strategy_ids: ["PARENT_AUTONOMY_SPACE", "PARENT_BOUNDARY_SET"]
 
 cards:
   - strategy_id: "DYAD_POSITIVE_AFFIRM"
@@ -91,6 +91,11 @@ cards:
     states: ["normal"]
     target_actor: "both"
     repair_target: "positive_reinforcement"
+    strategy_family: "positive_affirmation"
+    support_needs: ["positive_reinforcement"]
+    task_processes: ["smooth_progress", "completion"]
+    approved_action_clause: "你们刚才一起把节奏调整好了，可以继续保持现在这种配合。"
+    priority: 0
     use_when:
       - "双方完成任务、恢复协调或出现明确的积极互动"
       - "需要巩固双方共同形成的积极互动回路"
@@ -109,6 +114,11 @@ cards:
     states: ["dysregulation"]
     target_actor: "both"
     repair_target: "relationship_repair"
+    strategy_family: "relationship_repair"
+    support_needs: ["mutual_understanding"]
+    task_processes: ["explanation_mismatch"]
+    approved_action_clause: "我们先不判断谁对谁错。孩子先说一个卡住的地方，家长听完再回应。"
+    priority: 0
     use_when:
       - "双方出现误解、责备或正在升级的负向互动"
       - "现有证据只能支持双方互动失配，不能可靠归因到单方"
@@ -128,6 +138,11 @@ cards:
     states: ["normal", "fluctuation"]
     target_actor: "child"
     repair_target: "positive_reinforcement"
+    strategy_family: "positive_affirmation"
+    support_needs: ["positive_reinforcement"]
+    task_processes: ["smooth_progress", "completion"]
+    approved_action_clause: "你刚才做得很好，继续保持这个节奏就好。"
+    priority: 0
     use_when:
       - "任务顺利推进或儿童积极尝试"
       - "需要巩固积极反馈回路"
@@ -146,6 +161,11 @@ cards:
     states: ["normal", "fluctuation"]
     target_actor: "parent"
     repair_target: "positive_reinforcement"
+    strategy_family: "positive_affirmation"
+    support_needs: ["positive_reinforcement"]
+    task_processes: ["smooth_progress", "completion"]
+    approved_action_clause: "您的耐心讲解很有帮助，可以继续这样的方式。"
+    priority: 0
     use_when:
       - "家长耐心讲解且互动顺畅"
       - "需要巩固家长当前辅导方式"
@@ -164,6 +184,11 @@ cards:
     states: ["fluctuation", "dysregulation"]
     target_actor: "parent"
     repair_target: "parent_regulation"
+    strategy_family: "tone_adjustment"
+    support_needs: ["emotional_support"]
+    task_processes: ["pace_mismatch"]
+    approved_action_clause: "可以先放慢语速，只保留一个问题，给孩子一些思考时间。"
+    priority: 0
     use_when:
       - "家长持续催促、语速加快或密集追问"
       - "儿童思考和回应空间被压缩"
@@ -183,6 +208,11 @@ cards:
     states: ["fluctuation", "dysregulation"]
     target_actor: "child"
     repair_target: "child_support"
+    strategy_family: "emotional_soothing"
+    support_needs: ["emotional_support"]
+    task_processes: ["sustained_stall", "disengaged"]
+    approved_action_clause: "这一步现在有些困难，我们先不着急。你可以告诉家长，哪里最需要帮助。"
+    priority: 0
     use_when:
       - "儿童明确表达紧张、疲惫或挫败"
       - "任务压力已经影响继续参与"
@@ -202,6 +232,11 @@ cards:
     states: ["dysregulation"]
     target_actor: "child"
     repair_target: "relationship_repair"
+    strategy_family: "resistance_understanding"
+    support_needs: ["mutual_understanding"]
+    task_processes: ["explanation_mismatch"]
+    approved_action_clause: "家长讲这些是想帮你。你可以先说一个具体困难，让家长知道怎么帮你。"
+    priority: 0
     use_when:
       - "儿童对家长辅导表现出不耐烦或对立"
       - "双方对困难原因产生误解"
@@ -220,6 +255,11 @@ cards:
     states: ["dysregulation"]
     target_actor: "parent"
     repair_target: "relationship_repair"
+    strategy_family: "resistance_understanding"
+    support_needs: ["mutual_understanding"]
+    task_processes: ["explanation_mismatch"]
+    approved_action_clause: "孩子可能不是不想做，是遇到了具体困难。可以先听他说一个卡住的地方。"
+    priority: 0
     use_when:
       - "家长对儿童行为产生误解或归因"
       - "沟通转向责备或对立"
@@ -238,6 +278,11 @@ cards:
     states: ["dysregulation", "high_risk"]
     target_actor: "child"
     repair_target: "needs_clarification"
+    strategy_family: "need_inquiry"
+    support_needs: ["need_expression"]
+    task_processes: ["sustained_stall", "brief_stall"]
+    approved_action_clause: "我们可以先不继续做。你愿意告诉家长，现在最需要什么帮助吗？"
+    priority: 0
     use_when:
       - "儿童明确说不会、不想继续或要求退出"
       - "真实困难尚不清楚"
@@ -256,6 +301,11 @@ cards:
     states: ["fluctuation", "dysregulation", "high_risk"]
     target_actor: "parent"
     repair_target: "parent_regulation"
+    strategy_family: "caregiver_empathy"
+    support_needs: ["emotional_support"]
+    task_processes: ["sustained_stall", "disengaged"]
+    approved_action_clause: "你已经投入了很多精力。可以先停一下，把接下来缩小为一个步骤。"
+    priority: 0
     use_when:
       - "家长表现出持续疲惫、无力或辅导挫败"
       - "直接建议可能引起防御"
@@ -274,6 +324,11 @@ cards:
     states: ["dysregulation", "high_risk"]
     target_actor: "child"
     repair_target: "task_pacing"
+    strategy_family: "task_pacing"
+    support_needs: ["task_pacing"]
+    task_processes: ["pace_mismatch"]
+    approved_action_clause: "我们先休息一下，或者换一个简单的部分做。"
+    priority: 0
     use_when:
       - "家长讲解频率过快，儿童跟不上"
       - "儿童出现注意力游离或脑子跟不上的反应"
@@ -292,6 +347,11 @@ cards:
     states: ["dysregulation", "high_risk"]
     target_actor: "parent"
     repair_target: "task_pacing"
+    strategy_family: "task_pacing"
+    support_needs: ["task_pacing"]
+    task_processes: ["pace_mismatch"]
+    approved_action_clause: "可以先让孩子去喝口水，降低一下当前的任务强度。"
+    priority: 0
     use_when:
       - "家长持续高频催促或讲解过快"
       - "儿童来不及表达或操作"
@@ -310,6 +370,11 @@ cards:
     states: ["dysregulation"]
     target_actor: "child"
     repair_target: "task_support"
+    strategy_family: "learning_support"
+    support_needs: ["learning_support"]
+    task_processes: ["sustained_stall", "explanation_mismatch"]
+    approved_action_clause: "你可以试着用纸演算这一步，或者换个方法检查一下。"
+    priority: 0
     use_when:
       - "儿童在同一认知点反复出错"
       - "现有方法无效且儿童愿意尝试"
@@ -328,6 +393,11 @@ cards:
     states: ["dysregulation"]
     target_actor: "parent"
     repair_target: "task_support"
+    strategy_family: "learning_support"
+    support_needs: ["learning_support"]
+    task_processes: ["over_assistance", "explanation_mismatch"]
+    approved_action_clause: "可以先确认孩子具体卡在哪一步，再只提供一个最小提示，不直接给答案。"
+    priority: 0
     use_when:
       - "任务持续停滞且现有讲解无效"
       - "家长重复纠错或直接提供答案"
@@ -344,9 +414,14 @@ cards:
 
   - strategy_id: "CHILD_AUTONOMY_SPACE"
     name: "儿童自主性支持"
-    states: ["high_risk"]
+    states: ["high_risk", "dysregulation"]
     target_actor: "child"
     repair_target: "autonomy_boundary"
+    strategy_family: "autonomy_support"
+    support_needs: ["autonomy_support"]
+    task_processes: ["over_assistance", "disengaged"]
+    approved_action_clause: "你可以先自己决定从哪一步开始试，遇到困难再请家长帮忙。"
+    priority: 0
     use_when:
       - "儿童长期被动依赖，等待指令"
       - "儿童缺少独立尝试或表达空间"
@@ -362,9 +437,14 @@ cards:
 
   - strategy_id: "PARENT_AUTONOMY_SPACE"
     name: "归还儿童自主空间"
-    states: ["high_risk"]
+    states: ["high_risk", "dysregulation"]
     target_actor: "parent"
     repair_target: "autonomy_boundary"
+    strategy_family: "autonomy_support"
+    support_needs: ["autonomy_support"]
+    task_processes: ["over_assistance"]
+    approved_action_clause: "可以把下一步交还给孩子，让他先独立尝试或表达，再提供必要提示。"
+    priority: 0
     use_when:
       - "家长长期接管、代答或过度纠正"
       - "儿童等待指令并缺少独立尝试"
@@ -383,6 +463,12 @@ cards:
     states: ["fluctuation", "dysregulation"]
     target_actor: "child"
     repair_target: "posture_adjustment"
+    strategy_family: "posture_adjustment"
+    support_needs: []
+    task_processes: []
+    approved_action_clause: "你可以先坐端正，把书拿好，抬头看一下再继续。"
+    inactive: true
+    priority: 0
     use_when:
       - "儿童因疲劳导致坐姿歪斜或头离桌面过近"
       - "注意力完全游离于作业外"
@@ -401,6 +487,12 @@ cards:
     states: ["fluctuation", "dysregulation"]
     target_actor: "parent"
     repair_target: "posture_adjustment"
+    strategy_family: "posture_adjustment"
+    support_needs: []
+    task_processes: []
+    approved_action_clause: "可以关注一下孩子是否揉眼睛或困倦，可能需要休息一下。"
+    inactive: true
+    priority: 0
     use_when:
       - "儿童出现揉眼睛、困倦等疲劳信号"
       - "家长未注意到儿童的身体疲劳信号"
@@ -419,6 +511,12 @@ cards:
     states: ["normal", "fluctuation", "dysregulation"]
     target_actor: "parent"
     repair_target: "environment_adjustment"
+    strategy_family: "environment_adjustment"
+    support_needs: []
+    task_processes: []
+    approved_action_clause: "可以看一下学习环境是否有干扰，调整一下空间让孩子更专注。"
+    inactive: true
+    priority: 0
     use_when:
       - "外部事件或环境因素持续打断儿童专注"
       - "学习材料缺失或环境噪音干扰"
@@ -437,6 +535,12 @@ cards:
     states: ["dysregulation", "high_risk"]
     target_actor: "child"
     repair_target: "boundary_setting"
+    strategy_family: "boundary_setting"
+    support_needs: []
+    task_processes: []
+    approved_action_clause: "这个问题可以先问问家长的想法，我们一起听听看。"
+    inactive: true
+    priority: 0
     use_when:
       - "儿童试图跳过家长直接向AI索要答案"
       - "需要明确AI不直接回答学习内容"
@@ -455,6 +559,11 @@ cards:
     states: ["dysregulation", "high_risk"]
     target_actor: "parent"
     repair_target: "boundary_setting"
+    strategy_family: "autonomy_support"
+    support_needs: ["autonomy_support"]
+    task_processes: ["over_assistance"]
+    approved_action_clause: "您是孩子的主要指导者，我会在您需要时提供辅助，不会代替您指导。"
+    priority: 0
     use_when:
       - "家长过度依赖AI评分或指导"
       - "需要明确家长是主要指导者"

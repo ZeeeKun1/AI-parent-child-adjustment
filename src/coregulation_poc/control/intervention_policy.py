@@ -23,6 +23,9 @@ class PolicyPrinciples(BaseModel):
     post_intervention_max_wait_count: int = Field(ge=1)
     low_confidence_action: InterventionAction
     insufficient_evidence_action: InterventionAction
+    post_intervention_full_window_required: bool
+    fluctuation_is_non_intervention: bool
+    fluctuation_no_reinforcement: bool
 
 
 class DecisionRule(BaseModel):
@@ -65,7 +68,7 @@ class InterventionPolicy(BaseModel):
 
         expected_actions = {
             CoregulationState.NORMAL: InterventionAction.NO_INTERVENTION,
-            CoregulationState.FLUCTUATION: InterventionAction.OBSERVE,
+            CoregulationState.FLUCTUATION: InterventionAction.NO_INTERVENTION,
             CoregulationState.DYSREGULATION: InterventionAction.INTERVENE,
             CoregulationState.HIGH_RISK: InterventionAction.PROGRESSIVE_SUPPORT,
         }
@@ -79,9 +82,11 @@ class InterventionPolicy(BaseModel):
             InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
             InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
             InterventionDecisionReason.HISTORY_REQUIRED,
+            InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
+            InterventionDecisionReason.SUPPORT_TARGET_UNIDENTIFIED,
         }
-        if set(self.guard_actions) != required_guards:
-            raise ValueError("intervention policy must define every controller guard")
+        if not required_guards.issubset(set(self.guard_actions)):
+            raise ValueError("intervention policy must define every required controller guard")
         if any(rule.action is not InterventionAction.HOLD for rule in self.guard_actions.values()):
             raise ValueError("controller guards must hold rather than authorize intervention")
 
@@ -93,7 +98,9 @@ class InterventionPolicy(BaseModel):
         ):
             raise ValueError("positive maintenance must use its dedicated reason code")
         if set(self.positive_maintenance.allowed_states) != {CoregulationState.NORMAL}:
-            raise ValueError("positive maintenance is limited to clearly coordinated states")
+            raise ValueError("positive maintenance is limited to the normal state")
+        if set(self.positive_maintenance.recovery_transition_states) != {CoregulationState.FLUCTUATION}:
+            raise ValueError("positive maintenance recovery transitions are limited to fluctuation")
         if not self.positive_maintenance.requires_natural_turn_boundary:
             raise ValueError("positive maintenance must wait for a natural turn boundary")
 
@@ -102,6 +109,13 @@ class InterventionPolicy(BaseModel):
                 raise ValueError(f"state {state.value} must wait for a natural turn boundary")
         if not self.state_actions[CoregulationState.HIGH_RISK].history_required:
             raise ValueError("high-risk progressive support requires interaction history")
+
+        if not self.principles.post_intervention_full_window_required:
+            raise ValueError("post-intervention observation must cover a full window")
+        if not self.principles.fluctuation_is_non_intervention:
+            raise ValueError("fluctuation must be a non-intervention state")
+        if not self.principles.fluctuation_no_reinforcement:
+            raise ValueError("fluctuation must not be reinforced")
 
         if self.principles.use_hard_time_or_count_thresholds:
             raise ValueError("hard time or count thresholds are not supported by the research")

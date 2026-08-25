@@ -4,10 +4,11 @@ from coregulation_poc.control.intervention_policy import (
     InterventionPolicy,
     load_intervention_policy,
 )
-from coregulation_poc.control.state_tracker import StateTrajectoryController
+from coregulation_poc.control.state_tracker import STATE_RANK, StateTrajectoryController
 
 __all__ = [
     "InterventionPolicy",
+    "STATE_RANK",
     "StateTrajectoryController",
     "load_intervention_policy",
 ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from coregulation_poc.intervention import load_strategy_library
@@ -35,14 +37,22 @@ def _assessment(
     performance: str = "pace conflict",
     actor: str = "parent",
     assessed_at_ms: int = 1000,
+    support_need: str | None = "emotional_support",
+    task_process: str | None = "pace_mismatch",
 ) -> StateAssessment:
     return StateAssessment(
         session_id="msg-gen-demo",
         assessed_at_ms=assessed_at_ms,
         state=state,
+        previous_state=None,
+        trajectory="stable",
         evidence_sufficiency="sufficient",
         confidence="high",
         interaction_performance=[performance],
+        task_process=task_process,
+        support_need=support_need,
+        support_target=actor,
+        interruptibility="natural_pause",
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -111,7 +121,7 @@ def _decision(
 class FakeTextChatProvider:
     """Fake provider for testing without real API calls."""
 
-    def __init__(self, response_text: str = "先放慢语速，只留一个问题。") -> None:
+    def __init__(self, response_text: str = "") -> None:
         self.response_text = response_text
         self.call_count = 0
         self.last_prompt: str | None = None
@@ -124,6 +134,22 @@ class FakeTextChatProvider:
             text = self.response_text
 
         return _Result
+
+
+def _llm_json(
+    *,
+    strategy_id: str = "PARENT_TONE_AND_PACE",
+    target_actor: str = "parent",
+    evidence_ids: list[str] | None = None,
+    observation_clause: str = "刚才语速比较快",
+) -> str:
+    """Build a valid JSON LLM response for tests."""
+    return json.dumps({
+        "strategy_id": strategy_id,
+        "target_actor": target_actor,
+        "evidence_ids": evidence_ids or ["evidence_0"],
+        "observation_clause": observation_clause,
+    })
 
 
 class FailingTextChatProvider:
@@ -230,7 +256,7 @@ class TestSelectorWithoutGenerator:
 
 class TestSelectorWithGenerator:
     def test_valid_llm_response_uses_constrained_llm(self) -> None:
-        provider = FakeTextChatProvider("先放慢语速，只留一个问题。")
+        provider = FakeTextChatProvider(_llm_json())
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -242,13 +268,14 @@ class TestSelectorWithGenerator:
 
         assert result.plan is not None
         assert result.plan.message_source is MessageSource.CONSTRAINED_LLM
-        assert result.plan.message == "先放慢语速，只留一个问题。"
+        assert "刚才语速比较快" in result.plan.message
+        assert "可以先放慢语速" in result.plan.message
         assert all(result.plan.validation_checks.values())
         assert provider.call_count == 1
 
     def test_llm_too_long_falls_back(self) -> None:
-        long_text = "这是一个非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的干预话术，远远超过九十字符限制需要触发回退机制"
-        provider = FakeTextChatProvider(long_text)
+        long_clause = "这是一个非常非常非常非常非常非常非常非常非常长的观察描述超过三十个字"
+        provider = FakeTextChatProvider(_llm_json(observation_clause=long_clause))
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -263,7 +290,7 @@ class TestSelectorWithGenerator:
         assert all(result.plan.validation_checks.values())
 
     def test_llm_with_banned_phrase_falls_back(self) -> None:
-        provider = FakeTextChatProvider("答案是三。")
+        provider = FakeTextChatProvider(_llm_json(observation_clause="答案是三"))
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -277,8 +304,8 @@ class TestSelectorWithGenerator:
         assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
 
     def test_llm_too_many_sentences_falls_back(self) -> None:
-        text = "先放慢语速。只留一个问题。给孩子思考时间。"
-        provider = FakeTextChatProvider(text)
+        clause = "刚才语速很快。孩子跟不上了。需要调整。"
+        provider = FakeTextChatProvider(_llm_json(observation_clause=clause))
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -335,7 +362,7 @@ class TestSelectorWithGenerator:
         assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
 
     def test_llm_receives_prompt_with_card_and_evidence(self) -> None:
-        provider = FakeTextChatProvider("先放慢语速。")
+        provider = FakeTextChatProvider(_llm_json())
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -350,7 +377,7 @@ class TestSelectorWithGenerator:
         assert "快点写" in provider.last_prompt
 
     def test_validation_checks_include_all_fields(self) -> None:
-        provider = FakeTextChatProvider("先放慢语速。")
+        provider = FakeTextChatProvider(_llm_json())
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -362,8 +389,14 @@ class TestSelectorWithGenerator:
 
         assert result.plan is not None
         checks = result.plan.validation_checks
-        assert "non_empty" in checks
+        assert "strategy_id_matches" in checks
+        assert "target_actor_matches" in checks
+        assert "evidence_ids_valid" in checks
+        assert "observation_within_limit" in checks
         assert "within_character_limit" in checks
         assert "within_sentence_limit" in checks
         assert "contains_no_banned_phrase" in checks
+        assert "contains_no_answer" in checks
+        assert "contains_no_blame_command" in checks
+        assert "action_clause_unchanged" in checks
         assert "target_actor_explicit" in checks

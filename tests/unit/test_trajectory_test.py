@@ -19,11 +19,17 @@ def test_trajectory_test_saves_auditable_outputs(tmp_path) -> None:
                             "session_id": "demo",
                             "assessed_at_ms": 1000,
                             "state": "fluctuation",
+                            "previous_state": None,
+                            "trajectory": "stable",
                             "evidence_sufficiency": "sufficient",
                             "confidence": "high",
                             "alternative_state": None,
                             "ambiguity_reason": None,
                             "interaction_performance": ["brief task stall"],
+                            "task_process": "brief_stall",
+                            "support_need": "none",
+                            "support_target": "child",
+                            "interruptibility": "natural_pause",
                             "modality_evidence": {
                                 "audio": {
                                     "sufficiency": "sufficient",
@@ -73,4 +79,4 @@ def test_trajectory_test_saves_auditable_outputs(tmp_path) -> None:
     assert (run_dir / "state_trajectory.json").exists()
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     assert result["final_state"] == "fluctuation"
-    assert result["final_action"] == "observe"
+    assert result["final_action"] == "no_intervention"

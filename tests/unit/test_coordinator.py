@@ -11,8 +11,12 @@ from coregulation_poc.intervention import load_strategy_library
 from coregulation_poc.models import (
     Actor,
     EvidenceSufficiency,
+    InteractionTrajectory,
+    Interruptibility,
     RecoveryStatus,
     StateAssessment,
+    SupportNeed,
+    TaskProcess,
 )
 
 # 100 ms @ 16 kHz, s16, mono = 1600 samples = 3200 bytes
@@ -36,16 +40,27 @@ def _assessment(
     session_id: str = "coordinator-demo",
     evidence_sufficient: bool = True,
     confidence: str = "high",
+    trajectory: str = "stable",
+    interruptibility: str = "natural_pause",
+    previous_state: str | None = None,
+    support_need: str | None = None,
+    task_process: str | None = None,
 ) -> StateAssessment:
     if not evidence_sufficient:
         return StateAssessment(
             session_id=session_id,
             assessed_at_ms=assessed_at_ms,
             state=None,
+            previous_state=None,
+            trajectory="unclear",
             evidence_sufficiency="insufficient",
             confidence="low",
             ambiguity_reason="Observable evidence is insufficient.",
             interaction_performance=[],
+            task_process=None,
+            support_need=None,
+            support_target="unknown",
+            interruptibility="unclear",
             modality_evidence={
                 "audio": {
                     "sufficiency": "insufficient",
@@ -57,15 +72,37 @@ def _assessment(
             reason="No state can be supported.",
         )
 
+    _task_process_defaults = {
+        "normal": "smooth_progress",
+        "fluctuation": "brief_stall",
+        "dysregulation": "pace_mismatch",
+        "high_risk": "unclear",
+    }
+    _support_need_defaults = {
+        "normal": "positive_reinforcement",
+        "fluctuation": "none",
+        "dysregulation": "emotional_support",
+        "high_risk": "autonomy_support",
+    }
+    if task_process is None:
+        task_process = _task_process_defaults.get(state, "unclear") if state else None
+    if support_need is None:
+        support_need = _support_need_defaults.get(state, "unclear") if state else None
     ambiguity_reason = None if confidence == "high" else "The state boundary is uncertain."
     return StateAssessment(
         session_id=session_id,
         assessed_at_ms=assessed_at_ms,
         state=state,
+        previous_state=previous_state,
+        trajectory=trajectory,
         evidence_sufficiency="sufficient",
         confidence=confidence,
         ambiguity_reason=ambiguity_reason,
         interaction_performance=[performance],
+        task_process=task_process,
+        support_need=support_need,
+        support_target=actor,
+        interruptibility=interruptibility,
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -115,7 +152,7 @@ def test_normal_state_produces_no_intervention() -> None:
     _feed_silence(coordinator)
     assessment = _assessment(
         state="normal",
-        performance="normal task progression",
+        performance="steady coordination",
         actor="both",
         assessed_at_ms=1000,
     )
@@ -174,6 +211,7 @@ def test_no_turn_boundary_holds_intervention() -> None:
         performance="pace conflict",
         actor="parent",
         assessed_at_ms=1000,
+        interruptibility="active_speech",
     )
 
     result = coordinator.process(
@@ -207,7 +245,7 @@ def test_post_intervention_recovery_observed_leads_to_new_decision() -> None:
     second = coordinator.process(
         assessment=_assessment(
             state="normal",
-            performance="normal task progression",
+            performance="steady coordination",
             actor="both",
             assessed_at_ms=2000,
         ),
@@ -245,6 +283,8 @@ def test_post_intervention_non_recovery_selects_different_strategy() -> None:
             performance="pace conflict",
             actor="parent",
             assessed_at_ms=2000,
+            support_need="task_pacing",
+            task_process="pace_mismatch",
         ),
         interaction_history_available=False,
         delivery_runtime=_runtime(prepared_at_ms=2000),
@@ -317,6 +357,8 @@ def test_interventions_paused_holds_delivery_and_preserves_previous_plan() -> No
             performance="pace conflict",
             actor="parent",
             assessed_at_ms=2000,
+            support_need="task_pacing",
+            task_process="pace_mismatch",
         ),
         interaction_history_available=False,
         delivery_runtime=_runtime(prepared_at_ms=2000, interventions_paused=True),
@@ -354,7 +396,7 @@ def test_complete_cycle_normal_to_dysregulation_to_recovery() -> None:
     cycle_1 = coordinator.process(
         assessment=_assessment(
             state="normal",
-            performance="normal task progression",
+            performance="steady coordination",
             actor="both",
             assessed_at_ms=1000,
         ),
@@ -381,7 +423,7 @@ def test_complete_cycle_normal_to_dysregulation_to_recovery() -> None:
     cycle_3 = coordinator.process(
         assessment=_assessment(
             state="normal",
-            performance="normal task progression",
+            performance="steady coordination",
             actor="both",
             assessed_at_ms=3000,
         ),

@@ -6,11 +6,17 @@
         "session_id": "strategy_example",
         "assessed_at_ms": 1000,
         "state": "normal",
+        "previous_state": null,
+        "trajectory": "stable",
         "evidence_sufficiency": "sufficient",
         "confidence": "high",
         "interaction_performance": [
           "normal task progression"
         ],
+        "task_process": "smooth_progress",
+        "support_need": "none",
+        "support_target": "both",
+        "interruptibility": "natural_pause",
         "modality_evidence": {
           "audio": {
             "sufficiency": "sufficient",
@@ -43,11 +49,17 @@
         "session_id": "strategy_example",
         "assessed_at_ms": 2000,
         "state": "dysregulation",
+        "previous_state": "normal",
+        "trajectory": "worsening",
         "evidence_sufficiency": "sufficient",
         "confidence": "high",
         "interaction_performance": [
           "pace conflict"
         ],
+        "task_process": "pace_mismatch",
+        "support_need": "emotional_support",
+        "support_target": "parent",
+        "interruptibility": "natural_pause",
         "modality_evidence": {
           "audio": {
             "sufficiency": "sufficient",
