@@ -12,7 +12,11 @@ from __future__ import annotations
 import asyncio
 
 from coregulation_poc.capture.media import MediaChunk, MediaKind
-from coregulation_poc.control import STATE_RANK, StateTrajectoryController, load_intervention_policy
+from coregulation_poc.control import (
+    STATE_RANK,
+    StateTrajectoryController,
+    load_intervention_policy,
+)
 from coregulation_poc.models import (
     ControlObservation,
     CoregulationState,
@@ -22,7 +26,6 @@ from coregulation_poc.models import (
 from coregulation_poc.runtime import RealtimeLoopConfig, RealtimeSession
 from coregulation_poc.runtime.window import MediaWindow
 from coregulation_poc.web.research import ResearchSessionRegistry
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -55,6 +58,13 @@ def _dysregulation_assessment(
         support_need="task_pacing",
         support_target="parent",
         interruptibility="natural_pause",
+        boundary_signals={
+            "task_stall_observed": True,
+            "parental_prompt_count": 1,
+            "conflict_action_observed": False,
+            "child_disengaged_observed": False,
+            "regulation_balance": "one_stable",
+        },
         modality_evidence={
             "audio": {
                 "sufficiency": "sufficient",
@@ -117,6 +127,13 @@ def _image(timestamp_ms: int) -> MediaChunk:
     return MediaChunk(MediaKind.IMAGE, timestamp_ms, b"jpeg")
 
 
+async def _reach_confirmed_dysregulation(session: RealtimeSession) -> None:
+    for index in range(3):
+        await session.accept_chunk(_audio(index * 10_000 + (1 if index else 0)))
+        await session.accept_chunk(_image((index + 1) * 10_000))
+        await session.analyze_now()
+
+
 def _create_session(
     *,
     session_id: str = "feedback-test",
@@ -156,9 +173,7 @@ async def _exercise_self_continue() -> None:
         recognizer=_DysregulationRecognizer(),
     )
     await session.start()
-    await session.accept_chunk(_audio(100))
-    await session.accept_chunk(_image(101))
-    await session.analyze_now()
+    await _reach_confirmed_dysregulation(session)
 
     # Verify intervention was sent
     events = session._test_events  # type: ignore[attr-defined]
@@ -170,11 +185,11 @@ async def _exercise_self_continue() -> None:
         {
             "type": "delivery_execution",
             "delivery_id": intervention["delivery_id"],
-            "recorded_at_ms": 200,
+            "recorded_at_ms": 30_200,
             "visual": {
                 "status": "delivered",
-                "started_at_ms": 180,
-                "completed_at_ms": 181,
+                "started_at_ms": 30_180,
+                "completed_at_ms": 30_181,
                 "provider": "browser_overlay",
             },
             "voice": {"status": "not_attempted"},
@@ -188,7 +203,7 @@ async def _exercise_self_continue() -> None:
             "type": "family_response",
             "response": "self_continue",
             "delivery_id": intervention["delivery_id"],
-            "recorded_at_ms": 300,
+            "recorded_at_ms": 30_300,
         }
     )
     assert session._self_continue_suppressed is True
@@ -198,8 +213,8 @@ async def _exercise_self_continue() -> None:
     session.previous_plan = None
 
     # Next analysis cycle: intervention should be held
-    await session.accept_chunk(_audio(1300))
-    await session.accept_chunk(_image(1301))
+    await session.accept_chunk(_audio(41_300))
+    await session.accept_chunk(_image(41_301))
     await session.analyze_now()
 
     events = session._test_events  # type: ignore[attr-defined]

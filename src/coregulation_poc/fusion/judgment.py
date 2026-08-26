@@ -276,11 +276,13 @@ def build_judgment_system_prompt(
                 "6. Do not output intervention actions or intervention scripts; "
                 "assess only the observable state and its attributes.\n"
                 "7. Use the codebook's operational_boundary as a trajectory-level "
-                "anchor: 10-to-30-second stalls with one participant stable support "
-                "fluctuation; at least 30 seconds without spontaneous recovery plus "
-                "corroborating evidence supports dysregulation. The runtime performs "
-                "the final cross-window calculation, so never invent missing duration "
-                "or counts."
+                "anchor. Ten to 30 seconds of observed coordination disruption "
+                "supports fluctuation. Disruption may be a task stall, pace conflict, "
+                "misaligned understanding, escalating negative interaction, or child "
+                "disengagement. At least 30 seconds without explicit recovery plus "
+                "corroborating evidence supports actionable dysregulation. The runtime "
+                "performs the final cross-window duration calculation, so never invent "
+                "missing duration or counts."
             ),
             "Return exactly one JSON object. Do not use Markdown or add commentary.",
             (
@@ -403,7 +405,8 @@ def build_judgment_system_prompt(
             coordination and task progress are maintained.
             - Fluctuation means temporary unevenness with observable recovery capacity.
             - Dysregulation means an unresolved negative interaction cycle within the
-            current sequence.
+              current sequence; the runtime confirms the 30-second cross-window
+              operational boundary before authorizing intervention.
             - High_risk requires a persistent pattern supported by current evidence
             and prior-window history.
             - Acoustic features may corroborate a trajectory, but pitch, RMS energy,

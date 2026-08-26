@@ -12,9 +12,11 @@ from coregulation_poc.models import (
     ConfidenceLevel,
     CoregulationState,
     EvidenceSufficiency,
+    InteractionTrajectory,
     RegulationBalance,
     StateAssessment,
     SupportNeed,
+    TaskProcess,
 )
 from coregulation_poc.paths import STATE_CODEBOOK_PATH
 
@@ -29,9 +31,14 @@ class BoundaryRuleConfig(BaseModel):
     fluctuation_stagnation_minimum_ms: int = Field(gt=0)
     dysregulation_stagnation_minimum_ms: int = Field(gt=0)
     spontaneous_recovery_window_ms: int = Field(gt=0)
+    uncertain_evidence_retention_ms: int = Field(gt=0)
     parental_prompt_rate_window_ms: int = Field(gt=0)
     high_parental_prompt_rate_per_minute_exclusive: float = Field(ge=0)
     required_corroborating_signal_count: int = Field(ge=1)
+    model_dysregulation_requires_operational_confirmation: bool
+    coordination_disruption_task_processes: list[TaskProcess] = Field(min_length=1)
+    coordination_disruption_performances: list[str] = Field(min_length=1)
+    explicit_recovery_task_processes: list[TaskProcess] = Field(min_length=1)
     corroborating_signals: list[str] = Field(min_length=1)
     guidance: str = Field(min_length=1)
 
@@ -42,6 +49,11 @@ class BoundaryRuleConfig(BaseModel):
         if self.spontaneous_recovery_window_ms != self.dysregulation_stagnation_minimum_ms:
             raise ValueError(
                 "recovery and dysregulation boundaries must share the 30-second cutoff"
+            )
+        if self.uncertain_evidence_retention_ms != self.spontaneous_recovery_window_ms:
+            raise ValueError(
+                "uncertain evidence retention must use the existing 30-second "
+                "recovery boundary"
             )
         return self
 
@@ -78,6 +90,9 @@ class BoundaryResolution:
             "boundary_rule_applied": self.rule_applied,
             "boundary_reason_code": self.reason_code,
             "active_stall_duration_ms": self.active_stall_duration_ms,
+            "active_coordination_disruption_duration_ms": (
+                self.active_stall_duration_ms
+            ),
             "rolling_parental_prompt_rate_per_minute": (
                 self.rolling_parental_prompt_rate_per_minute
             ),
@@ -88,7 +103,13 @@ class BoundaryResolution:
 
 
 class BoundaryStateTracker:
-    """Apply the data-derived fluctuation/dysregulation boundary across windows."""
+    """Apply the data-derived fluctuation/dysregulation boundary across windows.
+
+    Only valid windows with directly observed coordination disruption add to an
+    episode.  Uncertain windows pause the episode rather than silently treating
+    missing evidence as recovery; a candidate expires after the existing
+    30-second recovery boundary if uncertainty continues.
+    """
 
     def __init__(
         self,
@@ -97,7 +118,11 @@ class BoundaryStateTracker:
     ) -> None:
         self.config = config
         self.allowed_performances = allowed_performances
-        self._active_stall_started_at_ms: int | None = None
+        self._active_disruption_started_at_ms: int | None = None
+        self._active_disruption_observed_ms: int = 0
+        self._last_counted_disruption_end_ms: int | None = None
+        self._uncertainty_started_at_ms: int | None = None
+        self._episode_corroborating_signals: set[str] = set()
         self._prompt_windows: deque[tuple[int, int, int]] = deque()
 
     @classmethod
@@ -116,38 +141,38 @@ class BoundaryStateTracker:
             raise ValueError("boundary window end must be greater than its start")
 
         model_state = assessment.state
-        if (
+        signals = assessment.boundary_signals
+        evidence_available = not (
             assessment.evidence_sufficiency is EvidenceSufficiency.INSUFFICIENT
             or assessment.confidence is ConfidenceLevel.LOW
             or model_state is None
-        ):
-            self._active_stall_started_at_ms = None
-            return self._resolution(
+        )
+        if not evidence_available:
+            return self._resolve_uncertainty(
                 assessment=assessment,
                 model_state=model_state,
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
                 reason_code="boundary_evidence_unavailable",
             )
 
-        signals = assessment.boundary_signals
         self._record_prompt_window(
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
             prompt_count=signals.parental_prompt_count,
         )
         prompt_rate = self._rolling_prompt_rate(window_end_ms)
-        corroborating = self._corroborating_signals(assessment, prompt_rate)
+        current_corroborating = self._corroborating_signals(assessment, prompt_rate)
+        disruption_observed = self._coordination_disruption_observed(assessment)
+        explicit_recovery = self._explicit_recovery_observed(assessment)
 
-        if signals.task_stall_observed is False:
-            recovery_elapsed_ms = (
-                None
-                if self._active_stall_started_at_ms is None
-                else max(0, window_start_ms - self._active_stall_started_at_ms)
-            )
+        if explicit_recovery and not disruption_observed:
+            active_duration_ms = self._active_disruption_duration()
             spontaneous_recovery = (
-                recovery_elapsed_ms is not None
-                and recovery_elapsed_ms <= self.config.spontaneous_recovery_window_ms
+                active_duration_ms is not None
+                and active_duration_ms <= self.config.spontaneous_recovery_window_ms
             )
-            self._active_stall_started_at_ms = None
+            self._clear_active_disruption()
             return self._resolution(
                 assessment=assessment,
                 model_state=model_state,
@@ -157,60 +182,176 @@ class BoundaryStateTracker:
                     else "no_active_task_stall"
                 ),
                 prompt_rate=prompt_rate,
-                corroborating=corroborating,
+                corroborating=current_corroborating,
                 spontaneous_recovery=spontaneous_recovery,
             )
 
-        if signals.task_stall_observed is not True:
-            self._active_stall_started_at_ms = None
-            return self._resolution(
+        if not disruption_observed:
+            return self._resolve_uncertainty(
                 assessment=assessment,
                 model_state=model_state,
-                reason_code="task_stall_unclear",
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+                reason_code="coordination_recovery_unclear",
                 prompt_rate=prompt_rate,
-                corroborating=corroborating,
+                corroborating=current_corroborating,
             )
 
-        if self._active_stall_started_at_ms is None:
-            self._active_stall_started_at_ms = window_start_ms
-        stall_duration_ms = max(0, window_end_ms - self._active_stall_started_at_ms)
+        disruption_duration_ms = self._record_disruption_window(
+            window_start_ms=window_start_ms,
+            window_end_ms=window_end_ms,
+        )
+        self._episode_corroborating_signals.update(current_corroborating)
+        corroborating = self._ordered_episode_corroborating()
 
         if model_state is CoregulationState.HIGH_RISK:
             return self._resolution(
                 assessment=assessment,
                 model_state=model_state,
                 reason_code="high_risk_history_rule_preserved",
-                stall_duration_ms=stall_duration_ms,
+                stall_duration_ms=disruption_duration_ms,
                 prompt_rate=prompt_rate,
                 corroborating=corroborating,
             )
 
         target_state = model_state
-        reason_code = "stall_below_fluctuation_boundary"
-        if stall_duration_ms >= self.config.dysregulation_stagnation_minimum_ms:
+        reason_code = "disruption_below_fluctuation_boundary"
+        if disruption_duration_ms >= self.config.dysregulation_stagnation_minimum_ms:
             if len(corroborating) >= self.config.required_corroborating_signal_count:
                 target_state = CoregulationState.DYSREGULATION
-                reason_code = "dysregulation_30_seconds_with_corroboration"
+                reason_code = "dysregulation_30_seconds_disruption_with_corroboration"
             else:
+                if self.config.model_dysregulation_requires_operational_confirmation:
+                    target_state = CoregulationState.FLUCTUATION
                 reason_code = "dysregulation_duration_met_waiting_for_corroboration"
+        elif disruption_duration_ms >= self.config.fluctuation_stagnation_minimum_ms:
+            target_state = CoregulationState.FLUCTUATION
+            reason_code = "fluctuation_10_to_30_seconds_coordination_disruption"
         elif (
-            stall_duration_ms >= self.config.fluctuation_stagnation_minimum_ms
-            and signals.regulation_balance is RegulationBalance.ONE_STABLE
+            model_state is CoregulationState.DYSREGULATION
+            and self.config.model_dysregulation_requires_operational_confirmation
         ):
             target_state = CoregulationState.FLUCTUATION
-            reason_code = "fluctuation_10_to_30_seconds_one_stable"
-        elif stall_duration_ms >= self.config.fluctuation_stagnation_minimum_ms:
-            reason_code = "fluctuation_duration_met_balance_unresolved"
+            reason_code = "dysregulation_candidate_waiting_for_duration"
 
         resolved = self._replace_state(assessment, target_state, reason_code)
         return self._resolution(
             assessment=resolved,
             model_state=model_state,
             reason_code=reason_code,
-            stall_duration_ms=stall_duration_ms,
+            stall_duration_ms=disruption_duration_ms,
             prompt_rate=prompt_rate,
             corroborating=corroborating,
         )
+
+    def _coordination_disruption_observed(self, assessment: StateAssessment) -> bool:
+        signals = assessment.boundary_signals
+        if signals.task_stall_observed is True:
+            return True
+        if assessment.task_process in set(
+            self.config.coordination_disruption_task_processes
+        ):
+            return True
+        return bool(
+            set(assessment.interaction_performance).intersection(
+                self.config.coordination_disruption_performances
+            )
+        )
+
+    def _explicit_recovery_observed(self, assessment: StateAssessment) -> bool:
+        signals = assessment.boundary_signals
+        return all(
+            (
+                signals.task_stall_observed is False,
+                assessment.task_process in set(
+                    self.config.explicit_recovery_task_processes
+                ),
+                assessment.trajectory
+                in {InteractionTrajectory.STABLE, InteractionTrajectory.RECOVERING},
+                signals.conflict_action_observed is False,
+                signals.child_disengaged_observed is False,
+                signals.regulation_balance is RegulationBalance.BOTH_STABLE,
+            )
+        )
+
+    def _record_disruption_window(
+        self,
+        *,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> int:
+        if self._active_disruption_started_at_ms is None:
+            self._active_disruption_started_at_ms = window_start_ms
+        counted_start = window_start_ms
+        if self._last_counted_disruption_end_ms is not None:
+            counted_start = max(counted_start, self._last_counted_disruption_end_ms)
+        self._active_disruption_observed_ms += max(0, window_end_ms - counted_start)
+        self._last_counted_disruption_end_ms = max(
+            window_end_ms,
+            self._last_counted_disruption_end_ms or 0,
+        )
+        self._uncertainty_started_at_ms = None
+        return self._active_disruption_observed_ms
+
+    def _resolve_uncertainty(
+        self,
+        *,
+        assessment: StateAssessment,
+        model_state: CoregulationState | None,
+        window_start_ms: int,
+        window_end_ms: int,
+        reason_code: str,
+        prompt_rate: float | None = None,
+        corroborating: tuple[str, ...] = (),
+    ) -> BoundaryResolution:
+        active_duration_ms = self._active_disruption_duration()
+        if active_duration_ms is None:
+            return self._resolution(
+                assessment=assessment,
+                model_state=model_state,
+                reason_code=reason_code,
+                prompt_rate=prompt_rate,
+                corroborating=corroborating,
+            )
+        if self._uncertainty_started_at_ms is None:
+            self._uncertainty_started_at_ms = window_start_ms
+        uncertainty_ms = max(0, window_end_ms - self._uncertainty_started_at_ms)
+        if uncertainty_ms >= self.config.uncertain_evidence_retention_ms:
+            self._clear_active_disruption()
+            return self._resolution(
+                assessment=assessment,
+                model_state=model_state,
+                reason_code="coordination_disruption_candidate_expired_after_uncertainty",
+                prompt_rate=prompt_rate,
+                corroborating=corroborating,
+            )
+        return self._resolution(
+            assessment=assessment,
+            model_state=model_state,
+            reason_code=f"{reason_code}_candidate_retained",
+            stall_duration_ms=active_duration_ms,
+            prompt_rate=prompt_rate,
+            corroborating=self._ordered_episode_corroborating(),
+        )
+
+    def _active_disruption_duration(self) -> int | None:
+        if self._active_disruption_started_at_ms is None:
+            return None
+        return self._active_disruption_observed_ms
+
+    def _ordered_episode_corroborating(self) -> tuple[str, ...]:
+        return tuple(
+            item
+            for item in self.config.corroborating_signals
+            if item in self._episode_corroborating_signals
+        )
+
+    def _clear_active_disruption(self) -> None:
+        self._active_disruption_started_at_ms = None
+        self._active_disruption_observed_ms = 0
+        self._last_counted_disruption_end_ms = None
+        self._uncertainty_started_at_ms = None
+        self._episode_corroborating_signals.clear()
 
     def _record_prompt_window(
         self,

@@ -12,10 +12,10 @@ from coregulation_poc.models import (
     CoregulationState,
     EvidenceSufficiency,
     InteractionTrajectory,
+    Interruptibility,
     InterventionAction,
     InterventionDecision,
     InterventionDecisionReason,
-    Interruptibility,
     RecoveryStatus,
     StateTrajectoryPoint,
     StateTrajectorySnapshot,
@@ -58,7 +58,33 @@ class StateTrajectoryController:
         self._pending_intervention_state = None
         self._post_intervention_wait_count = 0
 
-    def ingest(self, observation: ControlObservation) -> InterventionDecision:
+    def mark_intervention_delivered(self, state: CoregulationState) -> None:
+        """Arm response observation when a previously queued plan is delivered."""
+
+        if state not in {
+            CoregulationState.NORMAL,
+            CoregulationState.DYSREGULATION,
+            CoregulationState.HIGH_RISK,
+        }:
+            raise ValueError("delivered intervention state is not actionable")
+        if self._pending_intervention_state is not None:
+            raise ValueError("an intervention response is already pending")
+        self._pending_intervention_state = state
+        self._post_intervention_wait_count = 0
+
+    def ingest(
+        self,
+        observation: ControlObservation,
+        *,
+        defer_delivery_timing: bool = False,
+    ) -> InterventionDecision:
+        """Record a state and decide whether an intervention is authorized.
+
+        ``defer_delivery_timing`` is used by the realtime runtime, which can retain
+        an authorized plan and deliver it at the next live audio boundary.  The
+        default behavior remains conservative for offline callers that cannot
+        queue a plan.
+        """
         assessment = observation.assessment
         self._validate_observation(observation)
         previous_state = self._points[-1].state if self._points else None
@@ -163,7 +189,10 @@ class StateTrajectoryController:
                     reason=InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
                     recovery_status=recovery_status,
                 )
-            if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
+            if (
+                not defer_delivery_timing
+                and assessment.interruptibility is not Interruptibility.NATURAL_PAUSE
+            ):
                 return self._record_guard_decision(
                     observation=observation,
                     previous_state=previous_state,
@@ -181,7 +210,10 @@ class StateTrajectoryController:
                 recovery_status=recovery_status,
             )
         if assessment.state is CoregulationState.HIGH_RISK:
-            if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
+            if (
+                not defer_delivery_timing
+                and assessment.interruptibility is not Interruptibility.NATURAL_PAUSE
+            ):
                 return self._record_guard_decision(
                     observation=observation,
                     previous_state=previous_state,
@@ -189,7 +221,11 @@ class StateTrajectoryController:
                     reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
                     recovery_status=recovery_status,
                 )
-        if rule.requires_natural_turn_boundary and not observation.natural_turn_boundary:
+        if (
+            rule.requires_natural_turn_boundary
+            and not defer_delivery_timing
+            and not observation.natural_turn_boundary
+        ):
             return self._record_guard_decision(
                 observation=observation,
                 previous_state=previous_state,

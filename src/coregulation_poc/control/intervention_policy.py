@@ -20,6 +20,7 @@ class PolicyPrinciples(BaseModel):
     require_corroborating_signal_for_dysregulation: bool
     use_single_signal_as_trigger: bool
     require_natural_turn_boundary_for_intervention: bool
+    retain_authorized_intervention_until_safe_boundary: bool
     require_post_intervention_response_before_repeat: bool
     post_intervention_max_wait_count: int = Field(ge=1)
     low_confidence_action: InterventionAction
@@ -128,6 +129,10 @@ class InterventionPolicy(BaseModel):
             raise ValueError("a single signal cannot trigger intervention")
         if not self.principles.require_natural_turn_boundary_for_intervention:
             raise ValueError("the policy must protect the dyad's natural interaction rhythm")
+        if not self.principles.retain_authorized_intervention_until_safe_boundary:
+            raise ValueError(
+                "authorized interventions must be retained until a safe boundary"
+            )
         if not self.principles.require_post_intervention_response_before_repeat:
             raise ValueError("the policy must observe intervention consequences before repeating")
         if self.principles.low_confidence_action is not InterventionAction.HOLD:

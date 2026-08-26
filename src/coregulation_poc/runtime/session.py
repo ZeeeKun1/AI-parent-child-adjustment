@@ -37,7 +37,12 @@ from coregulation_poc.intervention import (
     load_strategy_library,
 )
 from coregulation_poc.intervention.models import InterventionPlan
-from coregulation_poc.models import ControlObservation, CoregulationState, StateAssessment
+from coregulation_poc.models import (
+    ControlObservation,
+    CoregulationState,
+    Interruptibility,
+    StateAssessment,
+)
 from coregulation_poc.runtime.recognition import StateRecognizer
 from coregulation_poc.runtime.window import MediaWindow, RollingMediaWindow
 
@@ -177,6 +182,9 @@ class RealtimeSession:
         self.assessment_history: list[StateAssessment] = []
         self.pending_delivery: DeliveryPackage | None = None
         self._pending_plan: InterventionPlan | None = None
+        self._queued_delivery: DeliveryPackage | None = None
+        self._queued_plan: InterventionPlan | None = None
+        self._queued_interruptibility: Interruptibility | None = None
         self.delivery_reports: list[dict[str, Any]] = []
         self.intervention_outcomes: list[dict[str, Any]] = []
         self.expert_interventions: list[dict[str, Any]] = []
@@ -244,6 +252,7 @@ class RealtimeSession:
             "awaiting_post_intervention_response": (
                 self.controller.awaiting_post_intervention_response
             ),
+            "intervention_queued": self._queued_delivery is not None,
             "interventions_paused": self._interventions_paused,
             "expert_takeover_active": self._expert_takeover_active,
             "voice_enabled": self.config.voice_enabled,
@@ -269,7 +278,11 @@ class RealtimeSession:
             return
         self.window.append(chunk)
         snapshot = self.window.snapshot()
-        if snapshot is None or not snapshot.has_both_modalities:
+        if snapshot is None:
+            return
+        if await self._try_deliver_queued(snapshot):
+            return
+        if not snapshot.has_both_modalities:
             return
         if (
             self.config.max_assessments_per_session > 0
@@ -410,7 +423,10 @@ class RealtimeSession:
                 post_intervention_response_observed=post_response_observed,
                 interaction_history_available=history_available,
             )
-            decision = self.controller.ingest(observation)
+            decision = self.controller.ingest(
+                observation,
+                defer_delivery_timing=True,
+            )
             self.assessment_count += 1
             self.assessment_history.append(assessment)
             self.previous_state = assessment.state
@@ -462,6 +478,24 @@ class RealtimeSession:
                     **boundary_resolution.as_event_fields(),
                 }
             )
+            if self._queued_delivery is not None:
+                if decision.intervention_permitted:
+                    self._queued_interruptibility = assessment.interruptibility
+                    if self.controller.awaiting_post_intervention_response:
+                        self.controller.mark_intervention_not_delivered()
+                    await self.send_event(
+                        {
+                            "type": "intervention_held",
+                            "sequence": decision.sequence,
+                            "reason": "waiting_for_natural_turn_boundary",
+                            "queued": True,
+                        }
+                    )
+                    return
+                await self._cancel_queued_delivery(
+                    reason="state_or_evidence_no_longer_authorizes_intervention",
+                    sequence=decision.sequence,
+                )
             selection = self.selector.select(
                 assessment=assessment,
                 decision=decision,
@@ -500,7 +534,6 @@ class RealtimeSession:
                     }
                 )
                 return
-            self.previous_plan = selection.plan
             preparation = self.delivery.prepare(
                 plan=selection.plan,
                 runtime=DeliveryRuntimeContext(
@@ -520,6 +553,24 @@ class RealtimeSession:
                     }
                 )
                 return
+            if not self._delivery_timing_is_safe(
+                snapshot,
+                assessment.interruptibility,
+            ):
+                if self.controller.awaiting_post_intervention_response:
+                    self.controller.mark_intervention_not_delivered()
+                self._queued_delivery = preparation.package
+                self._queued_plan = selection.plan
+                self._queued_interruptibility = assessment.interruptibility
+                await self.send_event(
+                    {
+                        "type": "intervention_held",
+                        "sequence": decision.sequence,
+                        "reason": "waiting_for_natural_turn_boundary",
+                        "queued": True,
+                    }
+                )
+                return
             self._pending_plan = selection.plan
             await self._deliver(preparation.package)
         except asyncio.CancelledError:
@@ -535,6 +586,58 @@ class RealtimeSession:
                         "retryable": True,
                     }
                 )
+
+    def _delivery_timing_is_safe(
+        self,
+        snapshot: MediaWindow,
+        interruptibility: Interruptibility,
+    ) -> bool:
+        if interruptibility in {
+            Interruptibility.TASK_ENGAGED,
+            Interruptibility.UNCLEAR,
+        }:
+            return False
+        return self.turn_boundary_detector(snapshot)
+
+    async def _try_deliver_queued(self, snapshot: MediaWindow) -> bool:
+        package = self._queued_delivery
+        plan = self._queued_plan
+        interruptibility = self._queued_interruptibility
+        if package is None or plan is None or interruptibility is None:
+            return False
+        if self._interventions_paused or self._expert_takeover_active:
+            return False
+        if not self._delivery_timing_is_safe(snapshot, interruptibility):
+            return False
+
+        self._queued_delivery = None
+        self._queued_plan = None
+        self._queued_interruptibility = None
+        self.controller.mark_intervention_delivered(plan.state)
+        self._pending_plan = plan
+        await self.send_event(
+            {
+                "type": "intervention_queue_released",
+                "sequence": package.sequence,
+                "reason": "natural_turn_boundary_observed",
+            }
+        )
+        await self._deliver(package)
+        return True
+
+    async def _cancel_queued_delivery(self, *, reason: str, sequence: int) -> None:
+        if self._queued_delivery is None:
+            return
+        self._queued_delivery = None
+        self._queued_plan = None
+        self._queued_interruptibility = None
+        await self.send_event(
+            {
+                "type": "intervention_queue_cancelled",
+                "sequence": sequence,
+                "reason": reason,
+            }
+        )
 
     async def _deliver(self, package: DeliveryPackage) -> None:
         if self._interventions_paused or self._expert_takeover_active:
@@ -566,8 +669,10 @@ class RealtimeSession:
                 voice_output_identifier = voice.output_identifier
             except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
                 voice_error = str(exc)
-        self.pending_delivery = package
         plan = self._pending_plan
+        if plan is not None:
+            self.previous_plan = plan
+        self.pending_delivery = package
         await self.send_event(
             {
                 "type": "intervention",
@@ -628,6 +733,11 @@ class RealtimeSession:
                     }
                 )
                 return True
+            if control_type == "pause_interventions" and self._queued_delivery is not None:
+                await self._cancel_queued_delivery(
+                    reason="interventions_paused",
+                    sequence=self._queued_delivery.sequence,
+                )
             self._interventions_paused = control_type == "pause_interventions"
             await self.send_event(
                 {
@@ -713,6 +823,11 @@ class RealtimeSession:
         reason = self._required_text(control.get("reason"), "reason", maximum=300)
         self._expert_takeover_active = True
         self._interventions_paused = True
+        if self._queued_delivery is not None:
+            await self._cancel_queued_delivery(
+                reason="expert_takeover_active",
+                sequence=self._queued_delivery.sequence,
+            )
         if self.pending_delivery is not None:
             if self.controller.awaiting_post_intervention_response:
                 self.controller.mark_intervention_not_delivered()
@@ -871,6 +986,11 @@ class RealtimeSession:
         # Apply feedback effects on system behavior
         if response == "self_continue":
             # Suppress intervention for one complete analysis window
+            if self._queued_delivery is not None:
+                await self._cancel_queued_delivery(
+                    reason="family_requested_self_continue",
+                    sequence=self._queued_delivery.sequence,
+                )
             self._self_continue_suppressed = True
         elif response == "task_too_hard":
             self._update_task_difficulty("challenging")
@@ -1070,4 +1190,7 @@ class RealtimeSession:
                 self._analysis_task.cancel()
             with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
                 await self._analysis_task
+        self._queued_delivery = None
+        self._queued_plan = None
+        self._queued_interruptibility = None
         self.window.clear()
