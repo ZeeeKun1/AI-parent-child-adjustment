@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib.metadata
 import time
 from collections.abc import Callable
@@ -12,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from coregulation_poc.capture.media import MediaChunk, MediaKind, StrictTimestampNormalizer
+from coregulation_poc.capture.media import MediaChunk, StrictTimestampNormalizer
 from coregulation_poc.capture.video_replay import ReplayMedia, decode_video_for_replay
 from coregulation_poc.codebook import load_state_codebook
 from coregulation_poc.control import load_intervention_policy
@@ -24,6 +23,7 @@ from coregulation_poc.paths import (
     STATE_CODEBOOK_PATH,
     STRATEGY_CARDS_PATH,
 )
+from coregulation_poc.providers.qwen_text_chat import QwenTextChatProvider
 from coregulation_poc.runtime.factory import QwenVoiceSynthesizer
 from coregulation_poc.runtime.recognition import QwenWindowRecognizer
 from coregulation_poc.runtime.session import RealtimeLoopConfig, RealtimeSession
@@ -207,6 +207,13 @@ async def run_pipeline_test(
     voice_synthesizer: QwenVoiceSynthesizer | None = None
     if voice_enabled:
         voice_synthesizer = QwenVoiceSynthesizer(settings)
+    text_chat_provider = QwenTextChatProvider(
+        api_key=settings.dashscope_api_key.get_secret_value(),
+        model=settings.text_chat_model,
+        temperature=settings.text_chat_temperature,
+        max_tokens=settings.text_chat_max_tokens,
+        timeout_seconds=settings.text_chat_timeout_seconds,
+    )
     progress(f"    Module 1: {type(recognizer).__name__}")
     progress("    Module 2: StateTrajectoryController")
     progress("    Module 3: StrategySelector")
@@ -229,6 +236,7 @@ async def run_pipeline_test(
         send_event=send_event,
         config=loop_config,
         voice_synthesizer=voice_synthesizer,
+        text_chat_provider=text_chat_provider,
     )
 
     # -- Step 5: replay video through the pipeline ---------------------------

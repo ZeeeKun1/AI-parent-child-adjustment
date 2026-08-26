@@ -35,14 +35,14 @@ class Settings(BaseSettings):
 
     text_chat_model: str = "qwen3.7-plus"
     text_chat_temperature: float = Field(default=0.3, ge=0.0, le=2.0)
-    text_chat_max_tokens: int = Field(default=128, ge=16, le=1024)
+    text_chat_max_tokens: int = Field(default=256, ge=16, le=1024)
     text_chat_timeout_seconds: float = Field(default=10, ge=3, le=60)
 
     # Stage-2 judgment model settings (two-stage recognition pipeline)
     judgment_model: str = "qwen3.7-plus"
     judgment_temperature: float = Field(default=0.15, ge=0.0, le=2.0)
     judgment_max_tokens: int = Field(default=2048, ge=256, le=8192)
-    judgment_timeout_seconds: float = Field(default=30, ge=5, le=120)
+    judgment_timeout_seconds: float = Field(default=60, ge=5, le=120)
 
     browser_capture_access_token: SecretStr | None = None
     research_console_access_token: SecretStr | None = None

@@ -30,7 +30,12 @@ from coregulation_poc.delivery import (
     load_delivery_policy,
     not_attempted_voice_execution,
 )
-from coregulation_poc.intervention import MessageGenerator, StrategySelector, load_strategy_library
+from coregulation_poc.intervention import (
+    MessageGenerator,
+    StrategyChoiceGenerator,
+    StrategySelector,
+    load_strategy_library,
+)
 from coregulation_poc.intervention.models import InterventionPlan
 from coregulation_poc.models import ControlObservation, CoregulationState, StateAssessment
 from coregulation_poc.runtime.recognition import StateRecognizer
@@ -149,6 +154,7 @@ class RealtimeSession:
         self.boundary_tracker = BoundaryStateTracker.from_codebook()
         self.strategy_library = load_strategy_library()
         message_generator = None
+        strategy_choice_generator = None
         if text_chat_provider is not None:
             message_generator = MessageGenerator(
                 provider=text_chat_provider,
@@ -156,9 +162,11 @@ class RealtimeSession:
                 max_sentences=self.strategy_library.principles.maximum_message_sentences,
                 banned_phrases=list(self.strategy_library.banned_phrases),
             )
+            strategy_choice_generator = StrategyChoiceGenerator(text_chat_provider)
         self.selector = StrategySelector(
             self.strategy_library,
             message_generator=message_generator,
+            strategy_choice_generator=strategy_choice_generator,
         )
         self.strategy_cards = {
             card.strategy_id: card for card in self.strategy_library.cards
@@ -199,13 +207,28 @@ class RealtimeSession:
 
     @property
     def api_call_count(self) -> int:
-        return int(getattr(self.recognizer, "api_call_count", self.assessment_count))
+        recognition_calls = int(
+            getattr(self.recognizer, "api_call_count", self.assessment_count)
+        )
+        message_calls = int(
+            getattr(self.selector.message_generator, "call_count", 0)
+        )
+        strategy_choice_calls = int(
+            getattr(self.selector.strategy_choice_generator, "call_count", 0)
+        )
+        return recognition_calls + message_calls + strategy_choice_calls
 
     @property
     def runtime_metrics(self) -> dict[str, Any]:
         return {
             "assessment_count": self.assessment_count,
             "api_call_count": self.api_call_count,
+            "strategy_selection_llm_call_count": int(
+                getattr(self.selector.strategy_choice_generator, "call_count", 0)
+            ),
+            "message_generation_llm_call_count": int(
+                getattr(self.selector.message_generator, "call_count", 0)
+            ),
             "voiceprint_api_call_count": int(
                 getattr(self.recognizer, "voiceprint_api_call_count", 0)
             ),
@@ -544,6 +567,7 @@ class RealtimeSession:
             except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
                 voice_error = str(exc)
         self.pending_delivery = package
+        plan = self._pending_plan
         await self.send_event(
             {
                 "type": "intervention",
@@ -556,6 +580,18 @@ class RealtimeSession:
                 "source": "ai",
                 "heading": package.visual_prompt.heading,
                 "message": package.visual_prompt.message,
+                "strategy_selection_source": (
+                    plan.strategy_selection_source.value if plan is not None else None
+                ),
+                "semantic_selection_confidence": (
+                    plan.semantic_selection_confidence.value
+                    if plan is not None and plan.semantic_selection_confidence is not None
+                    else None
+                ),
+                "semantic_relaxed_dimensions": (
+                    plan.semantic_relaxed_dimensions if plan is not None else []
+                ),
+                "selection_reason": plan.selection_reason if plan is not None else None,
                 "dismissible": package.visual_prompt.dismissible,
                 "voice_expected": package.voice_prompt.enabled,
                 "voice_provider": package.voice_prompt.provider,

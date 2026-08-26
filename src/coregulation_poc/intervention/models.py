@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from coregulation_poc.models import (
     Actor,
+    ConfidenceLevel,
     CoregulationState,
     EvidenceReference,
     InterventionAction,
@@ -40,12 +41,20 @@ class StrategySelectionStatus(StrEnum):
     HELD = "held"
 
 
+class StrategySelectionSource(StrEnum):
+    EXACT_RULE = "exact_rule"
+    BOUNDED_LLM = "bounded_llm"
+
+
 class StrategyHoldReason(StrEnum):
     MODULE_TWO_DID_NOT_AUTHORIZE = "module_two_did_not_authorize"
     STATE_NOT_SUPPORTED = "state_not_supported"
     ASSESSMENT_DECISION_MISMATCH = "assessment_decision_mismatch"
     NO_ROUTED_STRATEGY = "no_routed_strategy"
     TARGET_ACTOR_EVIDENCE_INSUFFICIENT = "target_actor_evidence_insufficient"
+    SEMANTIC_SELECTOR_UNAVAILABLE = "semantic_selector_unavailable"
+    SEMANTIC_SELECTOR_NO_MATCH = "semantic_selector_no_match"
+    SEMANTIC_SELECTOR_REJECTED = "semantic_selector_rejected"
 
 
 class StrategyPrinciples(BaseModel):
@@ -56,6 +65,8 @@ class StrategyPrinciples(BaseModel):
     target_actor_must_be_explicit: bool
     one_card_one_primary_action: bool
     llm_generates_observation_only: bool
+    llm_strategy_selection_is_bounded: bool
+    llm_cannot_create_strategy_cards: bool
     approved_template_fallback_required: bool
     do_not_repeat_before_observing_response: bool
     maximum_message_characters: int = Field(gt=0)
@@ -120,6 +131,12 @@ class StrategyLibraryConfig(BaseModel):
             "one_card_one_primary_action": self.principles.one_card_one_primary_action,
             "llm_generates_observation_only": (
                 self.principles.llm_generates_observation_only
+            ),
+            "llm_strategy_selection_is_bounded": (
+                self.principles.llm_strategy_selection_is_bounded
+            ),
+            "llm_cannot_create_strategy_cards": (
+                self.principles.llm_cannot_create_strategy_cards
             ),
             "approved_template_fallback_required": (
                 self.principles.approved_template_fallback_required
@@ -223,6 +240,9 @@ class InterventionPlan(BaseModel):
     repair_target: RepairTarget
     message: str = Field(min_length=1)
     message_source: MessageSource
+    strategy_selection_source: StrategySelectionSource = StrategySelectionSource.EXACT_RULE
+    semantic_selection_confidence: ConfidenceLevel | None = None
+    semantic_relaxed_dimensions: list[str] = Field(default_factory=list)
     selection_reason: str = Field(min_length=1)
     selected_from_interaction_performance: str = Field(min_length=1)
     evidence_references: list[EvidenceReference] = Field(min_length=1)
@@ -250,6 +270,12 @@ class InterventionPlan(BaseModel):
             raise ValueError("progressive_support must match the module-two action")
         if not self.validation_checks or not all(self.validation_checks.values()):
             raise ValueError("all message validation checks must pass")
+        if self.strategy_selection_source is StrategySelectionSource.BOUNDED_LLM:
+            if self.semantic_selection_confidence not in {
+                ConfidenceLevel.HIGH,
+                ConfidenceLevel.MEDIUM,
+            }:
+                raise ValueError("bounded LLM selection requires accepted confidence")
         return self
 
 

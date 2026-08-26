@@ -92,6 +92,10 @@ class QwenTextChatProvider:
             "messages": [
                 {"role": "user", "content": prompt},
             ],
+            # Qwen 3.7 enables thinking by default. Realtime intervention
+            # messages do not need a hidden reasoning pass; disabling it keeps
+            # latency bounded and sends the approved wording directly.
+            "enable_thinking": False,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
@@ -199,6 +203,10 @@ class QwenTextChatProvider:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            # Structured state judgment needs a concise JSON answer, not a
+            # long reasoning trace. Qwen 3.7 otherwise enables thinking by
+            # default and can exceed the synchronous request timeout.
+            "enable_thinking": False,
             "temperature": self.temperature if temperature is None else temperature,
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }

@@ -139,7 +139,10 @@ def build_judgment_system_prompt(
             (
                 "EVIDENCE RULES:\n"
                 "1. For audio evidence: set modality=audio, use the verbatim quote "
-                "from the speech turn, set frame_timestamp_ms to null.\n"
+                "from the speech turn, copy that quote into observation when no "
+                "separate acoustic observation is needed, and set "
+                "frame_timestamp_ms to null. Both quote and observation must be "
+                "non-empty strings.\n"
                 "2. For video evidence: set modality=video, set frame_timestamp_ms "
                 "to the observation's timestamp, set quote to null.\n"
                 "3. frame_timestamp_ms must fall within [start_ms, end_ms] for "
@@ -505,6 +508,23 @@ def parse_judgment_result(response_text: str) -> StateAssessment:
         The text response from the judgment model.
     """
     payload = _find_json_object(response_text)
+    # Qwen can represent an audio item's redundant human-readable observation
+    # as null while still returning the required verbatim quote. Reuse that
+    # quote instead of rejecting otherwise traceable evidence; this does not
+    # invent or reinterpret any observation.
+    modality_evidence = payload.get("modality_evidence")
+    if isinstance(modality_evidence, dict):
+        audio = modality_evidence.get("audio")
+        if isinstance(audio, dict):
+            items = audio.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    observation = item.get("observation")
+                    quote = item.get("quote")
+                    if observation is None and isinstance(quote, str) and quote.strip():
+                        item["observation"] = quote.strip()
     try:
         return StateAssessment.model_validate(payload)
     except ValidationError as exc:
