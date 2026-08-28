@@ -323,7 +323,7 @@ def test_child_escalation_selects_child_support_without_guessing_parent() -> Non
     assert result.plan.target_actor is Actor.CHILD
 
 
-def test_high_risk_progresses_only_after_observed_non_recovery() -> None:
+def test_high_risk_changes_strategy_after_interval_and_observed_non_recovery() -> None:
     controller = _controller()
     selector = _selector()
     first_observation = _observation(
@@ -347,7 +347,7 @@ def test_high_risk_progresses_only_after_observed_non_recovery() -> None:
         state="high_risk",
         performance="persistent interaction imbalance",
         actor="parent",
-        assessed_at_ms=2000,
+        assessed_at_ms=121_000,
         response_observed=True,
         history_available=True,
         support_need="autonomy_support",
@@ -388,7 +388,7 @@ def test_deterioration_selects_de_escalation_card() -> None:
         state="high_risk",
         performance="sustained strong resistance or withdrawal",
         actor="child",
-        assessed_at_ms=2000,
+        assessed_at_ms=121_000,
         response_observed=True,
         history_available=True,
         support_need="task_pacing",

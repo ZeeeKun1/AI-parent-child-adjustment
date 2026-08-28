@@ -24,8 +24,6 @@ class PolicyPrinciples(BaseModel):
     require_post_intervention_response_before_repeat: bool
     post_intervention_max_wait_count: int = Field(ge=1)
     same_episode_observation_ms: int = Field(ge=30_000)
-    max_interventions_per_episode: int = Field(ge=1, le=3)
-    repeat_requires_escalation_or_changed_need: bool
     low_confidence_action: InterventionAction
     insufficient_evidence_action: InterventionAction
     post_intervention_full_window_required: bool
@@ -88,8 +86,6 @@ class InterventionPolicy(BaseModel):
             InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
             InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
             InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD,
-            InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION,
-            InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT,
             InterventionDecisionReason.HISTORY_REQUIRED,
             InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
             InterventionDecisionReason.SUPPORT_TARGET_UNIDENTIFIED,
@@ -148,10 +144,6 @@ class InterventionPolicy(BaseModel):
             raise ValueError("insufficient evidence must hold intervention")
         if self.principles.same_episode_observation_ms < 120_000:
             raise ValueError("same-episode observation period must be at least 120 seconds")
-        if self.principles.max_interventions_per_episode != 2:
-            raise ValueError("one dysregulation episode must allow at most two interventions")
-        if not self.principles.repeat_requires_escalation_or_changed_need:
-            raise ValueError("repeat intervention must require escalation or a changed need")
 
         referenced_basis = {
             basis

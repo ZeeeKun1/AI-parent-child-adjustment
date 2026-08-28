@@ -29,4 +29,5 @@ def test_policy_preserves_research_boundaries() -> None:
     assert policy.principles.retain_authorized_intervention_until_safe_boundary is False
     assert policy.principles.positive_maintenance_enabled is False
     assert policy.principles.require_post_intervention_response_before_repeat is True
+    assert policy.principles.same_episode_observation_ms == 120_000
     assert policy.state_actions[CoregulationState.HIGH_RISK].history_required is True

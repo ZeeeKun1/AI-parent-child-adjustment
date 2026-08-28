@@ -55,8 +55,6 @@ class InterventionDecisionReason(StrEnum):
     WAITING_FOR_NATURAL_TURN_BOUNDARY = "waiting_for_natural_turn_boundary"
     WAITING_FOR_POST_INTERVENTION_RESPONSE = "waiting_for_post_intervention_response"
     SAME_EPISODE_OBSERVATION_PERIOD = "same_episode_observation_period"
-    SAME_EPISODE_NO_ESCALATION = "same_episode_no_escalation"
-    SAME_EPISODE_INTERVENTION_LIMIT = "same_episode_intervention_limit"
     HISTORY_REQUIRED = "history_required"
     SUPPORT_NEED_NOT_IDENTIFIED = "support_need_not_identified"
     SUPPORT_TARGET_UNIDENTIFIED = "support_target_unidentified"

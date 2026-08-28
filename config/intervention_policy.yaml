@@ -1,4 +1,4 @@
-version: 4
+version: 5
 source:
   - "Formative study section 3.4.1: intervention timing depends on dyadic co-regulation state"
   - "Formative study section 3.4.2: experts use multiple cues and whole context"
@@ -12,8 +12,10 @@ research_basis:
     When interaction remains coordinated or can recover, avoid interrupting the
     dyad's communication and the child's task attention.
   observe_consequences: >-
-    After an intervention, observe the dyad's response and task progression before
-    making another intervention decision.
+    After an intervention, observe the dyad's response and task progression for
+    120 seconds before making another intervention decision. If dysregulation
+    persists after that interval, renewed support remains warranted even when the
+    event has not escalated or changed form.
   deliver_authorized_support: >-
     Once sustained dysregulation or high risk authorizes support, deliver the
     selected prompt as soon as it is ready. Model response latency does not change
@@ -39,8 +41,6 @@ principles:
   require_post_intervention_response_before_repeat: true
   post_intervention_max_wait_count: 12
   same_episode_observation_ms: 120000
-  max_interventions_per_episode: 2
-  repeat_requires_escalation_or_changed_need: true
   low_confidence_action: hold
   insufficient_evidence_action: hold
   post_intervention_full_window_required: true
@@ -83,20 +83,6 @@ guard_actions:
     rationale: >-
       The same dysregulation episode is still within its 120-second observation
       period, so the system continues recognition without repeating a prompt.
-  same_episode_no_escalation:
-    action: hold
-    reason_code: same_episode_no_escalation
-    research_basis: [observe_consequences, protect_natural_rhythm]
-    rationale: >-
-      The same episode has not worsened and its support need has not meaningfully
-      changed, so another intervention would add interruption without new value.
-  same_episode_intervention_limit:
-    action: hold
-    reason_code: same_episode_intervention_limit
-    research_basis: [observe_consequences, protect_natural_rhythm]
-    rationale: >-
-      Two interventions have already been issued in this episode. The system keeps
-      observing and waits for confirmed recovery or expert support.
   history_required:
     action: hold
     reason_code: history_required

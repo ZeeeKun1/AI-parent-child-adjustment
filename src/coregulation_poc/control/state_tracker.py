@@ -290,45 +290,14 @@ class StateTrajectoryController:
         self,
         assessment: StateAssessment,
     ) -> InterventionDecisionReason | None:
-        """Suppress repeated prompts within one unresolved dysregulation episode."""
+        """Keep only a delivery-anchored interval between repeated prompts."""
 
         if not self._episode_active or not self._episode_interventions:
             return None
-        if (
-            len(self._episode_interventions)
-            >= self.policy.principles.max_interventions_per_episode
-        ):
-            return InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT
-        # High-risk episodes bypass the ordinary observation wait. They remain
-        # subject to the per-episode intervention cap above.
-        if assessment.state is CoregulationState.HIGH_RISK:
-            return None
-
-        last_time, last_state, last_need, last_target, last_performances = (
-            self._episode_interventions[-1]
-        )
-        state_escalated = STATE_RANK[assessment.state] > STATE_RANK[last_state]
-        if not state_escalated:
-            elapsed_ms = max(0, assessment.assessed_at_ms - last_time)
-            if elapsed_ms < self.policy.principles.same_episode_observation_ms:
-                return InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
-
-        meaningful_need = assessment.support_need not in {
-            None,
-            SupportNeed.NONE,
-            SupportNeed.UNCLEAR,
-        }
-        need_changed = meaningful_need and assessment.support_need is not last_need
-        target_changed = assessment.support_target is not last_target
-        new_performance = bool(
-            set(assessment.interaction_performance) - set(last_performances)
-        )
-        worsened = (
-            state_escalated
-            or assessment.trajectory is InteractionTrajectory.WORSENING
-        )
-        if not (worsened or need_changed or target_changed or new_performance):
-            return InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION
+        last_time = self._episode_interventions[-1][0]
+        elapsed_ms = max(0, assessment.assessed_at_ms - last_time)
+        if elapsed_ms < self.policy.principles.same_episode_observation_ms:
+            return InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
         return None
 
     def _reset_episode(self) -> None:

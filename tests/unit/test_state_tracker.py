@@ -296,7 +296,7 @@ def test_post_intervention_response_timeout() -> None:
     )
 
 
-def test_same_episode_waits_120_seconds_and_requires_worsening() -> None:
+def test_same_episode_reintervenes_after_120_seconds_without_escalation() -> None:
     controller = _controller()
     first = controller.ingest(_observation("dysregulation", 0, boundary=True))
     assert first.action is InterventionAction.INTERVENE
@@ -309,21 +309,10 @@ def test_same_episode_waits_120_seconds_and_requires_worsening() -> None:
             response_observed=True,
         )
     )
-    unchanged = controller.ingest(
-        _observation("dysregulation", 120_000, boundary=True)
-    )
-    escalated = controller.ingest(
-        _observation(
-            "dysregulation",
-            130_000,
-            boundary=True,
-            trajectory="worsening",
-        )
-    )
+    unchanged = controller.ingest(_observation("dysregulation", 120_000, boundary=True))
 
     assert cooldown.reason_code is InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
-    assert unchanged.reason_code is InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION
-    assert escalated.action is InterventionAction.INTERVENE
+    assert unchanged.action is InterventionAction.INTERVENE
 
 
 def test_same_episode_wait_starts_when_intervention_is_delivered() -> None:
@@ -344,7 +333,6 @@ def test_same_episode_wait_starts_when_intervention_is_delivered() -> None:
             120_000,
             boundary=True,
             response_observed=True,
-            trajectory="worsening",
         )
     )
     ready = controller.ingest(
@@ -352,7 +340,6 @@ def test_same_episode_wait_starts_when_intervention_is_delivered() -> None:
             "dysregulation",
             140_000,
             boundary=True,
-            trajectory="worsening",
         )
     )
 
@@ -362,10 +349,10 @@ def test_same_episode_wait_starts_when_intervention_is_delivered() -> None:
     assert ready.action is InterventionAction.INTERVENE
 
 
-def test_same_episode_allows_at_most_two_interventions() -> None:
+def test_same_episode_can_repeat_beyond_two_interventions_with_spacing() -> None:
     controller = _controller()
-    controller.ingest(_observation("dysregulation", 0, boundary=True))
-    controller.ingest(
+    first = controller.ingest(_observation("dysregulation", 0, boundary=True))
+    first_wait = controller.ingest(
         _observation(
             "dysregulation",
             10_000,
@@ -373,23 +360,25 @@ def test_same_episode_allows_at_most_two_interventions() -> None:
             response_observed=True,
         )
     )
-    controller.ingest(
+    second = controller.ingest(
+        _observation(
+            "dysregulation",
+            120_000,
+            boundary=True,
+        )
+    )
+    second_wait = controller.ingest(
         _observation(
             "dysregulation",
             130_000,
             boundary=True,
-            trajectory="worsening",
-        )
-    )
-    limited = controller.ingest(
-        _observation(
-            "high_risk",
-            140_000,
-            boundary=True,
             response_observed=True,
-            history_available=True,
         )
     )
+    third = controller.ingest(_observation("dysregulation", 240_000, boundary=True))
 
-    assert limited.action is InterventionAction.HOLD
-    assert limited.reason_code is InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT
+    assert first.action is InterventionAction.INTERVENE
+    assert first_wait.reason_code is InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+    assert second.action is InterventionAction.INTERVENE
+    assert second_wait.reason_code is InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+    assert third.action is InterventionAction.INTERVENE
