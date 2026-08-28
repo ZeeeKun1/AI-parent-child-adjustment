@@ -61,6 +61,8 @@ class RealtimeLoopConfig:
     max_parallel_perception: int = 3
     max_parallel_judgment: int = 2
     max_intervention_staleness_ms: int = 20_000
+    voice_synthesis_timeout_seconds: float = 8.0
+    shutdown_drain_timeout_seconds: float = 30.0
     voice_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -80,6 +82,10 @@ class RealtimeLoopConfig:
             raise ValueError("max_parallel_judgment must be between 1 and 4")
         if self.max_intervention_staleness_ms < 5_000:
             raise ValueError("intervention staleness must be at least 5000 ms")
+        if self.voice_synthesis_timeout_seconds <= 0:
+            raise ValueError("voice synthesis timeout must be positive")
+        if self.shutdown_drain_timeout_seconds <= 0:
+            raise ValueError("shutdown drain timeout must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +226,7 @@ class RealtimeSession:
         self._latest_completed_judgment_ms = 0
         self._stale_intervention_count = 0
         self._analysis_error_count = 0
+        self._consecutive_analysis_errors = 0
         self._speaker_binding_count = 0
         self._speaker_binding_success_count = 0
         self._boundary_adjustment_count = 0
@@ -275,6 +282,7 @@ class RealtimeSession:
             "expert_intervention_count": len(self.expert_interventions),
             "family_response_count": len(self.family_responses),
             "analysis_error_count": self._analysis_error_count,
+            "consecutive_analysis_error_count": self._consecutive_analysis_errors,
             "stale_intervention_count": self._stale_intervention_count,
             "speaker_binding_count": self._speaker_binding_count,
             "speaker_binding_success_count": self._speaker_binding_success_count,
@@ -368,11 +376,6 @@ class RealtimeSession:
             observation_task = asyncio.create_task(self._observe_window(snapshot))
             self._perception_tasks.add(observation_task)
             observation_task.add_done_callback(self._perception_tasks.discard)
-            judgment_task = asyncio.create_task(
-                self._judge_observation(observation_task)
-            )
-            self._judgment_tasks.add(judgment_task)
-            judgment_task.add_done_callback(self._judgment_tasks.discard)
         await self._analysis_queue.put(
             _AnalysisJob(
                 snapshot=snapshot,
@@ -402,11 +405,10 @@ class RealtimeSession:
 
     async def _judge_observation(
         self,
-        observation_task: asyncio.Task[WindowObservation],
+        observation: WindowObservation,
     ) -> tuple[WindowObservation, StateAssessment]:
-        """Judge prepared windows concurrently while final application stays ordered."""
+        """Judge one prepared window after every earlier window has been applied."""
 
-        observation = await observation_task
         async with self._judgment_semaphore:
             history = tuple(
                 self.assessment_history[-self.config.history_assessments :]
@@ -432,12 +434,24 @@ class RealtimeSession:
                 return
             try:
                 await self._analyze_job(job)
+                if self._consecutive_analysis_errors:
+                    recovered_after = self._consecutive_analysis_errors
+                    self._consecutive_analysis_errors = 0
+                    if recovered_after >= 3:
+                        with suppress(ConnectionError, RuntimeError):
+                            await self.send_event(
+                                {
+                                    "type": "analysis_recovered",
+                                    "recovered_after_errors": recovered_after,
+                                }
+                            )
             except asyncio.CancelledError:
                 if not job.completed.done():
                     job.completed.cancel()
                 raise
-            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+            except Exception as exc:
                 self._analysis_error_count += 1
+                self._consecutive_analysis_errors += 1
                 with suppress(ConnectionError, RuntimeError):
                     await self.send_event(
                         {
@@ -447,6 +461,8 @@ class RealtimeSession:
                             "window_end_ms": job.snapshot.end_ms,
                             "message": str(exc),
                             "retryable": True,
+                            "consecutive_error_count": self._consecutive_analysis_errors,
+                            "service_degraded": self._consecutive_analysis_errors >= 3,
                         }
                     )
             finally:
@@ -458,9 +474,13 @@ class RealtimeSession:
         snapshot = job.snapshot
         history = tuple(self.assessment_history[-self.config.history_assessments :])
         history_available = bool(history)
-        if job.judgment_task is not None:
-            observation, model_assessment = await job.judgment_task
-            history_available = bool(self.assessment_history)
+        if job.observation_task is not None:
+            observation = await job.observation_task
+            history = tuple(
+                self.assessment_history[-self.config.history_assessments :]
+            )
+            history_available = bool(history)
+            observation, model_assessment = await self._judge_observation(observation)
         else:
             observation = None
             await self.send_event(
@@ -645,6 +665,27 @@ class RealtimeSession:
                     "support_target": assessment.support_target.value,
                     "interruptibility": assessment.interruptibility.value,
                     "interaction_performance": list(assessment.interaction_performance),
+                    "assessment": assessment.model_dump(mode="json"),
+                    "perception_report": (
+                        perception.model_dump(mode="json")
+                        if (
+                            recognition_observation is not None
+                            and (perception := getattr(
+                                recognition_observation, "perception_report", None
+                            )) is not None
+                        )
+                        else None
+                    ),
+                    "acoustic_features": (
+                        acoustic.model_dump(mode="json")
+                        if (
+                            recognition_observation is not None
+                            and (acoustic := getattr(
+                                recognition_observation, "acoustic_features", None
+                            )) is not None
+                        )
+                        else None
+                    ),
                     "analysis_staleness_ms": max(
                         0,
                         self._latest_media_timestamp_ms - snapshot.end_ms,
@@ -652,30 +693,6 @@ class RealtimeSession:
                     **boundary_resolution.as_event_fields(),
                 }
             )
-            analysis_staleness_ms = max(
-                0,
-                self._latest_media_timestamp_ms - snapshot.end_ms,
-            )
-            if (
-                decision.intervention_permitted
-                and analysis_staleness_ms > self.config.max_intervention_staleness_ms
-                and self._latest_completed_judgment_ms > snapshot.end_ms
-            ):
-                self._stale_intervention_count += 1
-                if self.controller.awaiting_post_intervention_response:
-                    self.controller.mark_intervention_not_delivered()
-                await self.send_event(
-                    {
-                        "type": "intervention_held",
-                        "sequence": decision.sequence,
-                        "reason": "superseded_stale_assessment",
-                        "analysis_staleness_ms": analysis_staleness_ms,
-                        "superseded_by_assessment_ms": (
-                            self._latest_completed_judgment_ms
-                        ),
-                    }
-                )
-                return
             # Strategy ranking and contextual message generation may make one
             # or two HTTP calls.  Keep them off the event loop so camera/audio
             # capture continues while the result for this original window is
@@ -748,6 +765,12 @@ class RealtimeSession:
             raise
         except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
             self._analysis_error_count += 1
+            if (
+                self.controller.awaiting_post_intervention_response
+                and self.pending_delivery is None
+            ):
+                self.controller.mark_intervention_not_delivered()
+                self._pending_plan = None
             with suppress(ConnectionError, RuntimeError):
                 await self.send_event(
                     {
@@ -775,25 +798,14 @@ class RealtimeSession:
                 }
             )
             return
-        audio_base64: str | None = None
-        audio_mime_type: str | None = None
-        voice_error: str | None = None
-        voice_output_identifier: str | None = None
-        if package.voice_prompt.enabled and self.voice_synthesizer is not None:
-            try:
-                voice = await self.voice_synthesizer.synthesize(package.voice_prompt.message)
-                wav = pcm16_wav_bytes(voice.pcm_audio, voice.sample_rate_hz)
-                audio_base64 = base64.b64encode(wav).decode("ascii")
-                audio_mime_type = "audio/wav"
-                voice_output_identifier = voice.output_identifier
-            except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
-                voice_error = str(exc)
         plan = self._pending_plan
         if plan is not None:
             self.previous_plan = plan
         self.pending_delivery = package
-        await self.send_event(
-            {
+        voice_pending = bool(
+            package.voice_prompt.enabled and self.voice_synthesizer is not None
+        )
+        intervention_event = {
                 "type": "intervention",
                 "delivery_id": package.delivery_id,
                 "sequence": package.sequence,
@@ -824,6 +836,43 @@ class RealtimeSession:
                 ),
                 "dismissible": package.visual_prompt.dismissible,
                 "voice_expected": package.voice_prompt.enabled,
+                "voice_provider": package.voice_prompt.provider,
+                "voice_pending": voice_pending,
+                "voice_output_identifier": None,
+                "audio_mime_type": None,
+                "audio_base64": None,
+                "voice_error": None,
+            }
+        try:
+            await self.send_event(intervention_event)
+        except (ConnectionError, OSError, RuntimeError):
+            self.pending_delivery = None
+            self._pending_plan = None
+            if self.controller.awaiting_post_intervention_response:
+                self.controller.mark_intervention_not_delivered()
+            raise
+        if not voice_pending:
+            return
+
+        audio_base64: str | None = None
+        audio_mime_type: str | None = None
+        voice_error: str | None = None
+        voice_output_identifier: str | None = None
+        try:
+            voice = await asyncio.wait_for(
+                self.voice_synthesizer.synthesize(package.voice_prompt.message),
+                timeout=self.config.voice_synthesis_timeout_seconds,
+            )
+            wav = pcm16_wav_bytes(voice.pcm_audio, voice.sample_rate_hz)
+            audio_base64 = base64.b64encode(wav).decode("ascii")
+            audio_mime_type = "audio/wav"
+            voice_output_identifier = voice.output_identifier
+        except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+            voice_error = str(exc)
+        await self.send_event(
+            {
+                "type": "intervention_voice",
+                "delivery_id": package.delivery_id,
                 "voice_provider": package.voice_prompt.provider,
                 "voice_output_identifier": voice_output_identifier,
                 "audio_mime_type": audio_mime_type,
@@ -882,7 +931,14 @@ class RealtimeSession:
             return True
         package = self.pending_delivery
         if package is None or control.get("delivery_id") != package.delivery_id:
-            raise ValueError("delivery_execution does not match the pending intervention")
+            await self.send_event(
+                {
+                    "type": "delivery_execution_ignored",
+                    "delivery_id": control.get("delivery_id"),
+                    "reason": "no_matching_pending_intervention",
+                }
+            )
+            return True
         recorded_at_ms = self._non_negative_int(control.get("recorded_at_ms"), "recorded_at_ms")
         visual = self._channel_execution(
             control.get("visual"),
@@ -920,7 +976,17 @@ class RealtimeSession:
             )
             pending_plan = self._pending_plan
             if pending_plan is None:
-                raise ValueError("delivered intervention has no pending plan")
+                self.controller.mark_intervention_not_delivered()
+                self.pending_delivery = None
+                await self.send_event(
+                    {
+                        "type": "loop_error",
+                        "stage": "delivery",
+                        "message": "delivered intervention had no pending plan",
+                        "retryable": False,
+                    }
+                )
+                return True
             self.controller.mark_intervention_delivered(
                 pending_plan.state,
                 delivered_at_ms=delivery_timeline_ms,
@@ -1299,11 +1365,45 @@ class RealtimeSession:
         if self._stopped:
             return
         self._stopped = True
-        await self.wait_for_analysis()
-        await self._analysis_queue.put(None)
-        if self._analysis_worker_task is not None:
-            with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
-                await self._analysis_worker_task
+        drain_timed_out = False
+        try:
+            await asyncio.wait_for(
+                self.wait_for_analysis(),
+                timeout=self.config.shutdown_drain_timeout_seconds,
+            )
+        except TimeoutError:
+            drain_timed_out = True
+            self._analysis_error_count += 1
+            with suppress(ConnectionError, RuntimeError):
+                await self.send_event(
+                    {
+                        "type": "loop_error",
+                        "stage": "shutdown",
+                        "message": "analysis drain timed out; pending windows were cancelled",
+                        "retryable": False,
+                    }
+                )
+        if drain_timed_out:
+            if self._analysis_worker_task is not None:
+                self._analysis_worker_task.cancel()
+                with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
+                    await self._analysis_worker_task
+            for task in (*self._perception_tasks, *self._judgment_tasks):
+                if not task.done():
+                    task.cancel()
+            while True:
+                try:
+                    pending = self._analysis_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if pending is not None and not pending.completed.done():
+                    pending.completed.set_result(None)
+                self._analysis_queue.task_done()
+        else:
+            await self._analysis_queue.put(None)
+            if self._analysis_worker_task is not None:
+                with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
+                    await self._analysis_worker_task
         for task in tuple(self._perception_tasks):
             if not task.done():
                 task.cancel()

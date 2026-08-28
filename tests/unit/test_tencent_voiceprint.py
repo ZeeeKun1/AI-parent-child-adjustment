@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -186,3 +187,46 @@ def test_cleanup_deletes_voiceprints_before_group_metadata() -> None:
         "vp-child",
     ]
     assert client.delete_requests[2].GroupId == "coreg_TestGroup"
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_short_utterance_is_padded_and_forced_to_a_known_role(
+    prepare_segments: object,
+    extract_f0: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client, minimum_score=70)
+    enrollment = TencentSpeakerEnrollment(
+        family_id="family",
+        group_id="coreg_TestGroup",
+        speakers={
+            "parent": TencentEnrolledSpeaker(
+                label="parent", duration_ms=5_000, voiceprint_id="vp-parent"
+            ),
+            "child": TencentEnrolledSpeaker(
+                label="child", duration_ms=5_000, voiceprint_id="vp-child"
+            ),
+        },
+    )
+    prepare_segments.return_value = (
+        np.zeros(6_400, dtype=np.float64),
+        16_000,
+        [(0, 400, 0, 6_400)],
+    )
+    extract_f0.return_value = (np.array([180.0]), 1)
+    client.verify_responses = [
+        SimpleNamespace(
+            Data=SimpleNamespace(
+                VerifyTops=[SimpleNamespace(VoicePrintId="vp-parent", Score="92.0")]
+            )
+        )
+    ]
+
+    binding = service.identify_speakers((), enrollment)
+
+    assert binding.bound is True
+    assert binding.segments[0].speaker.value == "parent"
+    assert binding.segments[0].forced_assignment is True
+    assert binding.segments[0].confidence == "low"
+    assert len(base64.b64decode(client.verify_requests[0].Data)) == 25_600

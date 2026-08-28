@@ -3,6 +3,8 @@ const AUDIO_PACKET = 1;
 const IMAGE_PACKET = 2;
 const AUDIO_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 const IMAGE_BACKPRESSURE_BYTES = 1024 * 1024;
+const RECONNECT_DELAY_MS = 2000;
+const VOICE_DELIVERY_TIMEOUT_MS = 12000;
 
 const elements = {
   consent: document.querySelector("#consent"),
@@ -117,6 +119,12 @@ const selectedRoles = { parent: null, child: null };
 let latestSessionSummary = null;
 let sessionInsights = createSessionInsights();
 let currentStep = 1;
+let reconnectTimer = null;
+let reconnecting = false;
+let reconnectCount = 0;
+let activeStudyContext = null;
+let activeAdmissionToken = null;
+let pendingDeliveryExecution = null;
 
 const PHASE_ART = {
   setup: "/static/img/companion-observing.png",
@@ -556,6 +564,79 @@ function waitForMessage(ws, acceptedTypes, timeoutMs = 10000) {
   });
 }
 
+function attachSocketLifecycle(ws) {
+  ws.addEventListener("message", handleServerMessage);
+  ws.addEventListener("error", () => {
+    if (captureActive && !stopping && ws === socket) {
+      setStatus("实时连接不稳定，正在自动恢复。采集设备仍保持开启。", "warning");
+    }
+  });
+  ws.addEventListener("close", () => {
+    if (ws !== socket) return;
+    socket = null;
+    if (captureActive && !stopping) {
+      setStatus("实时连接已中断，正在自动续接。采集设备仍保持开启。", "warning");
+      scheduleReconnect();
+    }
+  });
+}
+
+async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 0) {
+  const ws = new WebSocket(websocketUrl());
+  ws.binaryType = "arraybuffer";
+  socket = ws;
+  attachSocketLifecycle(ws);
+  await waitForSocketOpen(ws);
+  ws.send(JSON.stringify({
+    type: "hello",
+    protocol_version: PROTOCOL_VERSION,
+    session_id: elements.session.textContent,
+    access_token: admissionToken,
+    study_context: { ...studyContext, reconnect_index: reconnectIndex },
+    capabilities: {
+      audio_worklet: Boolean(window.AudioWorkletNode),
+      media_devices: Boolean(navigator.mediaDevices),
+      secure_context: window.isSecureContext,
+      page_version: "0.6.0",
+    },
+  }));
+  const ready = await waitForMessage(ws, ["ready", "error"]);
+  ws.send(JSON.stringify({ type: "start" }));
+  await waitForMessage(ws, ["started", "error"]);
+  return ready;
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer !== null || reconnecting || stopping || !captureActive) return;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    void reconnectCaptureSocket();
+  }, RECONNECT_DELAY_MS);
+}
+
+async function reconnectCaptureSocket() {
+  if (reconnecting || stopping || !captureActive || !activeStudyContext || !activeAdmissionToken) return;
+  reconnecting = true;
+  try {
+    reconnectCount += 1;
+    negotiated = await openCaptureSocket(
+      activeStudyContext,
+      activeAdmissionToken,
+      reconnectCount,
+    );
+    setStatus("实时连接已恢复，活动继续。", "success");
+  } catch (error) {
+    if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+    socket = null;
+    if (captureActive && !stopping) {
+      setStatus("暂时无法连接服务器，系统会继续自动重试。请告知研究人员。", "error");
+    }
+  } finally {
+    reconnecting = false;
+    if (!socket && captureActive && !stopping) scheduleReconnect();
+  }
+}
+
 function sessionTimestampMs() {
   return startedAt ? Math.max(0, Math.round(performance.now() - startedAt)) : 0;
 }
@@ -942,6 +1023,11 @@ function releaseInterventionAudio() {
   interventionAudioUrl = null;
 }
 
+function clearPendingDeliveryExecution() {
+  if (pendingDeliveryExecution?.timer) window.clearTimeout(pendingDeliveryExecution.timer);
+  pendingDeliveryExecution = null;
+}
+
 function decodeBase64Audio(encoded, mimeType) {
   const binary = atob(encoded);
   const bytes = new Uint8Array(binary.length);
@@ -1028,12 +1114,37 @@ async function presentIntervention(message) {
   elements.interventionChannel.textContent = (message.voice_expected && voiceEnabled) ? "正在同步播放语音" : "你们可以忽略或关闭这条提示";
   elements.intervention.hidden = false;
 
+  if (message.voice_pending && voiceEnabled) {
+    clearPendingDeliveryExecution();
+    pendingDeliveryExecution = {
+      deliveryId: message.delivery_id,
+      visualStartedAtMs,
+      timer: window.setTimeout(() => {
+        const pending = pendingDeliveryExecution;
+        if (!pending || pending.deliveryId !== message.delivery_id) return;
+        clearPendingDeliveryExecution();
+        elements.interventionChannel.textContent = "文字提示已显示，语音暂时不可用";
+        sendDeliveryExecution(message.delivery_id, visualStartedAtMs, {
+          status: "failed",
+          started_at_ms: sessionTimestampMs(),
+          error: "语音准备超时",
+        });
+      }, VOICE_DELIVERY_TIMEOUT_MS),
+    };
+    elements.interventionChannel.textContent = "文字提示已显示，正在准备语音";
+    return;
+  }
+
   const voice = await playInterventionAudio(message);
   if (voice.status === "failed") elements.interventionChannel.textContent = "文字提示已显示，语音暂时不可用";
+  sendDeliveryExecution(message.delivery_id, visualStartedAtMs, voice);
+}
+
+function sendDeliveryExecution(deliveryId, visualStartedAtMs, voice) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   socket.send(JSON.stringify({
     type: "delivery_execution",
-    delivery_id: message.delivery_id,
+    delivery_id: deliveryId,
     recorded_at_ms: sessionTimestampMs(),
     visual: {
       status: "delivered",
@@ -1045,12 +1156,28 @@ async function presentIntervention(message) {
   }));
 }
 
+async function completeInterventionVoice(message) {
+  const pending = pendingDeliveryExecution;
+  if (!pending || pending.deliveryId !== message.delivery_id) return;
+  clearPendingDeliveryExecution();
+  const voice = await playInterventionAudio({
+    ...message,
+    voice_expected: true,
+  });
+  elements.interventionChannel.textContent = voice.status === "delivered"
+    ? "文字和语音提示已送达"
+    : "文字提示已显示，语音暂时不可用";
+  sendDeliveryExecution(message.delivery_id, pending.visualStartedAtMs, voice);
+}
+
 function handleServerMessage(event) {
   if (typeof event.data !== "string") return;
   let message;
   try { message = JSON.parse(event.data); } catch { return; }
   if (message.type === "intervention") {
     void presentIntervention(message);
+  } else if (message.type === "intervention_voice") {
+    void completeInterventionVoice(message);
   } else if (message.type === "interventions_paused") {
     interventionsPaused = true;
     updateInterventionPauseControl();
@@ -1074,7 +1201,18 @@ function handleServerMessage(event) {
   } else if (message.type === "control_unavailable") {
     setStatus("当前未启用实时提示，这项操作不会影响活动记录。", "warning");
   } else if (message.type === "loop_error") {
-    setStatus("本轮分析暂时没有结果，活动可以继续。", "warning");
+    setStatus(
+      message.service_degraded
+        ? "连续几轮分析暂时没有结果，采集仍在继续，请研究人员查看。"
+        : "本轮分析暂时没有结果，活动可以继续。",
+      message.service_degraded ? "error" : "warning",
+    );
+  } else if (message.type === "analysis_recovered") {
+    setStatus("状态分析已经恢复，活动继续。", "success");
+  } else if (message.type === "capture_warning") {
+    setStatus("一条采集数据未能处理，活动仍在继续。", "warning");
+  } else if (message.type === "stopping") {
+    setStatus("正在完成最后一轮分析并保存记录…", "working");
   } else if (message.type === "intervention_outcome") {
     trackInterventionOutcome(message);
   } else if (message.type === "state_update" && captureActive) {
@@ -1203,14 +1341,15 @@ async function prepareMedia() {
   source.connect(audioNode).connect(muteNode).connect(audioContext.destination);
   audioNode.port.onmessage = (event) => {
     lastAudioChunkAt = performance.now();
+    const timestampMs = nextAudioTimestampMs;
+    nextAudioTimestampMs += negotiated.media_format.audio_chunk_ms;
     if (!captureActive || !socket || socket.readyState !== WebSocket.OPEN) return;
     if (socket.bufferedAmount > AUDIO_BACKPRESSURE_BYTES) {
       audioBackpressureStops += 1;
-      void stopCapture(false, "网络连接不稳定，活动已安全停止");
+      setStatus("网络暂时拥堵，系统已跳过少量声音数据，活动继续。", "warning");
       return;
     }
-    socket.send(encodePacket(AUDIO_PACKET, nextAudioTimestampMs, event.data));
-    nextAudioTimestampMs += negotiated.media_format.audio_chunk_ms;
+    socket.send(encodePacket(AUDIO_PACKET, timestampMs, event.data));
     audioCount += 1;
     updateCounters();
   };
@@ -1266,6 +1405,9 @@ function releaseMedia() {
   imageTimer = null;
   elapsedTimer = null;
   captureHealthTimer = null;
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  reconnecting = false;
   if (audioNode) audioNode.disconnect();
   if (muteNode) muteNode.disconnect();
   audioNode = null;
@@ -1280,6 +1422,7 @@ function releaseMedia() {
   lastAudioChunkAt = 0;
   lastImageFrameAt = 0;
   releaseInterventionAudio();
+  clearPendingDeliveryExecution();
 }
 
 async function startCapture() {
@@ -1327,27 +1470,11 @@ async function startCapture() {
   elements.homeNav.setAttribute("aria-current", "page");
   elements.stageTarget.hidden = true;
   try {
-    socket = new WebSocket(websocketUrl());
-    socket.binaryType = "arraybuffer";
-    socket.addEventListener("message", handleServerMessage);
-    await waitForSocketOpen(socket);
-    socket.send(JSON.stringify({
-      type: "hello",
-      protocol_version: PROTOCOL_VERSION,
-      session_id: elements.session.textContent,
-      access_token: admissionToken,
-      study_context: studyContext,
-      capabilities: {
-        audio_worklet: Boolean(window.AudioWorkletNode),
-        media_devices: Boolean(navigator.mediaDevices),
-        secure_context: window.isSecureContext,
-        page_version: "0.5.0",
-      },
-    }));
-    negotiated = await waitForMessage(socket, ["ready", "error"]);
+    reconnectCount = 0;
+    activeStudyContext = studyContext;
+    activeAdmissionToken = admissionToken;
+    negotiated = await openCaptureSocket(studyContext, admissionToken);
     await prepareMedia();
-    socket.send(JSON.stringify({ type: "start" }));
-    await waitForMessage(socket, ["started", "error"]);
 
     startedAt = performance.now();
     nextAudioTimestampMs = 0;
@@ -1543,8 +1670,8 @@ async function stopCapture(normal = true, reason = null) {
           capture_duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
         },
       }));
-      finalSummary = await waitForMessage(socket, ["summary", "error"]);
-      if (finalSummary.duration_ms == null) finalSummary.duration_ms = localDurationMs;
+      finalSummary = await waitForMessage(socket, ["summary", "error"], 180000);
+      finalSummary.duration_ms = localDurationMs;
       socket.close();
     }
   } catch (error) {
@@ -1557,6 +1684,8 @@ async function stopCapture(normal = true, reason = null) {
   } finally {
     socket = null;
     negotiated = null;
+    activeStudyContext = null;
+    activeAdmissionToken = null;
     currentDeliveryId = null;
     elements.intervention.hidden = true;
     elements.sessionControls.hidden = true;
@@ -1587,11 +1716,9 @@ elements.bindingButtons.forEach((button) => {
   elements.taskDifficulty,
 ].forEach((element) => {
   element.addEventListener("input", () => {
-    sessionAccessToken = null;
     updateStartButton();
   });
   element.addEventListener("change", () => {
-    sessionAccessToken = null;
     updateStartButton();
   });
 });

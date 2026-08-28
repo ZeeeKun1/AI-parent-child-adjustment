@@ -236,15 +236,6 @@ class TencentVoiceprintService:
                 limitation_reason="No sufficiently long voiced segment was available.",
             )
 
-        verified_candidates = [
-            item for item in timed_segments if item[1] - item[0] >= min_segment_ms
-        ]
-        if not verified_candidates:
-            raise TencentVoiceprintError(
-                "Voiced audio was present, but no utterance was long enough "
-                "for reliable Tencent voiceprint verification"
-            )
-
         id_to_label = {
             speaker.voiceprint_id: label
             for label, speaker in enrollment.speakers.items()
@@ -255,10 +246,21 @@ class TencentVoiceprintService:
         low_confidence_count = 0
         request_count = 0
 
-        for start_ms, end_ms, start_sample, end_sample in verified_candidates:
+        for start_ms, end_ms, start_sample, end_sample in timed_segments:
             segment_audio = samples[start_sample:end_sample]
+            is_short = end_ms - start_ms < min_segment_ms
+            request_audio = segment_audio
+            if is_short:
+                # Tencent expects a longer sample than many natural homework
+                # replies (for example “嗯” or a one-word answer). Repeating
+                # the same voiced sample keeps the vocal identity while making
+                # the request technically acceptable. The result remains
+                # explicitly low-confidence and forced.
+                target_samples = max(1, round(sample_rate * min_segment_ms / 1000))
+                repeats = max(1, int(np.ceil(target_samples / segment_audio.size)))
+                request_audio = np.tile(segment_audio, repeats)[:target_samples]
             pcm_audio = np.clip(
-                np.rint(segment_audio * 32768.0), -32768, 32767
+                np.rint(request_audio * 32768.0), -32768, 32767
             ).astype("<i2").tobytes()
 
             request = models.VoicePrintGroupVerifyRequest()
@@ -267,8 +269,13 @@ class TencentVoiceprintService:
             request.Data = base64.b64encode(pcm_audio).decode("ascii")
             request.GroupId = enrollment.group_id
             request.TopN = 2
-            response = self._call("VoicePrintGroupVerify", request)
             request_count += 1
+            try:
+                response = self._call("VoicePrintGroupVerify", request)
+            except TencentVoiceprintError:
+                if not is_short:
+                    raise
+                response = None
 
             verify_tops = getattr(getattr(response, "Data", None), "VerifyTops", None)
             known_matches: list[tuple[float, str]] = []
@@ -282,25 +289,36 @@ class TencentVoiceprintService:
                 except (TypeError, ValueError):
                     continue
                 known_matches.append((score, label))
-            if not known_matches:
+            voiced_f0, _ = _extract_segment_f0(segment_audio, sample_rate)
+            if not known_matches and not is_short:
                 raise TencentVoiceprintError(
                     "Tencent 1:N verification returned no registered family speaker"
                 )
-
-            score, label = max(known_matches, key=lambda item: item[0])
-            forced_assignment = score < self.minimum_score
+            if known_matches:
+                score, label = max(known_matches, key=lambda item: item[0])
+                speaker = (
+                    SpeakerLabel.PARENT if label == "parent" else SpeakerLabel.CHILD
+                )
+            else:
+                # Last-resort role assignment for a short response when the
+                # provider cannot score it. It is never presented as a verified
+                # match; the state model receives the low-confidence marker.
+                score = None
+                median_f0 = float(np.median(voiced_f0)) if voiced_f0.size else 0.0
+                speaker = (
+                    SpeakerLabel.CHILD
+                    if median_f0 >= 260.0
+                    else SpeakerLabel.PARENT
+                )
+            forced_assignment = is_short or score is None or score < self.minimum_score
             if forced_assignment:
                 low_confidence_count += 1
             confidence = "low" if forced_assignment else "high"
-            speaker = (
-                SpeakerLabel.PARENT if label == "parent" else SpeakerLabel.CHILD
-            )
             if speaker is SpeakerLabel.PARENT:
                 parent_count += 1
             else:
                 child_count += 1
 
-            voiced_f0, _ = _extract_segment_f0(segment_audio, sample_rate)
             segments.append(
                 SpeakerSegment(
                     start_ms=start_ms,
@@ -313,47 +331,9 @@ class TencentVoiceprintService:
                     ),
                     voiced_frame_count=int(voiced_f0.size),
                     speaker=speaker,
-                    provider_score=round(score, 1),
+                    provider_score=(None if score is None else round(score, 1)),
                     confidence=confidence,
                     forced_assignment=forced_assignment,
-                )
-            )
-
-        # Very short responses cannot be submitted reliably to the provider.
-        # Keep the no-UNKNOWN experiment contract by assigning them to the
-        # nearest provider-verified turn and marking that continuity inference
-        # explicitly as low confidence and forced.
-        short_segments = [
-            item for item in timed_segments if item[1] - item[0] < min_segment_ms
-        ]
-        for start_ms, end_ms, start_sample, end_sample in short_segments:
-            midpoint = (start_ms + end_ms) / 2
-            nearest = min(
-                segments,
-                key=lambda item: abs(((item.start_ms + item.end_ms) / 2) - midpoint),
-            )
-            segment_audio = samples[start_sample:end_sample]
-            voiced_f0, _ = _extract_segment_f0(segment_audio, sample_rate)
-            if nearest.speaker is SpeakerLabel.PARENT:
-                parent_count += 1
-            else:
-                child_count += 1
-            low_confidence_count += 1
-            segments.append(
-                SpeakerSegment(
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    mean_f0_hz=(
-                        round(float(np.mean(voiced_f0)), 1) if voiced_f0.size else 0.0
-                    ),
-                    median_f0_hz=(
-                        round(float(np.median(voiced_f0)), 1) if voiced_f0.size else 0.0
-                    ),
-                    voiced_frame_count=int(voiced_f0.size),
-                    speaker=nearest.speaker,
-                    provider_score=None,
-                    confidence="low",
-                    forced_assignment=True,
                 )
             )
 

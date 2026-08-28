@@ -233,6 +233,49 @@ def test_browser_disconnect_is_recorded_as_failure(tmp_path: Path) -> None:
     assert result["raw_media_saved"] is False
 
 
+def test_browser_can_reconnect_same_session_after_transient_disconnect(
+    tmp_path: Path,
+) -> None:
+    app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/live") as first:
+            first.send_json(_hello("reconnect_test"))
+            assert first.receive_json()["type"] == "ready"
+            first.send_json({"type": "start"})
+            assert first.receive_json()["type"] == "started"
+
+        with client.websocket_connect("/ws/live") as second:
+            second.send_json(_hello("reconnect_test"))
+            assert second.receive_json()["type"] == "ready"
+            second.send_json({"type": "start"})
+            assert second.receive_json()["type"] == "started"
+            second.send_json({"type": "stop"})
+            assert second.receive_json()["type"] == "summary"
+
+    results = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "output" / "runs").glob("*/result.json")
+    ]
+    assert sorted(item["status"] for item in results) == ["completed", "disconnected"]
+
+
+def test_invalid_control_is_skipped_without_ending_capture(tmp_path: Path) -> None:
+    app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
+
+    with TestClient(app).websocket_connect("/ws/live") as websocket:
+        websocket.send_json(_hello("nonfatal-control-test"))
+        assert websocket.receive_json()["type"] == "ready"
+        websocket.send_json({"type": "start"})
+        assert websocket.receive_json()["type"] == "started"
+        websocket.send_text("not-json")
+        warning = websocket.receive_json()
+        assert warning["type"] == "capture_warning"
+        assert warning["session_continues"] is True
+        websocket.send_json({"type": "stop"})
+        assert websocket.receive_json()["type"] == "summary"
+
+
 def test_browser_access_token_is_checked_before_creating_a_run(tmp_path: Path) -> None:
     config = BrowserServerConfig(
         output_dir=tmp_path / "output",
@@ -278,6 +321,47 @@ def test_family_session_admission_replaces_visible_access_code(tmp_path: Path) -
             assert websocket.receive_json()["type"] == "started"
             websocket.send_json({"type": "stop"})
             assert websocket.receive_json()["type"] == "summary"
+
+
+def test_repeated_admission_preserves_existing_speaker_binding(tmp_path: Path) -> None:
+    app = create_browser_capture_app(
+        BrowserServerConfig(output_dir=tmp_path / "output")
+    )
+    payload = {
+        "session_id": "stable-admission",
+        "basic_info": {
+            "parent_age": 36,
+            "child_age": 9,
+            "child_grade": "三年级",
+        },
+    }
+    enrollment = SpeakerEnrollment(
+        family_id="stable-admission",
+        speakers={
+            "parent": EnrolledSpeaker(
+                label="parent",
+                audio_source="test_fixture",
+                duration_ms=3000,
+                embedding=tuple([0.0] * 256),
+            ),
+            "child": EnrolledSpeaker(
+                label="child",
+                audio_source="test_fixture",
+                duration_ms=3000,
+                embedding=tuple([0.0] * 256),
+            ),
+        },
+    )
+
+    with TestClient(app) as client:
+        first = client.post("/api/session-admission", json=payload)
+        app.state.session_enrollments["stable-admission"] = enrollment
+        second = client.post("/api/session-admission", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["session_token"] == second.json()["session_token"]
+    assert app.state.session_enrollments["stable-admission"] is enrollment
 
 
 def test_browser_enrollment_uses_cloud_service_without_exposing_ids(

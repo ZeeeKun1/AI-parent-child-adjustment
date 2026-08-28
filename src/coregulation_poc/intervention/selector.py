@@ -486,6 +486,26 @@ class StrategySelector:
                     if attempt:
                         checks["contextual_rewrite_completed"] = True
                     return message, MessageSource.CONSTRAINED_LLM, checks
+                repairable_checks = {
+                    "within_character_limit",
+                    "within_sentence_limit",
+                }
+                failed = {name for name, passed in checks.items() if not passed}
+                if attempt == 1 and failed and failed.issubset(repairable_checks):
+                    repaired = self._repair_contextual_result(result, card, evidence)
+                    repaired_checks = self._validate_llm_result(
+                        repaired,
+                        card,
+                        assessment,
+                        evidence,
+                    )
+                    if all(repaired_checks.values()):
+                        repaired_checks["contextual_format_repaired"] = True
+                        return (
+                            self._assemble_message(repaired),
+                            MessageSource.CONSTRAINED_LLM,
+                            repaired_checks,
+                        )
                 previous_result = result
                 failed_checks = [name for name, passed in checks.items() if not passed]
                 logger.warning(
@@ -551,6 +571,36 @@ class StrategySelector:
     def _assemble_message(result: LLMMessageResult) -> str:
         """Normalise the complete contextual message returned by the LLM."""
         return re.sub(r"\s+", " ", result.message).strip()
+
+    def _repair_contextual_result(
+        self,
+        result: LLMMessageResult,
+        card: StrategyCard,
+        evidence: list[EvidenceReference],
+    ) -> LLMMessageResult:
+        """Repair harmless formatting/metadata without replacing contextual wording."""
+
+        message = self._assemble_message(result)
+        sentence_parts = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？!?])", message)
+            if part.strip()
+        ]
+        if len(sentence_parts) > self.library.principles.maximum_message_sentences:
+            message = "".join(
+                sentence_parts[: self.library.principles.maximum_message_sentences]
+            )
+        maximum = self.library.principles.maximum_message_characters
+        if len(message) > maximum:
+            message = message[: max(1, maximum - 1)].rstrip("，,；;：: ") + "。"
+        return result.model_copy(
+            update={
+                "strategy_id": card.strategy_id,
+                "target_actor": card.target_actor.value,
+                "evidence_ids": (["evidence_0"] if evidence else []),
+                "message": message,
+            }
+        )
 
     def _validate_message(self, text: str, card: StrategyCard) -> dict[str, bool]:
         """Validate a plain-text LLM message (legacy compatibility)."""

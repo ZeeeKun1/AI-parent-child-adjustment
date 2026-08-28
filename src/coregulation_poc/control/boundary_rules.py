@@ -402,6 +402,8 @@ class BoundaryStateTracker:
             self._corroborating_windows.popleft()
         if not self._disruption_windows:
             self._recovery_windows.clear()
+            self._uncertainty_started_at_ms = None
+            self._dysregulation_active = False
 
     def _consecutive_disruption_window_count(self) -> int:
         """Count the most recent approximately consecutive disrupted windows."""

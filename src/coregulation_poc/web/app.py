@@ -7,6 +7,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,16 +63,19 @@ AUDITED_RUNTIME_EVENTS = {
     "speaker_binding",
     "voiceprint_cleanup",
     "intervention",
+    "intervention_voice",
     "intervention_held",
     "intervention_outcome",
     "interventions_paused",
     "interventions_resumed",
     "delivery_execution_received",
+    "delivery_execution_ignored",
     "family_response_received",
     "expert_takeover_started",
     "expert_takeover_ended",
     "expert_intervention_recorded",
     "loop_error",
+    "analysis_recovered",
     "control_unavailable",
 }
 
@@ -479,6 +483,16 @@ def create_browser_capture_app(
         cleanup_expired_admissions()
         if session_id in active_session_ids:
             raise HTTPException(status_code=409, detail="本次会话已经开始")
+        existing_admission = session_admissions.get(session_id)
+        if existing_admission is not None:
+            return {
+                "session_id": session_id,
+                "session_token": existing_admission.token,
+                "expires_in_seconds": max(
+                    1,
+                    round(existing_admission.expires_at_monotonic - time.monotonic()),
+                ),
+            }
         if (
             session_id not in session_admissions
             and len(session_admissions) >= server_config.max_pending_admissions
@@ -714,6 +728,20 @@ def create_browser_capture_app(
                 return metrics
             return {"api_call_count": runtime_session.api_call_count}
 
+        async def report_nonfatal_input_error(stage: str, exc: Exception) -> None:
+            event = {
+                "type": "capture_warning",
+                "stage": stage,
+                "message": str(exc),
+                "session_continues": True,
+            }
+            if recorder is not None:
+                recorder.store.append_event(event)
+            if session_id is not None:
+                await registry.observe(session_id, event)
+            with suppress(RuntimeError, WebSocketDisconnect):
+                await send_json(event)
+
         try:
             try:
                 hello_event = await asyncio.wait_for(
@@ -820,22 +848,32 @@ def create_browser_capture_app(
                         "capture session exceeded the server time limit"
                     ) from exc
                 if event.get("bytes") is not None:
-                    chunk = recorder.accept_packet(event["bytes"])
-                    if chunk_handler is not None:
-                        await chunk_handler(chunk)
-                    if runtime_session is not None:
-                        await runtime_session.accept_chunk(chunk)
+                    try:
+                        chunk = recorder.accept_packet(event["bytes"])
+                        if chunk_handler is not None:
+                            await chunk_handler(chunk)
+                        if runtime_session is not None:
+                            await runtime_session.accept_chunk(chunk)
+                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                        await report_nonfatal_input_error("media_packet", exc)
                     continue
                 raw_text = event.get("text")
                 if raw_text is None:
                     raise WebSocketDisconnect(code=1000)
-                control = _parse_control(raw_text)
+                try:
+                    control = _parse_control(raw_text)
+                except BrowserProtocolError as exc:
+                    await report_nonfatal_input_error("control_message", exc)
+                    continue
                 if control["type"] == "start":
-                    recorder.start()
-                    await registry.mark_status(session_id, "active")
-                    await send_json({"type": "started"})
-                    if runtime_session is not None:
-                        await runtime_session.start()
+                    try:
+                        recorder.start()
+                        await registry.mark_status(session_id, "active")
+                        await send_json({"type": "started"})
+                        if runtime_session is not None:
+                            await runtime_session.start()
+                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                        await report_nonfatal_input_error("start_control", exc)
                 elif control["type"] == "stop":
                     completion_status = "completed"
                     await stop_runtime(completion_status)
@@ -873,21 +911,37 @@ def create_browser_capture_app(
                     reason = control.get("reason")
                     recorded_at_ms = control.get("recorded_at_ms")
                     if device not in {"camera", "microphone"}:
-                        raise BrowserProtocolError("device_health contains an invalid device")
+                        await report_nonfatal_input_error(
+                            "device_health",
+                            BrowserProtocolError("device_health contains an invalid device"),
+                        )
+                        continue
                     if status not in {"normal", "abnormal"}:
-                        raise BrowserProtocolError("device_health contains an invalid status")
+                        await report_nonfatal_input_error(
+                            "device_health",
+                            BrowserProtocolError("device_health contains an invalid status"),
+                        )
+                        continue
                     if (
                         not isinstance(recorded_at_ms, int)
                         or isinstance(recorded_at_ms, bool)
                         or recorded_at_ms < 0
                     ):
-                        raise BrowserProtocolError(
-                            "device_health contains an invalid recorded_at_ms"
+                        await report_nonfatal_input_error(
+                            "device_health",
+                            BrowserProtocolError(
+                                "device_health contains an invalid recorded_at_ms"
+                            ),
                         )
+                        continue
                     if reason is not None and (
                         not isinstance(reason, str) or len(reason) > 100
                     ):
-                        raise BrowserProtocolError("device_health contains an invalid reason")
+                        await report_nonfatal_input_error(
+                            "device_health",
+                            BrowserProtocolError("device_health contains an invalid reason"),
+                        )
+                        continue
                     device_event = {
                         "type": "device_health",
                         "device": device,
@@ -897,7 +951,19 @@ def create_browser_capture_app(
                     }
                     recorder.store.append_event(device_event)
                     await registry.observe(session_id, device_event)
-                elif runtime_session is not None and await runtime_session.handle_control(control):
+                elif runtime_session is not None:
+                    try:
+                        if await runtime_session.handle_control(control):
+                            continue
+                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                        await report_nonfatal_input_error("runtime_control", exc)
+                        continue
+                    await report_nonfatal_input_error(
+                        "runtime_control",
+                        BrowserProtocolError(
+                            f"unsupported control message: {control['type']}"
+                        ),
+                    )
                     continue
                 elif (
                     runtime_session is None
@@ -911,9 +977,13 @@ def create_browser_capture_app(
                         }
                     )
                 else:
-                    raise BrowserProtocolError(
-                        f"unsupported control message: {control['type']}"
+                    await report_nonfatal_input_error(
+                        "control_message",
+                        BrowserProtocolError(
+                            f"unsupported control message: {control['type']}"
+                        ),
                     )
+                    continue
         except WebSocketDisconnect:
             completion_status = "disconnected"
         except (BrowserProtocolError, ValueError, OSError) as exc:
@@ -932,22 +1002,32 @@ def create_browser_capture_app(
         finally:
             await stop_runtime(completion_status)
             if session_id is not None and session_authorized:
-                enrollment = session_enrollments.pop(session_id, None)
-                enrollment_locks.pop(session_id, None)
-                cleanup_succeeded = await cleanup_remote_enrollment(enrollment)
-                if recorder is not None and isinstance(
-                    enrollment, TencentSpeakerEnrollment
-                ):
-                    cleanup_event = {
-                        "type": "voiceprint_cleanup",
-                        "provider": enrollment.model_name,
-                        "remote_records_deleted": cleanup_succeeded,
-                        "retry_queued": not cleanup_succeeded,
-                    }
-                    recorder.store.append_event(cleanup_event)
-                    await registry.observe(session_id, cleanup_event)
                 active_session_ids.discard(session_id)
-                session_admissions.pop(session_id, None)
+                if completion_status == "disconnected":
+                    admission = session_admissions.get(session_id)
+                    if admission is not None:
+                        session_admissions[session_id] = SessionAdmission(
+                            token=admission.token,
+                            expires_at_monotonic=(
+                                time.monotonic() + server_config.admission_ttl_seconds
+                            ),
+                        )
+                else:
+                    enrollment = session_enrollments.pop(session_id, None)
+                    enrollment_locks.pop(session_id, None)
+                    cleanup_succeeded = await cleanup_remote_enrollment(enrollment)
+                    if recorder is not None and isinstance(
+                        enrollment, TencentSpeakerEnrollment
+                    ):
+                        cleanup_event = {
+                            "type": "voiceprint_cleanup",
+                            "provider": enrollment.model_name,
+                            "remote_records_deleted": cleanup_succeeded,
+                            "retry_queued": not cleanup_succeeded,
+                        }
+                        recorder.store.append_event(cleanup_event)
+                        await registry.observe(session_id, cleanup_event)
+                    session_admissions.pop(session_id, None)
                 await registry.mark_status(session_id, completion_status)
             if recorder is not None and not recorder.finished:
                 recorder.finish(

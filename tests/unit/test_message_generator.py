@@ -320,7 +320,7 @@ class TestSelectorWithGenerator:
         assert result.plan is None
         assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
-    def test_llm_too_many_sentences_falls_back(self) -> None:
+    def test_llm_too_many_sentences_is_repaired_without_losing_intervention(self) -> None:
         clause = "刚才语速很快。孩子跟不上了。需要调整。"
         provider = FakeTextChatProvider(_llm_json(message=clause))
         selector = _selector(_generator(provider))
@@ -332,8 +332,10 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is None
-        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
+        assert result.plan is not None
+        assert result.plan.message == "刚才语速很快。孩子跟不上了。"
+        assert result.plan.message_source is MessageSource.CONSTRAINED_LLM
+        assert result.plan.validation_checks["contextual_format_repaired"] is True
 
     def test_llm_empty_response_falls_back(self) -> None:
         provider = FakeTextChatProvider("")

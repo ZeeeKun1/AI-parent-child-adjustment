@@ -177,6 +177,25 @@ def test_three_stall_windows_need_parent_and_child_corroboration_for_dysregulati
     )
 
 
+def test_long_missing_data_gap_resets_previous_dysregulation_episode() -> None:
+    tracker = BoundaryStateTracker.from_codebook()
+    for start_ms in (0, 10_000, 20_000):
+        tracker.resolve(
+            _assessment(prompt_count=1, disengaged=True),
+            window_start_ms=start_ms,
+            window_end_ms=start_ms + 10_000,
+        )
+
+    after_gap = tracker.resolve(
+        _assessment(prompt_count=0, disengaged=False),
+        window_start_ms=100_000,
+        window_end_ms=110_000,
+    )
+
+    assert after_gap.assessment.state is CoregulationState.FLUCTUATION
+    assert after_gap.active_stall_duration_ms == 10_000
+
+
 def test_sustained_disruption_plus_high_prompt_rate_reaches_dysregulation() -> None:
     tracker = BoundaryStateTracker.from_codebook()
     result = None

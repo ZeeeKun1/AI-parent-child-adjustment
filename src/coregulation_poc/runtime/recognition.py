@@ -12,9 +12,10 @@ from coregulation_poc.acoustics.speaker_binding import SpeakerBinding, bind_spea
 from coregulation_poc.acoustics.tencent_voiceprint import (
     SpeakerEnrollmentRecord,
     TencentSpeakerEnrollment,
+    TencentVoiceprintError,
     TencentVoiceprintService,
 )
-from coregulation_poc.capture.media import MediaKind
+from coregulation_poc.capture.media import MediaChunk, MediaKind
 from coregulation_poc.codebook import load_state_codebook
 from coregulation_poc.fusion.judgment import (
     build_judgment_system_prompt,
@@ -70,6 +71,26 @@ class WindowObservation:
     perception_report: PerceptionReport
     acoustic_features: AcousticFeatures
     speaker_binding: SpeakerBinding
+
+
+def _qwen_input_chunks(window: MediaWindow) -> tuple[MediaChunk, ...]:
+    """Return every window chunk once, with audio first as required by Qwen."""
+    try:
+        first_audio_index = next(
+            index
+            for index, chunk in enumerate(window.chunks)
+            if chunk.kind is MediaKind.AUDIO
+        )
+    except StopIteration as exc:
+        raise ValueError("Qwen multimodal perception requires audio in every window") from exc
+    if first_audio_index == 0:
+        return window.chunks
+    first_audio = window.chunks[first_audio_index]
+    return (
+        first_audio,
+        *window.chunks[:first_audio_index],
+        *window.chunks[first_audio_index + 1 :],
+    )
 
 
 class QwenWindowRecognizer:
@@ -163,11 +184,18 @@ class QwenWindowRecognizer:
             # enrollment lookup serialized while allowing the more expensive
             # multimodal perception requests to overlap.
             async with self._voiceprint_lock:
-                binding = await asyncio.to_thread(
-                    self.voiceprint_service.identify_speakers,
-                    audio_chunks,
-                    self.enrollment,
-                )
+                for attempt in range(2):
+                    try:
+                        binding = await asyncio.to_thread(
+                            self.voiceprint_service.identify_speakers,
+                            audio_chunks,
+                            self.enrollment,
+                        )
+                        break
+                    except TencentVoiceprintError:
+                        if attempt:
+                            raise
+                        await asyncio.sleep(0.4)
             self.voiceprint_api_call_count += binding.provider_request_count
             self.api_call_count += binding.provider_request_count
         else:
@@ -234,6 +262,12 @@ class QwenWindowRecognizer:
         speaker_binding_description: str | None,
     ) -> PerceptionReport:
         """Stage 1: Use the multimodal model to observe and report."""
+        # Qwen Omni Realtime rejects a fresh request when an image arrives
+        # before its first audio append. A rolling window can legitimately
+        # begin with a camera frame, especially after intervention delivery
+        # clears the previous window, so enforce the provider protocol here
+        # without changing the chronological window used by later stages.
+        input_chunks = _qwen_input_chunks(window)
         prompt = build_perception_prompt(
             session_id=session_id,
             window_start_ms=window.start_ms,
@@ -242,32 +276,41 @@ class QwenWindowRecognizer:
             speaker_binding_description=speaker_binding_description,
         )
 
-        provider = QwenOmniRealtimeProvider(
-            model=self.settings.omni_model,
-            api_key=self.settings.dashscope_api_key.get_secret_value(),
-            workspace_id=self.settings.aliyun_workspace_id,
-            base_url=self.settings.realtime_base_url,
-            instructions=prompt,
-            connection_timeout_seconds=self.settings.connection_timeout_seconds,
-        )
-        accumulator = RealtimeResponseAccumulator()
-        self.api_call_count += 1
-        try:
-            await provider.connect()
-            for chunk in window.chunks:
-                if chunk.kind is MediaKind.AUDIO:
-                    await provider.send_audio(chunk.payload, chunk.timestamp_ms)
-                else:
-                    await provider.send_frame(chunk.payload, chunk.timestamp_ms)
-            await provider.finish_input()
-            async with asyncio.timeout(self.settings.response_timeout_seconds):
-                async for envelope in provider.events():
-                    event = envelope.get("event")
-                    if isinstance(event, dict):
-                        accumulator.add(event)
-            return parse_perception_report(accumulator.response_text)
-        finally:
-            await provider.close()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            provider = QwenOmniRealtimeProvider(
+                model=self.settings.omni_model,
+                api_key=self.settings.dashscope_api_key.get_secret_value(),
+                workspace_id=self.settings.aliyun_workspace_id,
+                base_url=self.settings.realtime_base_url,
+                instructions=prompt,
+                connection_timeout_seconds=self.settings.connection_timeout_seconds,
+            )
+            accumulator = RealtimeResponseAccumulator()
+            self.api_call_count += 1
+            try:
+                await provider.connect()
+                for chunk in input_chunks:
+                    if chunk.kind is MediaKind.AUDIO:
+                        await provider.send_audio(chunk.payload, chunk.timestamp_ms)
+                    else:
+                        await provider.send_frame(chunk.payload, chunk.timestamp_ms)
+                await provider.finish_input()
+                async with asyncio.timeout(self.settings.response_timeout_seconds):
+                    async for envelope in provider.events():
+                        event = envelope.get("event")
+                        if isinstance(event, dict):
+                            accumulator.add(event)
+                return parse_perception_report(accumulator.response_text)
+            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+            finally:
+                await provider.close()
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Qwen perception failed without an error")
 
     async def _assess_judgment(
         self,
@@ -311,38 +354,40 @@ class QwenWindowRecognizer:
             task_context=self.task_context,
         )
 
-        self.api_call_count += 1
-        result = await asyncio.to_thread(
-            self._judgment_provider.generate_structured,
-            system_prompt=self._judgment_system_prompt,
-            user_prompt=user_prompt,
-            max_tokens=self.settings.judgment_max_tokens,
-            temperature=self.settings.judgment_temperature,
-        )
-
-        assessment = parse_judgment_result(result.text)
-
-        # Override runtime-controlled fields
-        assessment = assessment.model_copy(
-            update={
-                "assessed_at_ms": window.end_ms,
-                "previous_state": previous_state,
-            }
-        )
-
-        assessment = constrain_assessment_evidence_to_window(
-            assessment,
-            window_start_ms=window.start_ms,
-            window_end_ms=window.end_ms,
-        )
-
-        # Validate against runtime facts
-        assessment = validate_assessment_context(
-            assessment,
-            expected_session_id=session_id,
-            duration_ms=window.end_ms,
-            codebook=self.codebook,
-            history_available=history_available,
-        )
-
-        return assessment
+        last_error: Exception | None = None
+        for attempt in range(2):
+            self.api_call_count += 1
+            try:
+                result = await asyncio.to_thread(
+                    self._judgment_provider.generate_structured,
+                    system_prompt=self._judgment_system_prompt,
+                    user_prompt=user_prompt,
+                    max_tokens=self.settings.judgment_max_tokens,
+                    temperature=self.settings.judgment_temperature,
+                )
+                assessment = parse_judgment_result(result.text)
+                assessment = assessment.model_copy(
+                    update={
+                        "assessed_at_ms": window.end_ms,
+                        "previous_state": previous_state,
+                    }
+                )
+                assessment = constrain_assessment_evidence_to_window(
+                    assessment,
+                    window_start_ms=window.start_ms,
+                    window_end_ms=window.end_ms,
+                )
+                return validate_assessment_context(
+                    assessment,
+                    expected_session_id=session_id,
+                    duration_ms=window.end_ms,
+                    codebook=self.codebook,
+                    history_available=history_available,
+                )
+            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Qwen judgment failed without an error")

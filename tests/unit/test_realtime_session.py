@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from coregulation_poc.capture.media import MediaChunk, MediaKind
 from coregulation_poc.models import CoregulationState, StateAssessment
 from coregulation_poc.runtime import RealtimeLoopConfig, RealtimeSession, RollingMediaWindow
+from coregulation_poc.runtime.session import VoiceAudio
 from coregulation_poc.runtime.window import MediaWindow
 
 
@@ -253,6 +254,23 @@ class _SlowStagedRecognizer:
         raise AssertionError("staged recognition should use observe then judge")
 
 
+class _BlockingVoiceSynthesizer:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def synthesize(self, text: str) -> VoiceAudio:
+        assert text
+        self.started.set()
+        await self.release.wait()
+        return VoiceAudio(
+            pcm_audio=b"\x00\x00" * 160,
+            sample_rate_hz=16_000,
+            provider="test_tts",
+            output_identifier="voice-1",
+        )
+
+
 def _audio(timestamp_ms: int) -> MediaChunk:
     return MediaChunk(MediaKind.AUDIO, timestamp_ms, b"\x00\x00" * 1600)
 
@@ -422,13 +440,81 @@ async def _exercise_no_loss_staged_pipeline() -> None:
 
     assert recognizer.observed_windows == [10_000, 20_000, 30_000]
     assert sorted(recognizer.judged_windows) == [10_000, 20_000, 30_000]
-    # Judgment calls can overlap; final boundary application remains chronological.
-    assert len(recognizer.history_lengths) == 3
-    assert recognizer.history_lengths[0] == 0
-    assert all(length <= index for index, length in enumerate(recognizer.history_lengths))
+    # Perception calls can overlap, but judgment sees every earlier result.
+    assert recognizer.history_lengths == [0, 1, 2]
     assert session.assessment_count == 3
     assert len([event for event in events if event["type"] == "state_update"]) == 3
     await session.stop("completed")
+
+
+def test_visual_intervention_is_sent_before_voice_synthesis_finishes() -> None:
+    asyncio.run(_exercise_visual_first_delivery())
+
+
+async def _exercise_visual_first_delivery() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    voice = _BlockingVoiceSynthesizer()
+    session = RealtimeSession(
+        session_id="visual-first-test",
+        recognizer=_SequenceRecognizer(),
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=100_000,
+            voice_enabled=True,
+            voice_synthesis_timeout_seconds=1,
+        ),
+        voice_synthesizer=voice,
+    )
+    await session.start()
+    analysis = asyncio.create_task(_reach_confirmed_dysregulation(session))
+    await voice.started.wait()
+
+    intervention = next(event for event in events if event["type"] == "intervention")
+    assert intervention["voice_pending"] is True
+    assert not any(event["type"] == "intervention_voice" for event in events)
+
+    voice.release.set()
+    await analysis
+    voice_event = next(event for event in events if event["type"] == "intervention_voice")
+    assert voice_event["delivery_id"] == intervention["delivery_id"]
+    assert isinstance(voice_event["audio_base64"], str)
+    await session.stop("completed")
+
+
+def test_shutdown_cancels_a_stuck_analysis_after_bounded_wait() -> None:
+    asyncio.run(_exercise_bounded_shutdown())
+
+
+async def _exercise_bounded_shutdown() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    recognizer = _BlockingDysregulationRecognizer()
+    session = RealtimeSession(
+        session_id="bounded-shutdown-test",
+        recognizer=recognizer,
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=10_000,
+            shutdown_drain_timeout_seconds=0.02,
+        ),
+    )
+    await session.start()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    await recognizer.started.wait()
+    await asyncio.wait_for(session.stop("completed"), timeout=1)
+
+    assert any(
+        event.get("stage") == "shutdown" and event["type"] == "loop_error"
+        for event in events
+    )
 
 
 def test_session_runs_four_modules_and_observes_post_intervention_response() -> None:
