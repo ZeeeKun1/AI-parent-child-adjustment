@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from coregulation_poc.acoustics.feature_extraction import (
@@ -26,6 +27,7 @@ from coregulation_poc.fusion.perception import (
 )
 from coregulation_poc.fusion.response_parser import (
     RealtimeResponseAccumulator,
+    constrain_assessment_evidence_to_window,
     validate_assessment_context,
 )
 from coregulation_poc.models import (
@@ -52,6 +54,22 @@ class StateRecognizer(Protocol):
         history: tuple[StateAssessment, ...],
         history_available: bool,
     ) -> StateAssessment: ...
+
+
+@dataclass(frozen=True, slots=True)
+class WindowObservation:
+    """Window-local observations produced before trajectory judgment.
+
+    Perception can run in parallel for consecutive media windows.  Judgment
+    remains chronological so every window receives the latest completed state
+    history instead of losing windows while the multimodal model is busy.
+    """
+
+    session_id: str
+    window: MediaWindow
+    perception_report: PerceptionReport
+    acoustic_features: AcousticFeatures
+    speaker_binding: SpeakerBinding
 
 
 class QwenWindowRecognizer:
@@ -92,6 +110,7 @@ class QwenWindowRecognizer:
         self.enrollment = enrollment
         self.voiceprint_service = voiceprint_service
         self.task_context = task_context
+        self._voiceprint_lock = asyncio.Lock()
 
         # Stage-2 text chat provider for judgment
         self._judgment_provider = QwenTextChatProvider(
@@ -116,6 +135,21 @@ class QwenWindowRecognizer:
         history_available: bool,
     ) -> StateAssessment:
         """Run the two-stage assessment pipeline."""
+        observation = await self.observe(session_id=session_id, window=window)
+        return await self.judge(
+            observation=observation,
+            previous_state=previous_state,
+            history=history,
+            history_available=history_available,
+        )
+
+    async def observe(
+        self,
+        *,
+        session_id: str,
+        window: MediaWindow,
+    ) -> WindowObservation:
+        """Extract window-local multimodal facts without judging trajectory."""
         # --- Speaker binding ------------------------------------------------
         # Formal browser sessions use Tencent 1:N voiceprint matching. Legacy
         # file enrollment remains available for offline/local diagnostics.
@@ -125,11 +159,15 @@ class QwenWindowRecognizer:
                 raise RuntimeError(
                     "Tencent voiceprint enrollment is present but the service is unavailable"
                 )
-            binding = await asyncio.to_thread(
-                self.voiceprint_service.identify_speakers,
-                audio_chunks,
-                self.enrollment,
-            )
+            # The Tencent SDK client is shared by one family session.  Keep
+            # enrollment lookup serialized while allowing the more expensive
+            # multimodal perception requests to overlap.
+            async with self._voiceprint_lock:
+                binding = await asyncio.to_thread(
+                    self.voiceprint_service.identify_speakers,
+                    audio_chunks,
+                    self.enrollment,
+                )
             self.voiceprint_api_call_count += binding.provider_request_count
             self.api_call_count += binding.provider_request_count
         else:
@@ -140,9 +178,7 @@ class QwenWindowRecognizer:
                 allow_f0_fallback=False,
             )
         self.last_speaker_binding = binding
-        speaker_binding_description = (
-            binding.to_prompt_description() if binding.bound else None
-        )
+        speaker_binding_description = binding.to_prompt_description() if binding.bound else None
 
         # --- Stage 1: Perception (multimodal model via WebSocket) ------------
         perception_report = await self._assess_perception(
@@ -161,18 +197,34 @@ class QwenWindowRecognizer:
         )
         self.last_acoustic_features = acoustic_features
 
-        # --- Stage 2: Judgment (text model via HTTP) -------------------------
-        assessment = await self._assess_judgment(
+        return WindowObservation(
             session_id=session_id,
             window=window,
+            perception_report=perception_report,
+            acoustic_features=acoustic_features,
+            speaker_binding=binding,
+        )
+
+    async def judge(
+        self,
+        *,
+        observation: WindowObservation,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
+        history_available: bool,
+    ) -> StateAssessment:
+        """Judge one prepared observation using the latest ordered history."""
+
+        # --- Stage 2: Judgment (text model via HTTP) -------------------------
+        return await self._assess_judgment(
+            session_id=observation.session_id,
+            window=observation.window,
             previous_state=previous_state,
             history=history,
             history_available=history_available,
-            perception_report=perception_report,
-            acoustic_features=acoustic_features,
+            perception_report=observation.perception_report,
+            acoustic_features=observation.acoustic_features,
         )
-
-        return assessment
 
     async def _assess_perception(
         self,
@@ -278,20 +330,19 @@ class QwenWindowRecognizer:
             }
         )
 
+        assessment = constrain_assessment_evidence_to_window(
+            assessment,
+            window_start_ms=window.start_ms,
+            window_end_ms=window.end_ms,
+        )
+
         # Validate against runtime facts
-        validate_assessment_context(
+        assessment = validate_assessment_context(
             assessment,
             expected_session_id=session_id,
             duration_ms=window.end_ms,
             codebook=self.codebook,
             history_available=history_available,
         )
-
-        # Clamp evidence timestamps to the active window
-        if any(
-            evidence.start_ms < window.start_ms
-            for evidence in assessment.modality_evidence.all_items
-        ):
-            raise ValueError("model evidence falls before the active realtime window")
 
         return assessment

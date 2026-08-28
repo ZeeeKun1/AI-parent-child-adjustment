@@ -8,7 +8,7 @@ import wave
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 
@@ -40,10 +40,9 @@ from coregulation_poc.intervention.models import InterventionPlan
 from coregulation_poc.models import (
     ControlObservation,
     CoregulationState,
-    Interruptibility,
     StateAssessment,
 )
-from coregulation_poc.runtime.recognition import StateRecognizer
+from coregulation_poc.runtime.recognition import StateRecognizer, WindowObservation
 from coregulation_poc.runtime.window import MediaWindow, RollingMediaWindow
 
 ServerEventSender = Callable[[dict[str, Any]], Awaitable[None]]
@@ -58,7 +57,10 @@ class RealtimeLoopConfig:
     assessment_interval_ms: int = 10_000
     post_intervention_observation_ms: int = 4_000
     max_assessments_per_session: int = 180
-    history_assessments: int = 4
+    history_assessments: int = 6
+    max_parallel_perception: int = 3
+    max_parallel_judgment: int = 2
+    max_intervention_staleness_ms: int = 20_000
     voice_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -72,6 +74,12 @@ class RealtimeLoopConfig:
             raise ValueError("max_assessments_per_session must be non-negative (0 = unlimited)")
         if not 1 <= self.history_assessments <= 20:
             raise ValueError("history_assessments must be between 1 and 20")
+        if not 1 <= self.max_parallel_perception <= 4:
+            raise ValueError("max_parallel_perception must be between 1 and 4")
+        if not 1 <= self.max_parallel_judgment <= 4:
+            raise ValueError("max_parallel_judgment must be between 1 and 4")
+        if self.max_intervention_staleness_ms < 5_000:
+            raise ValueError("intervention staleness must be at least 5000 ms")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +88,16 @@ class VoiceAudio:
     sample_rate_hz: int
     provider: str
     output_identifier: str | None = None
+
+
+@dataclass(slots=True)
+class _AnalysisJob:
+    """One immutable media window waiting for chronological judgment."""
+
+    snapshot: MediaWindow
+    observation_task: asyncio.Task[WindowObservation] | None
+    judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None
+    completed: asyncio.Future[None]
 
 
 class VoiceSynthesizer(Protocol):
@@ -173,18 +191,13 @@ class RealtimeSession:
             message_generator=message_generator,
             strategy_choice_generator=strategy_choice_generator,
         )
-        self.strategy_cards = {
-            card.strategy_id: card for card in self.strategy_library.cards
-        }
+        self.strategy_cards = {card.strategy_id: card for card in self.strategy_library.cards}
         self.delivery = DeliveryCoordinator(load_delivery_policy())
         self.previous_state: CoregulationState | None = None
         self.previous_plan: InterventionPlan | None = None
         self.assessment_history: list[StateAssessment] = []
         self.pending_delivery: DeliveryPackage | None = None
         self._pending_plan: InterventionPlan | None = None
-        self._queued_delivery: DeliveryPackage | None = None
-        self._queued_plan: InterventionPlan | None = None
-        self._queued_interruptibility: Interruptibility | None = None
         self.delivery_reports: list[dict[str, Any]] = []
         self.intervention_outcomes: list[dict[str, Any]] = []
         self.expert_interventions: list[dict[str, Any]] = []
@@ -192,7 +205,20 @@ class RealtimeSession:
         self.assessment_count = 0
         self._last_scheduled_at_ms: int | None = None
         self._post_response_not_before_ms: int | None = None
-        self._analysis_task: asyncio.Task[None] | None = None
+        self._scheduled_assessment_count = 0
+        self._analysis_queue: asyncio.Queue[_AnalysisJob | None] = asyncio.Queue()
+        self._analysis_worker_task: asyncio.Task[None] | None = None
+        self._perception_semaphore = asyncio.Semaphore(
+            self.config.max_parallel_perception
+        )
+        self._perception_tasks: set[asyncio.Task[WindowObservation]] = set()
+        self._judgment_semaphore = asyncio.Semaphore(self.config.max_parallel_judgment)
+        self._judgment_tasks: set[
+            asyncio.Task[tuple[WindowObservation, StateAssessment]]
+        ] = set()
+        self._latest_media_timestamp_ms = 0
+        self._latest_completed_judgment_ms = 0
+        self._stale_intervention_count = 0
         self._analysis_error_count = 0
         self._speaker_binding_count = 0
         self._speaker_binding_success_count = 0
@@ -215,12 +241,8 @@ class RealtimeSession:
 
     @property
     def api_call_count(self) -> int:
-        recognition_calls = int(
-            getattr(self.recognizer, "api_call_count", self.assessment_count)
-        )
-        message_calls = int(
-            getattr(self.selector.message_generator, "call_count", 0)
-        )
+        recognition_calls = int(getattr(self.recognizer, "api_call_count", self.assessment_count))
+        message_calls = int(getattr(self.selector.message_generator, "call_count", 0))
         strategy_choice_calls = int(
             getattr(self.selector.strategy_choice_generator, "call_count", 0)
         )
@@ -230,6 +252,14 @@ class RealtimeSession:
     def runtime_metrics(self) -> dict[str, Any]:
         return {
             "assessment_count": self.assessment_count,
+            "scheduled_assessment_count": self._scheduled_assessment_count,
+            "analysis_queue_depth": self._analysis_queue.qsize(),
+            "perception_inflight_count": sum(
+                1 for task in self._perception_tasks if not task.done()
+            ),
+            "judgment_inflight_count": sum(
+                1 for task in self._judgment_tasks if not task.done()
+            ),
             "api_call_count": self.api_call_count,
             "strategy_selection_llm_call_count": int(
                 getattr(self.selector.strategy_choice_generator, "call_count", 0)
@@ -245,6 +275,7 @@ class RealtimeSession:
             "expert_intervention_count": len(self.expert_interventions),
             "family_response_count": len(self.family_responses),
             "analysis_error_count": self._analysis_error_count,
+            "stale_intervention_count": self._stale_intervention_count,
             "speaker_binding_count": self._speaker_binding_count,
             "speaker_binding_success_count": self._speaker_binding_success_count,
             "boundary_adjustment_count": self._boundary_adjustment_count,
@@ -252,7 +283,7 @@ class RealtimeSession:
             "awaiting_post_intervention_response": (
                 self.controller.awaiting_post_intervention_response
             ),
-            "intervention_queued": self._queued_delivery is not None,
+            "intervention_queued": False,
             "interventions_paused": self._interventions_paused,
             "expert_takeover_active": self._expert_takeover_active,
             "voice_enabled": self.config.voice_enabled,
@@ -264,6 +295,7 @@ class RealtimeSession:
         if self._started:
             return
         self._started = True
+        self._analysis_worker_task = asyncio.create_task(self._analysis_worker())
         await self.send_event(
             {
                 "type": "loop_started",
@@ -276,32 +308,29 @@ class RealtimeSession:
     async def accept_chunk(self, chunk: MediaChunk) -> None:
         if not self._started or self._stopped:
             return
+        self._latest_media_timestamp_ms = max(
+            self._latest_media_timestamp_ms,
+            chunk.timestamp_ms,
+        )
         self.window.append(chunk)
         snapshot = self.window.snapshot()
         if snapshot is None:
-            return
-        if await self._try_deliver_queued(snapshot):
             return
         if not snapshot.has_both_modalities:
             return
         if (
             self.config.max_assessments_per_session > 0
-            and self.assessment_count >= self.config.max_assessments_per_session
+            and self._scheduled_assessment_count
+            >= self.config.max_assessments_per_session
         ):
-            return
-        if self._analysis_task is not None and not self._analysis_task.done():
             return
         if self._last_scheduled_at_ms is None:
             due = snapshot.end_ms >= self.config.assessment_interval_ms
         else:
-            due = (
-                snapshot.end_ms - self._last_scheduled_at_ms
-                >= self.config.assessment_interval_ms
-            )
+            due = snapshot.end_ms - self._last_scheduled_at_ms >= self.config.assessment_interval_ms
         if not due:
             return
-        self._last_scheduled_at_ms = snapshot.end_ms
-        self._analysis_task = asyncio.create_task(self._analyze(snapshot))
+        await self._schedule_analysis(snapshot)
 
     async def analyze_now(self) -> None:
         """Run one deterministic analysis cycle; primarily useful for local verification."""
@@ -309,26 +338,182 @@ class RealtimeSession:
         snapshot = self.window.snapshot()
         if snapshot is None or not snapshot.has_both_modalities:
             raise ValueError("both audio and image media are required before analysis")
-        if self._analysis_task is not None and not self._analysis_task.done():
-            await self._analysis_task
+        if (
+            self._last_scheduled_at_ms is not None
+            and snapshot.end_ms <= self._last_scheduled_at_ms
+        ):
+            await self.wait_for_analysis()
             return
-        self._last_scheduled_at_ms = snapshot.end_ms
-        await self._analyze(snapshot)
+        completed = await self._schedule_analysis(snapshot)
+        await completed
 
-    def _speaker_binding_event(self, snapshot: MediaWindow) -> dict[str, Any] | None:
-        binding = getattr(self.recognizer, "last_speaker_binding", None)
+    async def wait_for_analysis(self) -> None:
+        """Wait until all captured windows have been judged in time order."""
+
+        await self._analysis_queue.join()
+
+    def _supports_staged_recognition(self) -> bool:
+        return callable(getattr(self.recognizer, "observe", None)) and callable(
+            getattr(self.recognizer, "judge", None)
+        )
+
+    async def _schedule_analysis(self, snapshot: MediaWindow) -> asyncio.Future[None]:
+        """Capture a due window even when earlier model calls are still running."""
+
+        loop = asyncio.get_running_loop()
+        completed: asyncio.Future[None] = loop.create_future()
+        observation_task: asyncio.Task[WindowObservation] | None = None
+        judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None = None
+        if self._supports_staged_recognition():
+            observation_task = asyncio.create_task(self._observe_window(snapshot))
+            self._perception_tasks.add(observation_task)
+            observation_task.add_done_callback(self._perception_tasks.discard)
+            judgment_task = asyncio.create_task(
+                self._judge_observation(observation_task)
+            )
+            self._judgment_tasks.add(judgment_task)
+            judgment_task.add_done_callback(self._judgment_tasks.discard)
+        await self._analysis_queue.put(
+            _AnalysisJob(
+                snapshot=snapshot,
+                observation_task=observation_task,
+                judgment_task=judgment_task,
+                completed=completed,
+            )
+        )
+        self._last_scheduled_at_ms = snapshot.end_ms
+        self._scheduled_assessment_count += 1
+        return completed
+
+    async def _observe_window(self, snapshot: MediaWindow) -> WindowObservation:
+        async with self._perception_semaphore:
+            await self.send_event(
+                {
+                    "type": "analysis_started",
+                    "window_start_ms": snapshot.start_ms,
+                    "window_end_ms": snapshot.end_ms,
+                }
+            )
+            staged_recognizer = cast(Any, self.recognizer)
+            return await staged_recognizer.observe(
+                session_id=self.session_id,
+                window=snapshot,
+            )
+
+    async def _judge_observation(
+        self,
+        observation_task: asyncio.Task[WindowObservation],
+    ) -> tuple[WindowObservation, StateAssessment]:
+        """Judge prepared windows concurrently while final application stays ordered."""
+
+        observation = await observation_task
+        async with self._judgment_semaphore:
+            history = tuple(
+                self.assessment_history[-self.config.history_assessments :]
+            )
+            staged_recognizer = cast(Any, self.recognizer)
+            assessment = await staged_recognizer.judge(
+                observation=observation,
+                previous_state=self.previous_state,
+                history=history,
+                history_available=bool(history),
+            )
+            self._latest_completed_judgment_ms = max(
+                self._latest_completed_judgment_ms,
+                assessment.assessed_at_ms,
+            )
+        return observation, assessment
+
+    async def _analysis_worker(self) -> None:
+        while True:
+            job = await self._analysis_queue.get()
+            if job is None:
+                self._analysis_queue.task_done()
+                return
+            try:
+                await self._analyze_job(job)
+            except asyncio.CancelledError:
+                if not job.completed.done():
+                    job.completed.cancel()
+                raise
+            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                self._analysis_error_count += 1
+                with suppress(ConnectionError, RuntimeError):
+                    await self.send_event(
+                        {
+                            "type": "loop_error",
+                            "stage": "analysis",
+                            "window_start_ms": job.snapshot.start_ms,
+                            "window_end_ms": job.snapshot.end_ms,
+                            "message": str(exc),
+                            "retryable": True,
+                        }
+                    )
+            finally:
+                if not job.completed.done():
+                    job.completed.set_result(None)
+                self._analysis_queue.task_done()
+
+    async def _analyze_job(self, job: _AnalysisJob) -> None:
+        snapshot = job.snapshot
+        history = tuple(self.assessment_history[-self.config.history_assessments :])
+        history_available = bool(history)
+        if job.judgment_task is not None:
+            observation, model_assessment = await job.judgment_task
+            history_available = bool(self.assessment_history)
+        else:
+            observation = None
+            await self.send_event(
+                {
+                    "type": "analysis_started",
+                    "window_start_ms": snapshot.start_ms,
+                    "window_end_ms": snapshot.end_ms,
+                }
+            )
+            model_assessment = await self.recognizer.assess(
+                session_id=self.session_id,
+                window=snapshot,
+                previous_state=self.previous_state,
+                history=history,
+                history_available=history_available,
+            )
+        # The chronological worker owns trajectory state.  This also protects
+        # generic recognizers that may have started with slightly stale context.
+        model_assessment = model_assessment.model_copy(
+            update={"previous_state": self.previous_state}
+        )
+        await self._apply_assessment(
+            snapshot=snapshot,
+            model_assessment=model_assessment,
+            history_available=history_available,
+            recognition_observation=observation,
+        )
+
+    def _speaker_binding_event(
+        self,
+        snapshot: MediaWindow,
+        recognition_observation: WindowObservation | None = None,
+    ) -> dict[str, Any] | None:
+        binding = (
+            recognition_observation.speaker_binding
+            if recognition_observation is not None
+            else getattr(self.recognizer, "last_speaker_binding", None)
+        )
         if binding is None:
             return None
         self._speaker_binding_count += 1
         if binding.bound:
             self._speaker_binding_success_count += 1
 
-        acoustic = getattr(self.recognizer, "last_acoustic_features", None)
+        acoustic = (
+            recognition_observation.acoustic_features
+            if recognition_observation is not None
+            else getattr(self.recognizer, "last_acoustic_features", None)
+        )
         acoustic_by_interval = {}
         if acoustic is not None:
             acoustic_by_interval = {
-                (segment.start_ms, segment.end_ms): segment
-                for segment in acoustic.segments
+                (segment.start_ms, segment.end_ms): segment for segment in acoustic.segments
             }
 
         segments = []
@@ -344,15 +529,9 @@ class RealtimeSession:
                     "provider_score": segment.provider_score,
                     "confidence": segment.confidence,
                     "forced_assignment": segment.forced_assignment,
-                    "mean_f0_hz": (
-                        segment.mean_f0_hz if segment.mean_f0_hz > 0 else None
-                    ),
-                    "median_f0_hz": (
-                        segment.median_f0_hz if segment.median_f0_hz > 0 else None
-                    ),
-                    "rms_energy": (
-                        None if measured is None else measured.rms_energy
-                    ),
+                    "mean_f0_hz": (segment.mean_f0_hz if segment.mean_f0_hz > 0 else None),
+                    "median_f0_hz": (segment.median_f0_hz if segment.median_f0_hz > 0 else None),
+                    "rms_energy": (None if measured is None else measured.rms_energy),
                 }
             )
 
@@ -372,38 +551,25 @@ class RealtimeSession:
             "segment_count": len(binding.segments),
             "segments_truncated": len(binding.segments) > len(segments),
             "segments": segments,
-            "total_speech_ms": (
-                None if acoustic is None else acoustic.total_speech_ms
-            ),
-            "total_silence_ms": (
-                None if acoustic is None else acoustic.total_silence_ms
-            ),
+            "total_speech_ms": (None if acoustic is None else acoustic.total_speech_ms),
+            "total_silence_ms": (None if acoustic is None else acoustic.total_silence_ms),
             "raw_audio_saved_locally": False,
             "voiceprint_embedding_saved_locally": False,
         }
 
-    async def _analyze(self, snapshot: MediaWindow) -> None:
-        history = tuple(self.assessment_history[-self.config.history_assessments :])
-        history_available = bool(history)
+    async def _apply_assessment(
+        self,
+        *,
+        snapshot: MediaWindow,
+        model_assessment: StateAssessment,
+        history_available: bool,
+        recognition_observation: WindowObservation | None,
+    ) -> None:
         post_response_observed = (
             self._post_response_not_before_ms is not None
             and snapshot.end_ms >= self._post_response_not_before_ms
         )
         try:
-            await self.send_event(
-                {
-                    "type": "analysis_started",
-                    "window_start_ms": snapshot.start_ms,
-                    "window_end_ms": snapshot.end_ms,
-                }
-            )
-            model_assessment = await self.recognizer.assess(
-                session_id=self.session_id,
-                window=snapshot,
-                previous_state=self.previous_state,
-                history=history,
-                history_available=history_available,
-            )
             boundary_resolution = self.boundary_tracker.resolve(
                 model_assessment,
                 window_start_ms=snapshot.start_ms,
@@ -414,7 +580,10 @@ class RealtimeSession:
                 self._boundary_adjustment_count += 1
             if boundary_resolution.spontaneous_recovery:
                 self._spontaneous_recovery_count += 1
-            binding_event = self._speaker_binding_event(snapshot)
+            binding_event = self._speaker_binding_event(
+                snapshot,
+                recognition_observation,
+            )
             if binding_event is not None:
                 await self.send_event(binding_event)
             observation = ControlObservation(
@@ -452,7 +621,8 @@ class RealtimeSession:
                     "assessed_at_ms": assessment.assessed_at_ms,
                     "state": None if assessment.state is None else assessment.state.value,
                     "previous_state": (
-                        None if assessment.previous_state is None
+                        None
+                        if assessment.previous_state is None
                         else assessment.previous_state.value
                     ),
                     "trajectory": assessment.trajectory.value,
@@ -475,28 +645,44 @@ class RealtimeSession:
                     "support_target": assessment.support_target.value,
                     "interruptibility": assessment.interruptibility.value,
                     "interaction_performance": list(assessment.interaction_performance),
+                    "analysis_staleness_ms": max(
+                        0,
+                        self._latest_media_timestamp_ms - snapshot.end_ms,
+                    ),
                     **boundary_resolution.as_event_fields(),
                 }
             )
-            if self._queued_delivery is not None:
-                if decision.intervention_permitted:
-                    self._queued_interruptibility = assessment.interruptibility
-                    if self.controller.awaiting_post_intervention_response:
-                        self.controller.mark_intervention_not_delivered()
-                    await self.send_event(
-                        {
-                            "type": "intervention_held",
-                            "sequence": decision.sequence,
-                            "reason": "waiting_for_natural_turn_boundary",
-                            "queued": True,
-                        }
-                    )
-                    return
-                await self._cancel_queued_delivery(
-                    reason="state_or_evidence_no_longer_authorizes_intervention",
-                    sequence=decision.sequence,
+            analysis_staleness_ms = max(
+                0,
+                self._latest_media_timestamp_ms - snapshot.end_ms,
+            )
+            if (
+                decision.intervention_permitted
+                and analysis_staleness_ms > self.config.max_intervention_staleness_ms
+                and self._latest_completed_judgment_ms > snapshot.end_ms
+            ):
+                self._stale_intervention_count += 1
+                if self.controller.awaiting_post_intervention_response:
+                    self.controller.mark_intervention_not_delivered()
+                await self.send_event(
+                    {
+                        "type": "intervention_held",
+                        "sequence": decision.sequence,
+                        "reason": "superseded_stale_assessment",
+                        "analysis_staleness_ms": analysis_staleness_ms,
+                        "superseded_by_assessment_ms": (
+                            self._latest_completed_judgment_ms
+                        ),
+                    }
                 )
-            selection = self.selector.select(
+                return
+            # Strategy ranking and contextual message generation may make one
+            # or two HTTP calls.  Keep them off the event loop so camera/audio
+            # capture continues while the result for this original window is
+            # pending.  The resulting intervention is still delivered when it
+            # becomes ready; it is never reassigned to a newer window.
+            selection = await asyncio.to_thread(
+                self.selector.select,
                 assessment=assessment,
                 decision=decision,
                 previous_plan=self.previous_plan,
@@ -506,7 +692,10 @@ class RealtimeSession:
             # Consume the boost after it has been applied to selection.
             self._difficulty_feedback_boost = False
             if selection.plan is None:
-                if self.controller.awaiting_post_intervention_response:
+                if (
+                    self.controller.awaiting_post_intervention_response
+                    and self.pending_delivery is None
+                ):
                     self.controller.mark_intervention_not_delivered()
                     await self.send_event(
                         {
@@ -553,24 +742,6 @@ class RealtimeSession:
                     }
                 )
                 return
-            if not self._delivery_timing_is_safe(
-                snapshot,
-                assessment.interruptibility,
-            ):
-                if self.controller.awaiting_post_intervention_response:
-                    self.controller.mark_intervention_not_delivered()
-                self._queued_delivery = preparation.package
-                self._queued_plan = selection.plan
-                self._queued_interruptibility = assessment.interruptibility
-                await self.send_event(
-                    {
-                        "type": "intervention_held",
-                        "sequence": decision.sequence,
-                        "reason": "waiting_for_natural_turn_boundary",
-                        "queued": True,
-                    }
-                )
-                return
             self._pending_plan = selection.plan
             await self._deliver(preparation.package)
         except asyncio.CancelledError:
@@ -586,58 +757,6 @@ class RealtimeSession:
                         "retryable": True,
                     }
                 )
-
-    def _delivery_timing_is_safe(
-        self,
-        snapshot: MediaWindow,
-        interruptibility: Interruptibility,
-    ) -> bool:
-        if interruptibility in {
-            Interruptibility.TASK_ENGAGED,
-            Interruptibility.UNCLEAR,
-        }:
-            return False
-        return self.turn_boundary_detector(snapshot)
-
-    async def _try_deliver_queued(self, snapshot: MediaWindow) -> bool:
-        package = self._queued_delivery
-        plan = self._queued_plan
-        interruptibility = self._queued_interruptibility
-        if package is None or plan is None or interruptibility is None:
-            return False
-        if self._interventions_paused or self._expert_takeover_active:
-            return False
-        if not self._delivery_timing_is_safe(snapshot, interruptibility):
-            return False
-
-        self._queued_delivery = None
-        self._queued_plan = None
-        self._queued_interruptibility = None
-        self.controller.mark_intervention_delivered(plan.state)
-        self._pending_plan = plan
-        await self.send_event(
-            {
-                "type": "intervention_queue_released",
-                "sequence": package.sequence,
-                "reason": "natural_turn_boundary_observed",
-            }
-        )
-        await self._deliver(package)
-        return True
-
-    async def _cancel_queued_delivery(self, *, reason: str, sequence: int) -> None:
-        if self._queued_delivery is None:
-            return
-        self._queued_delivery = None
-        self._queued_plan = None
-        self._queued_interruptibility = None
-        await self.send_event(
-            {
-                "type": "intervention_queue_cancelled",
-                "sequence": sequence,
-                "reason": reason,
-            }
-        )
 
     async def _deliver(self, package: DeliveryPackage) -> None:
         if self._interventions_paused or self._expert_takeover_active:
@@ -697,6 +816,12 @@ class RealtimeSession:
                     plan.semantic_relaxed_dimensions if plan is not None else []
                 ),
                 "selection_reason": plan.selection_reason if plan is not None else None,
+                "message_source": (
+                    plan.message_source.value if plan is not None else None
+                ),
+                "message_validation_checks": (
+                    plan.validation_checks if plan is not None else {}
+                ),
                 "dismissible": package.visual_prompt.dismissible,
                 "voice_expected": package.voice_prompt.enabled,
                 "voice_provider": package.voice_prompt.provider,
@@ -733,11 +858,6 @@ class RealtimeSession:
                     }
                 )
                 return True
-            if control_type == "pause_interventions" and self._queued_delivery is not None:
-                await self._cancel_queued_delivery(
-                    reason="interventions_paused",
-                    sequence=self._queued_delivery.sequence,
-                )
             self._interventions_paused = control_type == "pause_interventions"
             await self.send_event(
                 {
@@ -788,21 +908,36 @@ class RealtimeSession:
                 else None
             ),
         )
-        self.delivery_reports.append(report.model_dump(mode="json"))
         delivered = any(
             channel.status is OutputExecutionStatus.DELIVERED for channel in (visual, voice)
         )
+        delivery_timeline_ms: int | None = None
         if delivered:
+            delivery_timeline_ms = max(
+                recorded_at_ms,
+                self._latest_media_timestamp_ms,
+                package.prepared_at_ms,
+            )
+            pending_plan = self._pending_plan
+            if pending_plan is None:
+                raise ValueError("delivered intervention has no pending plan")
+            self.controller.mark_intervention_delivered(
+                pending_plan.state,
+                delivered_at_ms=delivery_timeline_ms,
+            )
             self._post_response_not_before_ms = (
-                recorded_at_ms + self.config.post_intervention_observation_ms
+                delivery_timeline_ms + self.config.post_intervention_observation_ms
             )
             # The next model window must contain only behavior observed after delivery.
             self.window.clear()
-            self._last_scheduled_at_ms = recorded_at_ms
+            self._last_scheduled_at_ms = delivery_timeline_ms
         else:
             self.controller.mark_intervention_not_delivered()
             self.pending_delivery = None
             self._pending_plan = None
+        report_record = report.model_dump(mode="json")
+        report_record["delivery_timeline_ms"] = delivery_timeline_ms
+        self.delivery_reports.append(report_record)
         await self.send_event(
             {
                 "type": "delivery_execution_received",
@@ -812,6 +947,7 @@ class RealtimeSession:
                 "visual_status": report.visual.status.value,
                 "voice_status": report.voice.status.value,
                 "post_intervention_observation_armed": delivered,
+                "delivery_timeline_ms": delivery_timeline_ms,
             }
         )
         return True
@@ -823,11 +959,6 @@ class RealtimeSession:
         reason = self._required_text(control.get("reason"), "reason", maximum=300)
         self._expert_takeover_active = True
         self._interventions_paused = True
-        if self._queued_delivery is not None:
-            await self._cancel_queued_delivery(
-                reason="expert_takeover_active",
-                sequence=self._queued_delivery.sequence,
-            )
         if self.pending_delivery is not None:
             if self.controller.awaiting_post_intervention_response:
                 self.controller.mark_intervention_not_delivered()
@@ -872,9 +1003,7 @@ class RealtimeSession:
             raise ValueError("请先观察上一条专家提示后的互动变化")
         operator = self._required_text(control.get("operator"), "operator", maximum=80)
         reason = self._required_text(control.get("reason"), "reason", maximum=300)
-        strategy_id = self._required_text(
-            control.get("strategy_id"), "strategy_id", maximum=80
-        )
+        strategy_id = self._required_text(control.get("strategy_id"), "strategy_id", maximum=80)
         card = self.strategy_cards.get(strategy_id)
         if card is None:
             raise ValueError("专家介入必须选择已审核的策略卡")
@@ -888,9 +1017,7 @@ class RealtimeSession:
             "target_actor": card.target_actor.value,
             "repair_target": card.repair_target.value,
             "expected_recovery": list(card.expected_recovery),
-            "baseline_state": (
-                None if self.previous_state is None else self.previous_state.value
-            ),
+            "baseline_state": (None if self.previous_state is None else self.previous_state.value),
             "operator": operator,
             "reason": reason,
         }
@@ -920,9 +1047,7 @@ class RealtimeSession:
 
     async def _record_expert_delivery(self, control: dict[str, Any]) -> None:
         assert self._expert_pending is not None
-        recorded_at_ms = self._non_negative_int(
-            control.get("recorded_at_ms"), "recorded_at_ms"
-        )
+        recorded_at_ms = self._non_negative_int(control.get("recorded_at_ms"), "recorded_at_ms")
         visual = self._channel_execution(
             control.get("visual"),
             modality=OutputModality.VISUAL_TEXT,
@@ -973,9 +1098,7 @@ class RealtimeSession:
         record = {
             "response": response,
             "delivery_id": (
-                str(control["delivery_id"])
-                if isinstance(control.get("delivery_id"), str)
-                else None
+                str(control["delivery_id"]) if isinstance(control.get("delivery_id"), str) else None
             ),
             "recorded_at_ms": self._optional_non_negative_int(
                 control.get("recorded_at_ms"), "recorded_at_ms"
@@ -986,11 +1109,6 @@ class RealtimeSession:
         # Apply feedback effects on system behavior
         if response == "self_continue":
             # Suppress intervention for one complete analysis window
-            if self._queued_delivery is not None:
-                await self._cancel_queued_delivery(
-                    reason="family_requested_self_continue",
-                    sequence=self._queued_delivery.sequence,
-                )
             self._self_continue_suppressed = True
         elif response == "task_too_hard":
             self._update_task_difficulty("challenging")
@@ -1104,12 +1222,8 @@ class RealtimeSession:
             "recovery_status": recovery_status,
             "effect_category": effect_category,
             "expected_recovery": list(plan.expected_recovery),
-            "observed_state": (
-                None if assessment.state is None else assessment.state.value
-            ),
-            "observed_interaction_performance": list(
-                assessment.interaction_performance
-            ),
+            "observed_state": (None if assessment.state is None else assessment.state.value),
+            "observed_interaction_performance": list(assessment.interaction_performance),
             "observed_evidence": [
                 {
                     "modality": item.modality.value,
@@ -1185,12 +1299,14 @@ class RealtimeSession:
         if self._stopped:
             return
         self._stopped = True
-        if self._analysis_task is not None:
-            if not self._analysis_task.done():
-                self._analysis_task.cancel()
+        await self.wait_for_analysis()
+        await self._analysis_queue.put(None)
+        if self._analysis_worker_task is not None:
             with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
-                await self._analysis_task
-        self._queued_delivery = None
-        self._queued_plan = None
-        self._queued_interruptibility = None
+                await self._analysis_worker_task
+        for task in tuple(self._perception_tasks):
+            if not task.done():
+                task.cancel()
+        if self._perception_tasks:
+            await asyncio.gather(*self._perception_tasks, return_exceptions=True)
         self.window.clear()

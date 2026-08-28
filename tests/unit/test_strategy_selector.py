@@ -157,7 +157,7 @@ def test_parent_pace_evidence_selects_parent_strategy() -> None:
     assert all(result.plan.validation_checks.values())
 
 
-def test_unknown_actor_holds_without_evidence() -> None:
+def test_unknown_actor_uses_safe_dyadic_card() -> None:
     observation = _observation(
         state="dysregulation",
         performance="pace conflict",
@@ -174,8 +174,9 @@ def test_unknown_actor_holds_without_evidence() -> None:
         decision=decision,
     )
 
-    assert result.status is StrategySelectionStatus.HELD
-    assert result.hold_reason == "target_actor_evidence_insufficient"
+    assert result.plan is not None
+    assert result.plan.target_actor is Actor.BOTH
+    assert result.plan.strategy_id == "DYAD_RELATIONSHIP_RESET"
 
 
 def test_child_task_stall_first_clarifies_need() -> None:
@@ -222,7 +223,7 @@ def test_child_task_support_follows_unresolved_needs_inquiry() -> None:
         state="dysregulation",
         performance="sustained task stall",
         actor="child",
-        assessed_at_ms=2000,
+        assessed_at_ms=121_000,
         response_observed=True,
         history_available=True,
         support_need="learning_support",
@@ -260,7 +261,7 @@ def test_both_actor_evidence_uses_dyadic_card_not_single_actor_card() -> None:
     assert result.plan.target_actor is Actor.BOTH
 
 
-def test_both_actor_evidence_cannot_authorize_single_actor_card() -> None:
+def test_both_actor_evidence_uses_closest_dyadic_card() -> None:
     observation = _observation(
         state="dysregulation",
         performance="pace conflict",
@@ -276,11 +277,12 @@ def test_both_actor_evidence_cannot_authorize_single_actor_card() -> None:
         decision=decision,
     )
 
-    assert result.status is StrategySelectionStatus.HELD
-    assert result.hold_reason == "target_actor_evidence_insufficient"
+    assert result.plan is not None
+    assert result.plan.target_actor is Actor.BOTH
+    assert result.plan.strategy_id == "DYAD_RELATIONSHIP_RESET"
 
 
-def test_positive_event_authorizes_bounded_positive_reinforcement() -> None:
+def test_positive_event_remains_non_intervention_under_simple_policy() -> None:
     observation = _observation(
         state="normal",
         performance="active child participation",
@@ -295,9 +297,9 @@ def test_positive_event_authorizes_bounded_positive_reinforcement() -> None:
         decision=decision,
     )
 
-    assert decision.action.value == "reinforce"
-    assert result.plan is not None
-    assert result.plan.strategy_id == "CHILD_POSITIVE_AFFIRM"
+    assert decision.action.value == "no_intervention"
+    assert result.plan is None
+    assert result.hold_reason == "module_two_did_not_authorize"
 
 
 def test_child_escalation_selects_child_support_without_guessing_parent() -> None:
@@ -435,9 +437,7 @@ def test_strategy_replay_writes_auditable_plans(tmp_path: Path) -> None:
     )
 
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
-    plans = json.loads(
-        (run_dir / "intervention_plans.json").read_text(encoding="utf-8")
-    )
+    plans = json.loads((run_dir / "intervention_plans.json").read_text(encoding="utf-8"))
     assert valid is True
     assert result["intervention_plan_count"] == 1
     assert plans[0]["target_actor"] == "parent"

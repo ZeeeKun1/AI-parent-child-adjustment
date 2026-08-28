@@ -141,6 +141,11 @@ async def run_pipeline_test(
             "post_intervention_observation_ms": loop_config.post_intervention_observation_ms,
             "max_assessments_per_session": loop_config.max_assessments_per_session,
             "history_assessments": loop_config.history_assessments,
+            "max_parallel_perception": loop_config.max_parallel_perception,
+            "max_parallel_judgment": loop_config.max_parallel_judgment,
+            "max_intervention_staleness_ms": (
+                loop_config.max_intervention_staleness_ms
+            ),
             "voice_enabled": loop_config.voice_enabled,
         },
         "research_basis": {
@@ -314,10 +319,11 @@ async def run_pipeline_test(
                     f"assessments={session.assessment_count}"
                 )
 
-        # Wait for any in-flight analysis to complete
-        if session._analysis_task is not None and not session._analysis_task.done():
+        # Every due window is retained even while perception is busy.  Drain
+        # the ordered analysis queue before finalizing the replay artifacts.
+        if session.runtime_metrics["scheduled_assessment_count"] > session.assessment_count:
             progress("    waiting for final analysis to complete...")
-            await session._analysis_task
+            await session.wait_for_analysis()
 
         # Force a final assessment if none was triggered (short clip)
         if session.assessment_count == 0:
@@ -347,6 +353,9 @@ async def run_pipeline_test(
     grouped = _extract_typed_events(events)
     metrics = session.runtime_metrics
     finished_wall = time.monotonic()
+    if metrics["assessment_count"] == 0:
+        valid = False
+        error_message = error_message or "no_valid_state_assessments"
 
     store.write_json("events_all.json", events)
     store.write_json("state_updates.json", grouped["state_updates"])
@@ -434,4 +443,6 @@ async def run_pipeline_test(
             f"{len(grouped['interventions'])} interventions, "
             f"{len(grouped['intervention_outcomes'])} outcomes"
         )
+    else:
+        progress(f"    FAIL: {error_message}")
     return store.run_dir, valid

@@ -3,11 +3,11 @@
 Verifies that support_need, task_process, and support_target
 actually control strategy selection, not just appear in the prompt.
 """
+
 from __future__ import annotations
 
 from coregulation_poc.control import StateTrajectoryController, load_intervention_policy
 from coregulation_poc.intervention import StrategySelector, load_strategy_library
-from coregulation_poc.intervention.models import StrategySelectionStatus
 from coregulation_poc.models import (
     Actor,
     ControlObservation,
@@ -263,8 +263,8 @@ def test_multiple_performances_use_all_matching_rules() -> None:
     assert "sustained task stall" in result.plan.selected_from_interaction_performance
 
 
-# Test 21: no fixed BOTH/PARENT/CHILD priority; support_target determines actor
-def test_no_fixed_actor_priority_support_target_determines_selection() -> None:
+# Test 21: normal state stays silent even when a positive event is observed
+def test_normal_positive_event_does_not_create_strategy_plan() -> None:
     observation = _observation(
         state="normal",
         performance="task completion",
@@ -280,7 +280,5 @@ def test_no_fixed_actor_priority_support_target_determines_selection() -> None:
         decision=decision,
     )
 
-    assert result.plan is not None
-    assert result.plan.target_actor is Actor.PARENT
-    assert result.plan.strategy_id == "PARENT_POSITIVE_AFFIRM"
-    assert result.plan.strategy_id != "DYAD_POSITIVE_AFFIRM"
+    assert result.plan is None
+    assert result.hold_reason == "module_two_did_not_authorize"

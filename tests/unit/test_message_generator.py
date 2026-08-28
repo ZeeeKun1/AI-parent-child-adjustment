@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from coregulation_poc.intervention import load_strategy_library
 from coregulation_poc.intervention.message_prompt import build_message_prompt
-from coregulation_poc.intervention.models import MessageSource
+from coregulation_poc.intervention.models import MessageSource, StrategyHoldReason
 from coregulation_poc.intervention.selector import MessageGenerator, StrategySelector
 from coregulation_poc.models import (
     Actor,
@@ -14,9 +12,8 @@ from coregulation_poc.models import (
     CoregulationState,
     EvidenceModality,
     EvidenceReference,
-    EvidenceSufficiency,
-    InterventionDecision,
     InterventionAction,
+    InterventionDecision,
     InterventionDecisionReason,
     RecoveryStatus,
     StateAssessment,
@@ -136,20 +133,35 @@ class FakeTextChatProvider:
         return _Result
 
 
+class SequenceTextChatProvider(FakeTextChatProvider):
+    """Return one configured response per rewrite attempt."""
+
+    def __init__(self, *responses: str) -> None:
+        super().__init__()
+        self.responses = list(responses)
+
+    def generate(self, prompt: str) -> object:
+        response_index = min(self.call_count, len(self.responses) - 1)
+        self.response_text = self.responses[response_index]
+        return super().generate(prompt)
+
+
 def _llm_json(
     *,
     strategy_id: str = "PARENT_TONE_AND_PACE",
     target_actor: str = "parent",
     evidence_ids: list[str] | None = None,
-    observation_clause: str = "刚才语速比较快",
+    message: str = "家长，孩子刚才还在思考，可以先放慢语速，只问一个问题。",
 ) -> str:
     """Build a valid JSON LLM response for tests."""
-    return json.dumps({
-        "strategy_id": strategy_id,
-        "target_actor": target_actor,
-        "evidence_ids": evidence_ids or ["evidence_0"],
-        "observation_clause": observation_clause,
-    })
+    return json.dumps(
+        {
+            "strategy_id": strategy_id,
+            "target_actor": target_actor,
+            "evidence_ids": evidence_ids or ["evidence_0"],
+            "message": message,
+        }
+    )
 
 
 class FailingTextChatProvider:
@@ -195,6 +207,7 @@ class TestMessagePrompt:
         assert "90" in prompt
         assert "2" in prompt
         assert "答案是" in prompt
+        assert "不得编造题目内容" in prompt
 
     def test_prompt_contains_evidence_quote(self) -> None:
         library = load_strategy_library()
@@ -268,14 +281,16 @@ class TestSelectorWithGenerator:
 
         assert result.plan is not None
         assert result.plan.message_source is MessageSource.CONSTRAINED_LLM
-        assert "刚才语速比较快" in result.plan.message
-        assert "可以先放慢语速" in result.plan.message
+        assert result.plan.message == "家长，孩子刚才还在思考，可以先放慢语速，只问一个问题。"
         assert all(result.plan.validation_checks.values())
         assert provider.call_count == 1
 
-    def test_llm_too_long_falls_back(self) -> None:
-        long_clause = "这是一个非常非常非常非常非常非常非常非常非常长的观察描述超过三十个字"
-        provider = FakeTextChatProvider(_llm_json(observation_clause=long_clause))
+    def test_invalid_first_draft_is_rewritten_contextually(self) -> None:
+        long_message = "这是一段超过安全长度限制的情境化提示" * 10
+        provider = SequenceTextChatProvider(
+            _llm_json(message=long_message),
+            _llm_json(message="家长，先放慢一点，让孩子说完这一小步。"),
+        )
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -286,11 +301,13 @@ class TestSelectorWithGenerator:
         )
 
         assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
+        assert result.plan.message_source is MessageSource.CONSTRAINED_LLM
         assert all(result.plan.validation_checks.values())
+        assert result.plan.validation_checks["contextual_rewrite_completed"] is True
+        assert provider.call_count == 2
 
     def test_llm_with_banned_phrase_falls_back(self) -> None:
-        provider = FakeTextChatProvider(_llm_json(observation_clause="答案是三"))
+        provider = FakeTextChatProvider(_llm_json(message="答案是三"))
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -300,12 +317,12 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
+        assert result.plan is None
+        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
     def test_llm_too_many_sentences_falls_back(self) -> None:
         clause = "刚才语速很快。孩子跟不上了。需要调整。"
-        provider = FakeTextChatProvider(_llm_json(observation_clause=clause))
+        provider = FakeTextChatProvider(_llm_json(message=clause))
         selector = _selector(_generator(provider))
         observation = _observation()
         decision = _decision()
@@ -315,8 +332,8 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
+        assert result.plan is None
+        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
     def test_llm_empty_response_falls_back(self) -> None:
         provider = FakeTextChatProvider("")
@@ -329,8 +346,8 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
+        assert result.plan is None
+        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
     def test_provider_connection_error_falls_back(self) -> None:
         provider = FailingTextChatProvider()
@@ -343,9 +360,8 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-        assert all(result.plan.validation_checks.values())
+        assert result.plan is None
+        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
     def test_provider_value_error_falls_back(self) -> None:
         provider = FailingTextChatProvider(ValueError("malformed response"))
@@ -358,8 +374,8 @@ class TestSelectorWithGenerator:
             decision=decision,
         )
 
-        assert result.plan is not None
-        assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
+        assert result.plan is None
+        assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
     def test_llm_receives_prompt_with_card_and_evidence(self) -> None:
         provider = FakeTextChatProvider(_llm_json())
@@ -392,11 +408,10 @@ class TestSelectorWithGenerator:
         assert "strategy_id_matches" in checks
         assert "target_actor_matches" in checks
         assert "evidence_ids_valid" in checks
-        assert "observation_within_limit" in checks
+        assert "message_non_empty" in checks
         assert "within_character_limit" in checks
         assert "within_sentence_limit" in checks
         assert "contains_no_banned_phrase" in checks
         assert "contains_no_answer" in checks
         assert "contains_no_blame_command" in checks
-        assert "action_clause_unchanged" in checks
         assert "target_actor_explicit" in checks

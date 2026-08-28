@@ -54,6 +54,9 @@ class InterventionDecisionReason(StrEnum):
     LOW_CONFIDENCE = "low_confidence"
     WAITING_FOR_NATURAL_TURN_BOUNDARY = "waiting_for_natural_turn_boundary"
     WAITING_FOR_POST_INTERVENTION_RESPONSE = "waiting_for_post_intervention_response"
+    SAME_EPISODE_OBSERVATION_PERIOD = "same_episode_observation_period"
+    SAME_EPISODE_NO_ESCALATION = "same_episode_no_escalation"
+    SAME_EPISODE_INTERVENTION_LIMIT = "same_episode_intervention_limit"
     HISTORY_REQUIRED = "history_required"
     SUPPORT_NEED_NOT_IDENTIFIED = "support_need_not_identified"
     SUPPORT_TARGET_UNIDENTIFIED = "support_target_unidentified"
@@ -320,20 +323,11 @@ class StateAssessment(BaseModel):
         if self.alternative_state is not None:
             if self.alternative_state is self.state:
                 raise ValueError("alternative_state must differ from state")
-            if self.ambiguity_reason is None or not self.ambiguity_reason.strip():
-                raise ValueError("alternative_state requires ambiguity_reason")
-        if self.confidence is not ConfidenceLevel.HIGH:
-            if self.ambiguity_reason is None or not self.ambiguity_reason.strip():
-                raise ValueError("low or medium confidence requires ambiguity_reason")
-        if self.support_target is Actor.PARENT:
-            if not any(item.actor is Actor.PARENT for item in self.modality_evidence.all_items):
-                raise ValueError("support_target=parent requires parent evidence")
-        if self.support_target is Actor.CHILD:
-            if not any(item.actor is Actor.CHILD for item in self.modality_evidence.all_items):
-                raise ValueError("support_target=child requires child evidence")
-        if self.support_need is SupportNeed.POSITIVE_REINFORCEMENT:
-            if self.state is not CoregulationState.NORMAL:
-                raise ValueError("positive_reinforcement is only allowed in normal state")
+        # Auxiliary interpretation fields are intentionally not hard validity
+        # gates.  The runtime normalises missing ambiguity text, unsupported
+        # actor labels and state-incompatible support labels before the
+        # assessment reaches the controller.  A minor model formatting or
+        # attribution error must not discard an otherwise usable state result.
         return self
 
 

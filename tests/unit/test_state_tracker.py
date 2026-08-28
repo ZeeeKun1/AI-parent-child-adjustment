@@ -6,14 +6,11 @@ from coregulation_poc.control.intervention_policy import load_intervention_polic
 from coregulation_poc.control.state_tracker import StateTrajectoryController
 from coregulation_poc.models import (
     ControlObservation,
-    InteractionTrajectory,
+    CoregulationState,
     InterventionAction,
     InterventionDecisionReason,
-    Interruptibility,
     RecoveryStatus,
     StateAssessment,
-    SupportNeed,
-    TaskProcess,
 )
 
 
@@ -151,7 +148,7 @@ def _controller() -> StateTrajectoryController:
 @pytest.mark.parametrize(
     ("state", "expected_action", "expected_reason"),
     [
-        ("normal", InterventionAction.HOLD, "waiting_for_natural_turn_boundary"),
+        ("normal", InterventionAction.NO_INTERVENTION, "normal_coordination"),
         ("fluctuation", InterventionAction.NO_INTERVENTION, "self_recovery_possible"),
     ],
 )
@@ -167,7 +164,7 @@ def test_normal_and_fluctuation_do_not_intervene(
     assert decision.intervention_permitted is False
 
 
-def test_positive_maintenance_waits_for_boundary_and_does_not_repeat() -> None:
+def test_normal_state_never_triggers_positive_maintenance() -> None:
     controller = _controller()
 
     waiting = controller.ingest(
@@ -196,12 +193,12 @@ def test_positive_maintenance_waits_for_boundary_and_does_not_repeat() -> None:
         )
     )
 
-    assert waiting.action is InterventionAction.HOLD
-    assert reinforced.action is InterventionAction.REINFORCE
+    assert waiting.action is InterventionAction.NO_INTERVENTION
+    assert reinforced.action is InterventionAction.NO_INTERVENTION
     assert repeated.action is InterventionAction.NO_INTERVENTION
 
 
-def test_self_recovery_from_fluctuation_can_be_reinforced() -> None:
+def test_self_recovery_from_fluctuation_remains_non_intervention() -> None:
     controller = _controller()
     controller.ingest(_observation("fluctuation", 1000, boundary=False))
 
@@ -209,24 +206,17 @@ def test_self_recovery_from_fluctuation_can_be_reinforced() -> None:
         _observation("normal", 2000, boundary=True, trajectory="recovering")
     )
 
-    assert decision.action is InterventionAction.REINFORCE
-    assert decision.reason_code is (
-        InterventionDecisionReason.POSITIVE_MAINTENANCE_OPPORTUNITY
-    )
+    assert decision.action is InterventionAction.NO_INTERVENTION
+    assert decision.reason_code is InterventionDecisionReason.NORMAL_COORDINATION
 
 
-def test_dysregulation_waits_for_natural_turn_boundary() -> None:
+def test_dysregulation_is_authorized_without_waiting_for_turn_boundary() -> None:
     controller = _controller()
 
     waiting = controller.ingest(_observation("dysregulation", 1000, boundary=False))
-    intervention = controller.ingest(_observation("dysregulation", 2000, boundary=True))
-
-    assert waiting.action is InterventionAction.HOLD
-    assert waiting.reason_code is (
-        InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY
-    )
-    assert intervention.action is InterventionAction.INTERVENE
-    assert intervention.strategy_selection_required is True
+    assert waiting.action is InterventionAction.INTERVENE
+    assert waiting.reason_code is InterventionDecisionReason.DYAD_CANNOT_SELF_RECOVER
+    assert waiting.strategy_selection_required is True
     assert controller.awaiting_post_intervention_response is True
 
 
@@ -241,7 +231,7 @@ def test_controller_waits_for_response_then_records_recovery() -> None:
 
     assert waiting.action is InterventionAction.HOLD
     assert waiting.recovery_status is RecoveryStatus.PENDING
-    assert recovered.action is InterventionAction.HOLD
+    assert recovered.action is InterventionAction.NO_INTERVENTION
     assert recovered.recovery_status is RecoveryStatus.RECOVERED
     assert controller.awaiting_post_intervention_response is False
 
@@ -279,24 +269,127 @@ def test_trajectory_rejects_session_or_time_discontinuity() -> None:
     controller.ingest(_observation("normal", 2000, boundary=False))
 
     with pytest.raises(ValueError, match="same session_id"):
-        controller.ingest(
-            _observation("normal", 3000, boundary=False, session_id="another")
-        )
+        controller.ingest(_observation("normal", 3000, boundary=False, session_id="another"))
     with pytest.raises(ValueError, match="non-decreasing"):
         controller.ingest(_observation("normal", 1000, boundary=False))
+
 
 def test_post_intervention_response_timeout() -> None:
     controller = _controller()
     controller.ingest(_observation("dysregulation", 1000, boundary=True))
 
-    waiting_1 = controller.ingest(_observation("dysregulation", 2000, boundary=True))
-    assert waiting_1.action is InterventionAction.HOLD
-    assert waiting_1.recovery_status is RecoveryStatus.PENDING
+    waiting = None
+    for index in range(1, 12):
+        waiting = controller.ingest(
+            _observation("dysregulation", 1000 + index * 1000, boundary=True)
+        )
+        assert waiting.action is InterventionAction.HOLD
+        assert waiting.recovery_status is RecoveryStatus.PENDING
 
-    waiting_2 = controller.ingest(_observation("dysregulation", 3000, boundary=True))
-    assert waiting_2.action is InterventionAction.HOLD
-    assert waiting_2.recovery_status is RecoveryStatus.PENDING
-
-    timeout_decision = controller.ingest(_observation("dysregulation", 4000, boundary=True))
+    timeout_decision = controller.ingest(
+        _observation("dysregulation", 13_000, boundary=True)
+    )
     assert timeout_decision.recovery_status is RecoveryStatus.TIMEOUT
-    assert timeout_decision.action is InterventionAction.INTERVENE
+    assert timeout_decision.action is InterventionAction.HOLD
+    assert timeout_decision.reason_code is (
+        InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+    )
+
+
+def test_same_episode_waits_120_seconds_and_requires_worsening() -> None:
+    controller = _controller()
+    first = controller.ingest(_observation("dysregulation", 0, boundary=True))
+    assert first.action is InterventionAction.INTERVENE
+
+    cooldown = controller.ingest(
+        _observation(
+            "dysregulation",
+            10_000,
+            boundary=True,
+            response_observed=True,
+        )
+    )
+    unchanged = controller.ingest(
+        _observation("dysregulation", 120_000, boundary=True)
+    )
+    escalated = controller.ingest(
+        _observation(
+            "dysregulation",
+            130_000,
+            boundary=True,
+            trajectory="worsening",
+        )
+    )
+
+    assert cooldown.reason_code is InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+    assert unchanged.reason_code is InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION
+    assert escalated.action is InterventionAction.INTERVENE
+
+
+def test_same_episode_wait_starts_when_intervention_is_delivered() -> None:
+    controller = _controller()
+    first = controller.ingest(_observation("dysregulation", 0, boundary=True))
+    assert first.action is InterventionAction.INTERVENE
+
+    # The model and message pipeline take 20 seconds before the browser confirms
+    # that the intervention is visible. The family must still receive a complete
+    # 120-second observation period after that confirmation.
+    controller.mark_intervention_delivered(
+        CoregulationState.DYSREGULATION,
+        delivered_at_ms=20_000,
+    )
+    still_waiting = controller.ingest(
+        _observation(
+            "dysregulation",
+            120_000,
+            boundary=True,
+            response_observed=True,
+            trajectory="worsening",
+        )
+    )
+    ready = controller.ingest(
+        _observation(
+            "dysregulation",
+            140_000,
+            boundary=True,
+            trajectory="worsening",
+        )
+    )
+
+    assert still_waiting.reason_code is (
+        InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+    )
+    assert ready.action is InterventionAction.INTERVENE
+
+
+def test_same_episode_allows_at_most_two_interventions() -> None:
+    controller = _controller()
+    controller.ingest(_observation("dysregulation", 0, boundary=True))
+    controller.ingest(
+        _observation(
+            "dysregulation",
+            10_000,
+            boundary=True,
+            response_observed=True,
+        )
+    )
+    controller.ingest(
+        _observation(
+            "dysregulation",
+            130_000,
+            boundary=True,
+            trajectory="worsening",
+        )
+    )
+    limited = controller.ingest(
+        _observation(
+            "high_risk",
+            140_000,
+            boundary=True,
+            response_observed=True,
+            history_available=True,
+        )
+    )
+
+    assert limited.action is InterventionAction.HOLD
+    assert limited.reason_code is InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT

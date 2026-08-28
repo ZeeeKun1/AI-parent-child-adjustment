@@ -10,13 +10,8 @@ from coregulation_poc.delivery import DeliveryRuntimeContext, load_delivery_poli
 from coregulation_poc.intervention import load_strategy_library
 from coregulation_poc.models import (
     Actor,
-    EvidenceSufficiency,
-    InteractionTrajectory,
-    Interruptibility,
     RecoveryStatus,
     StateAssessment,
-    SupportNeed,
-    TaskProcess,
 )
 
 # 100 ms @ 16 kHz, s16, mono = 1600 samples = 3200 bytes
@@ -198,7 +193,7 @@ def test_dysregulation_delivers_intervention() -> None:
     assert result.natural_turn_boundary is True
 
 
-def test_no_turn_boundary_holds_intervention() -> None:
+def test_no_turn_boundary_does_not_block_actionable_intervention() -> None:
     coordinator = _coordinator()
     # Feed loud audio so no turn boundary is detected
     loud_pcm = (5000).to_bytes(2, "little", signed=True) * 1600
@@ -221,8 +216,8 @@ def test_no_turn_boundary_holds_intervention() -> None:
     )
 
     assert result.natural_turn_boundary is False
-    assert result.decision.reason_code.value == "waiting_for_natural_turn_boundary"
-    assert result.outcome is CoordinatorCycleOutcome.NO_INTERVENTION
+    assert result.decision.reason_code.value == "dyad_cannot_self_recover"
+    assert result.outcome is CoordinatorCycleOutcome.INTERVENTION_DELIVERED
 
 
 def test_post_intervention_recovery_observed_leads_to_new_decision() -> None:
@@ -282,12 +277,12 @@ def test_post_intervention_non_recovery_selects_different_strategy() -> None:
             state="dysregulation",
             performance="pace conflict",
             actor="parent",
-            assessed_at_ms=2000,
+            assessed_at_ms=121_000,
             support_need="task_pacing",
             task_process="pace_mismatch",
         ),
         interaction_history_available=False,
-        delivery_runtime=_runtime(prepared_at_ms=2000),
+        delivery_runtime=_runtime(prepared_at_ms=121_000),
     )
 
     assert second.post_intervention_response_observed is True
@@ -356,12 +351,12 @@ def test_interventions_paused_holds_delivery_and_preserves_previous_plan() -> No
             state="dysregulation",
             performance="pace conflict",
             actor="parent",
-            assessed_at_ms=2000,
+            assessed_at_ms=121_000,
             support_need="task_pacing",
             task_process="pace_mismatch",
         ),
         interaction_history_available=False,
-        delivery_runtime=_runtime(prepared_at_ms=2000, interventions_paused=True),
+        delivery_runtime=_runtime(prepared_at_ms=121_000, interventions_paused=True),
     )
 
     assert second.outcome is CoordinatorCycleOutcome.INTERVENTION_HELD
@@ -455,7 +450,7 @@ def test_ingest_audio_chunk_returns_boundary_state() -> None:
     coordinator = _coordinator()
     assert coordinator.at_turn_boundary is False
 
-    for i in range(4):
+    for _ in range(4):
         assert coordinator.ingest_audio_chunk(_SILENT_PCM) is False
     assert coordinator.ingest_audio_chunk(_SILENT_PCM) is True
     assert coordinator.at_turn_boundary is True

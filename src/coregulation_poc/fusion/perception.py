@@ -48,8 +48,7 @@ def build_perception_prompt(
             "speaker=parent or speaker=child in speech_turns. The binding is "
             "probabilistic; if the content clearly contradicts the binding for a "
             "specific utterance, use speaker=unknown and note the discrepancy in "
-            "the text field.\n\n"
-            + speaker_binding_description
+            "the text field.\n\n" + speaker_binding_description
         )
     else:
         speaker_instruction = (
@@ -93,13 +92,8 @@ def build_perception_prompt(
             ),
             speaker_instruction,
             f"The pseudonymous session_id is {session_id}.",
-            (
-                f"This observation window covers session time "
-                f"{window_start_ms}-{window_end_ms} ms."
-            ),
-            (
-                f"Images are sampled chronologically about every {image_interval_ms} ms."
-            ),
+            (f"This observation window covers session time {window_start_ms}-{window_end_ms} ms."),
+            (f"Images are sampled chronologically about every {image_interval_ms} ms."),
             (
                 "Each image includes a frame_time_ms label. Audio timestamps are "
                 "approximate offsets from the beginning of the clip in milliseconds."
@@ -144,6 +138,26 @@ def parse_perception_report(response_text: str) -> PerceptionReport:
         The accumulated text response from the multimodal model.
     """
     payload = _find_json_object(response_text)
+    # Empty ASR turns and empty visual descriptions occasionally appear in
+    # otherwise useful multimodal responses.  They carry no observable
+    # evidence, so drop only those entries instead of rejecting the complete
+    # 10-second window.
+    speech_turns = payload.get("speech_turns")
+    if isinstance(speech_turns, list):
+        payload["speech_turns"] = [
+            turn
+            for turn in speech_turns
+            if isinstance(turn, dict) and isinstance(turn.get("text"), str) and turn["text"].strip()
+        ]
+    visual_observations = payload.get("visual_observations")
+    if isinstance(visual_observations, list):
+        payload["visual_observations"] = [
+            observation
+            for observation in visual_observations
+            if isinstance(observation, dict)
+            and isinstance(observation.get("description"), str)
+            and observation["description"].strip()
+        ]
     try:
         return PerceptionReport.model_validate(payload)
     except ValidationError as exc:

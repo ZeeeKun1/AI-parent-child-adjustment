@@ -17,6 +17,7 @@ from coregulation_poc.models import (
     InterventionDecision,
     InterventionDecisionReason,
     RecoveryStatus,
+    StateAssessment,
     StateTrajectoryPoint,
     StateTrajectorySnapshot,
     SupportNeed,
@@ -41,6 +42,10 @@ class StateTrajectoryController:
         self._pending_intervention_state: CoregulationState | None = None
         self._post_intervention_wait_count: int = 0
         self._reinforced_positive_performances: set[str] = set()
+        self._episode_active = False
+        self._episode_interventions: list[
+            tuple[int, CoregulationState, SupportNeed | None, Actor, frozenset[str]]
+        ] = []
 
     @property
     def session_id(self) -> str | None:
@@ -57,9 +62,18 @@ class StateTrajectoryController:
             raise ValueError("there is no pending intervention delivery to release")
         self._pending_intervention_state = None
         self._post_intervention_wait_count = 0
+        if self._episode_interventions:
+            self._episode_interventions.pop()
+        if not self._episode_interventions:
+            self._episode_active = False
 
-    def mark_intervention_delivered(self, state: CoregulationState) -> None:
-        """Arm response observation when a previously queued plan is delivered."""
+    def mark_intervention_delivered(
+        self,
+        state: CoregulationState,
+        *,
+        delivered_at_ms: int | None = None,
+    ) -> None:
+        """Confirm delivery and start episode timing from the actual delivery time."""
 
         if state not in {
             CoregulationState.NORMAL,
@@ -67,10 +81,35 @@ class StateTrajectoryController:
             CoregulationState.HIGH_RISK,
         }:
             raise ValueError("delivered intervention state is not actionable")
-        if self._pending_intervention_state is not None:
-            raise ValueError("an intervention response is already pending")
-        self._pending_intervention_state = state
+        if self._pending_intervention_state is None:
+            self._pending_intervention_state = state
+        elif self._pending_intervention_state is not state:
+            raise ValueError("delivered intervention state does not match the pending state")
         self._post_intervention_wait_count = 0
+        if delivered_at_ms is None:
+            return
+        if isinstance(delivered_at_ms, bool) or delivered_at_ms < 0:
+            raise ValueError("delivered_at_ms must be a non-negative integer")
+        if state not in {
+            CoregulationState.DYSREGULATION,
+            CoregulationState.HIGH_RISK,
+        }:
+            return
+        if not self._episode_interventions:
+            raise ValueError("delivered intervention has no episode record")
+
+        assessed_at_ms, recorded_state, need, target, performances = (
+            self._episode_interventions[-1]
+        )
+        if recorded_state is not state:
+            raise ValueError("delivered intervention does not match the latest episode record")
+        self._episode_interventions[-1] = (
+            max(assessed_at_ms, delivered_at_ms),
+            recorded_state,
+            need,
+            target,
+            performances,
+        )
 
     def ingest(
         self,
@@ -98,6 +137,12 @@ class StateTrajectoryController:
             interaction_performance=assessment.interaction_performance,
         )
         self._points.append(point)
+
+        # BoundaryStateTracker emits NORMAL only after confirmed stable recovery.
+        # A provisional recovery is FLUCTUATION and intentionally keeps the same
+        # episode open.
+        if assessment.state is CoregulationState.NORMAL:
+            self._reset_episode()
 
         recovery_status = self._recovery_status(observation)
         if self.awaiting_post_intervention_response:
@@ -142,11 +187,13 @@ class StateTrajectoryController:
                 recovery_status=recovery_status,
             )
 
-        positive_performances = self._positive_maintenance_performances(
-            observation=observation,
-            previous_state=previous_state,
-            recovery_status=recovery_status,
-        )
+        positive_performances = set()
+        if self.policy.principles.positive_maintenance_enabled:
+            positive_performances = self._positive_maintenance_performances(
+                observation=observation,
+                previous_state=previous_state,
+                recovery_status=recovery_status,
+            )
         if positive_performances:
             rule = self.policy.positive_maintenance
             if assessment.interruptibility is not Interruptibility.NATURAL_PAUSE:
@@ -177,30 +224,6 @@ class StateTrajectoryController:
 
         rule = self.policy.state_actions[assessment.state]
 
-        if assessment.state is CoregulationState.DYSREGULATION:
-            if assessment.support_need is None or assessment.support_need in (
-                SupportNeed.NONE,
-                SupportNeed.UNCLEAR,
-            ):
-                return self._record_guard_decision(
-                    observation=observation,
-                    previous_state=previous_state,
-                    sequence=sequence,
-                    reason=InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
-                    recovery_status=recovery_status,
-                )
-            if (
-                not defer_delivery_timing
-                and assessment.interruptibility is not Interruptibility.NATURAL_PAUSE
-            ):
-                return self._record_guard_decision(
-                    observation=observation,
-                    previous_state=previous_state,
-                    sequence=sequence,
-                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
-                    recovery_status=recovery_status,
-                )
-
         if rule.history_required and not observation.interaction_history_available:
             return self._record_guard_decision(
                 observation=observation,
@@ -209,30 +232,19 @@ class StateTrajectoryController:
                 reason=InterventionDecisionReason.HISTORY_REQUIRED,
                 recovery_status=recovery_status,
             )
-        if assessment.state is CoregulationState.HIGH_RISK:
-            if (
-                not defer_delivery_timing
-                and assessment.interruptibility is not Interruptibility.NATURAL_PAUSE
-            ):
+        if assessment.state in {
+            CoregulationState.DYSREGULATION,
+            CoregulationState.HIGH_RISK,
+        }:
+            episode_guard = self._same_episode_guard(assessment)
+            if episode_guard is not None:
                 return self._record_guard_decision(
                     observation=observation,
                     previous_state=previous_state,
                     sequence=sequence,
-                    reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
+                    reason=episode_guard,
                     recovery_status=recovery_status,
                 )
-        if (
-            rule.requires_natural_turn_boundary
-            and not defer_delivery_timing
-            and not observation.natural_turn_boundary
-        ):
-            return self._record_guard_decision(
-                observation=observation,
-                previous_state=previous_state,
-                sequence=sequence,
-                reason=InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
-                recovery_status=recovery_status,
-            )
         return self._record_state_decision(
             observation=observation,
             previous_state=previous_state,
@@ -273,6 +285,55 @@ class StateTrajectoryController:
             candidates |= explicit
 
         return candidates - self._reinforced_positive_performances
+
+    def _same_episode_guard(
+        self,
+        assessment: StateAssessment,
+    ) -> InterventionDecisionReason | None:
+        """Suppress repeated prompts within one unresolved dysregulation episode."""
+
+        if not self._episode_active or not self._episode_interventions:
+            return None
+        if (
+            len(self._episode_interventions)
+            >= self.policy.principles.max_interventions_per_episode
+        ):
+            return InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT
+        # High-risk episodes bypass the ordinary observation wait. They remain
+        # subject to the per-episode intervention cap above.
+        if assessment.state is CoregulationState.HIGH_RISK:
+            return None
+
+        last_time, last_state, last_need, last_target, last_performances = (
+            self._episode_interventions[-1]
+        )
+        state_escalated = STATE_RANK[assessment.state] > STATE_RANK[last_state]
+        if not state_escalated:
+            elapsed_ms = max(0, assessment.assessed_at_ms - last_time)
+            if elapsed_ms < self.policy.principles.same_episode_observation_ms:
+                return InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD
+
+        meaningful_need = assessment.support_need not in {
+            None,
+            SupportNeed.NONE,
+            SupportNeed.UNCLEAR,
+        }
+        need_changed = meaningful_need and assessment.support_need is not last_need
+        target_changed = assessment.support_target is not last_target
+        new_performance = bool(
+            set(assessment.interaction_performance) - set(last_performances)
+        )
+        worsened = (
+            state_escalated
+            or assessment.trajectory is InteractionTrajectory.WORSENING
+        )
+        if not (worsened or need_changed or target_changed or new_performance):
+            return InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION
+        return None
+
+    def _reset_episode(self) -> None:
+        self._episode_active = False
+        self._episode_interventions.clear()
 
     def snapshot(self) -> StateTrajectorySnapshot:
         if self._session_id is None:
@@ -358,6 +419,21 @@ class StateTrajectoryController:
         }:
             self._pending_intervention_state = decision.current_state
             self._post_intervention_wait_count = 0
+            if decision.current_state in {
+                CoregulationState.DYSREGULATION,
+                CoregulationState.HIGH_RISK,
+            }:
+                assessment = observation.assessment
+                self._episode_active = True
+                self._episode_interventions.append(
+                    (
+                        assessment.assessed_at_ms,
+                        decision.current_state,
+                        assessment.support_need,
+                        assessment.support_target,
+                        frozenset(assessment.interaction_performance),
+                    )
+                )
         return decision
 
     def _record_decision(

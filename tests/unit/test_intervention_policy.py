@@ -25,6 +25,8 @@ def test_policy_preserves_research_boundaries() -> None:
     assert policy.principles.use_data_derived_operational_thresholds is True
     assert policy.principles.require_corroborating_signal_for_dysregulation is True
     assert policy.principles.use_single_signal_as_trigger is False
-    assert policy.principles.require_natural_turn_boundary_for_intervention is True
+    assert policy.principles.require_natural_turn_boundary_for_intervention is False
+    assert policy.principles.retain_authorized_intervention_until_safe_boundary is False
+    assert policy.principles.positive_maintenance_enabled is False
     assert policy.principles.require_post_intervention_response_before_repeat is True
     assert policy.state_actions[CoregulationState.HIGH_RISK].history_required is True

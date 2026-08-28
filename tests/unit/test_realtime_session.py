@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from coregulation_poc.capture.media import MediaChunk, MediaKind
 from coregulation_poc.models import CoregulationState, StateAssessment
@@ -50,11 +51,28 @@ def _assessment(
                     }
                 ],
             },
-            "video": {
-                "sufficiency": "insufficient",
-                "items": [],
-                "limitation_reason": "The relevant behavior is outside the frame.",
-            },
+            "video": (
+                {
+                    "sufficiency": "sufficient",
+                    "items": [
+                        {
+                            "modality": "video",
+                            "actor": "child",
+                            "start_ms": assessed_at_ms,
+                            "end_ms": assessed_at_ms,
+                            "frame_timestamp_ms": assessed_at_ms,
+                            "code": "child disengagement",
+                            "observation": "The child withdraws while the parent keeps pressing.",
+                        }
+                    ],
+                }
+                if is_dysregulated
+                else {
+                    "sufficiency": "insufficient",
+                    "items": [],
+                    "limitation_reason": "The relevant behavior is outside the frame.",
+                }
+            ),
         },
         previous_state=previous_state,
         trajectory="stable",
@@ -65,9 +83,9 @@ def _assessment(
         boundary_signals={
             "task_stall_observed": is_dysregulated,
             "parental_prompt_count": 1 if is_dysregulated else 0,
-            "conflict_action_observed": False,
-            "child_disengaged_observed": False,
-            "regulation_balance": "one_stable" if is_dysregulated else "both_stable",
+            "conflict_action_observed": is_dysregulated,
+            "child_disengaged_observed": is_dysregulated,
+            "regulation_balance": "both_crossed" if is_dysregulated else "both_stable",
         },
         reason="The multimodal sequence supports this state.",
     )
@@ -90,7 +108,7 @@ class _SequenceRecognizer:
         assert history_available is bool(history)
         self.calls += 1
         self.api_call_count += 1
-        if self.calls <= 3:
+        if self.calls == 1:
             return _assessment(
                 session_id=session_id,
                 assessed_at_ms=window.end_ms,
@@ -159,6 +177,82 @@ class _PersistentActiveSpeechRecognizer:
         )
 
 
+class _BlockingDysregulationRecognizer:
+    """Let media advance while one actionable judgment is still in flight."""
+
+    def __init__(self) -> None:
+        self.api_call_count = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def assess(
+        self,
+        *,
+        session_id: str,
+        window: MediaWindow,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
+        history_available: bool,
+    ) -> StateAssessment:
+        del history, history_available
+        self.api_call_count += 1
+        self.started.set()
+        await self.release.wait()
+        return _assessment(
+            session_id=session_id,
+            assessed_at_ms=window.end_ms,
+            state="dysregulation",
+            performance="pace conflict",
+            actor="parent",
+            previous_state=previous_state,
+        )
+
+
+class _SlowStagedRecognizer:
+    def __init__(self) -> None:
+        self.api_call_count = 0
+        self.release = asyncio.Event()
+        self.observed_windows: list[int] = []
+        self.judged_windows: list[int] = []
+        self.history_lengths: list[int] = []
+
+    async def observe(self, *, session_id: str, window: MediaWindow) -> object:
+        del session_id
+        self.observed_windows.append(window.end_ms)
+        await self.release.wait()
+        self.api_call_count += 1
+        return SimpleNamespace(
+            window=window,
+            speaker_binding=None,
+            acoustic_features=None,
+        )
+
+    async def judge(
+        self,
+        *,
+        observation: object,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
+        history_available: bool,
+    ) -> StateAssessment:
+        assert history_available is bool(history)
+        window = observation.window
+        self.judged_windows.append(window.end_ms)
+        self.history_lengths.append(len(history))
+        self.api_call_count += 1
+        return _assessment(
+            session_id="no-loss-test",
+            assessed_at_ms=window.end_ms,
+            state="normal",
+            performance="steady coordination",
+            actor="both",
+            previous_state=previous_state,
+        )
+
+    async def assess(self, **_: object) -> StateAssessment:
+        raise AssertionError("staged recognition should use observe then judge")
+
+
 def _audio(timestamp_ms: int) -> MediaChunk:
     return MediaChunk(MediaKind.AUDIO, timestamp_ms, b"\x00\x00" * 1600)
 
@@ -168,27 +262,25 @@ def _image(timestamp_ms: int) -> MediaChunk:
 
 
 async def _reach_confirmed_dysregulation(session: RealtimeSession) -> None:
-    """Feed three complete valid windows to satisfy the 30-second boundary."""
+    """Feed one model-evidenced actionable dysregulation window."""
 
-    for index in range(3):
-        await session.accept_chunk(_audio(index * 10_000 + (1 if index else 0)))
-        await session.accept_chunk(_image((index + 1) * 10_000))
-        await session.analyze_now()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    await session.analyze_now()
 
 
-def test_confirmed_intervention_is_queued_until_live_audio_boundary() -> None:
+def test_confirmed_intervention_is_immediate_during_active_speech() -> None:
     asyncio.run(_exercise_queued_intervention())
 
 
 async def _exercise_queued_intervention() -> None:
     events: list[dict[str, object]] = []
-    safe_boundary = False
 
     async def send_event(event: dict[str, object]) -> None:
         events.append(event)
 
     def boundary_detector(_: MediaWindow) -> bool:
-        return safe_boundary
+        return False
 
     session = RealtimeSession(
         session_id="queued_intervention_test",
@@ -203,25 +295,14 @@ async def _exercise_queued_intervention() -> None:
     await session.start()
     await _reach_confirmed_dysregulation(session)
 
-    assert session.runtime_metrics["intervention_queued"] is True
-    assert not any(event["type"] == "intervention" for event in events)
-    assert any(
-        event["type"] == "intervention_held" and event.get("queued") is True
-        for event in events
-    )
-    assert session.controller.awaiting_post_intervention_response is False
-
-    safe_boundary = True
-    await session.accept_chunk(_audio(30_001))
-
     intervention = next(event for event in events if event["type"] == "intervention")
     assert intervention["strategy_id"] == "PARENT_TONE_AND_PACE"
     assert session.runtime_metrics["intervention_queued"] is False
     assert session.controller.awaiting_post_intervention_response is True
-    assert any(event["type"] == "intervention_queue_released" for event in events)
+    assert not any(event["type"] == "intervention_queue_released" for event in events)
 
 
-def test_queued_intervention_is_cancelled_when_dyad_recovers() -> None:
+def test_actionable_intervention_is_not_lost_when_boundary_is_false() -> None:
     asyncio.run(_exercise_queue_cancelled_on_recovery())
 
 
@@ -243,15 +324,50 @@ async def _exercise_queue_cancelled_on_recovery() -> None:
     )
     await session.start()
     await _reach_confirmed_dysregulation(session)
-    assert session.runtime_metrics["intervention_queued"] is True
-
-    await session.accept_chunk(_audio(30_001))
-    await session.accept_chunk(_image(40_000))
-    await session.analyze_now()
-
     assert session.runtime_metrics["intervention_queued"] is False
-    assert not any(event["type"] == "intervention" for event in events)
-    assert any(event["type"] == "intervention_queue_cancelled" for event in events)
+    assert any(event["type"] == "intervention" for event in events)
+    assert not any(event["type"] == "intervention_queue_cancelled" for event in events)
+
+
+def test_model_latency_alone_does_not_cancel_an_actionable_intervention() -> None:
+    asyncio.run(_exercise_latency_without_superseding_judgment())
+
+
+async def _exercise_latency_without_superseding_judgment() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    recognizer = _BlockingDysregulationRecognizer()
+    session = RealtimeSession(
+        session_id="latency-not-loss-test",
+        recognizer=recognizer,
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            window_duration_ms=10_000,
+            assessment_interval_ms=10_000,
+            max_assessments_per_session=1,
+            max_intervention_staleness_ms=20_000,
+        ),
+    )
+    await session.start()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    await recognizer.started.wait()
+
+    # Capture keeps moving while the model is slow, but no newer judgment has
+    # superseded the actionable result.
+    await session.accept_chunk(_audio(40_000))
+    await session.accept_chunk(_image(40_001))
+    recognizer.release.set()
+    await session.wait_for_analysis()
+
+    assert any(event["type"] == "intervention" for event in events)
+    assert not any(
+        event.get("reason") == "superseded_stale_assessment" for event in events
+    )
+    await session.stop("completed")
 
 
 def test_rolling_window_is_bounded_and_keeps_both_modalities() -> None:
@@ -265,6 +381,54 @@ def test_rolling_window_is_bounded_and_keeps_both_modalities() -> None:
     assert snapshot is not None
     assert [chunk.timestamp_ms for chunk in snapshot.chunks] == [1_000, 4_000]
     assert snapshot.has_both_modalities is True
+
+
+def test_due_windows_are_not_lost_while_perception_is_slow() -> None:
+    asyncio.run(_exercise_no_loss_staged_pipeline())
+
+
+async def _exercise_no_loss_staged_pipeline() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    recognizer = _SlowStagedRecognizer()
+    session = RealtimeSession(
+        session_id="no-loss-test",
+        recognizer=recognizer,
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            window_duration_ms=10_000,
+            assessment_interval_ms=10_000,
+            max_parallel_perception=3,
+        ),
+    )
+    await session.start()
+
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    await session.accept_chunk(_audio(10_001))
+    await session.accept_chunk(_image(20_000))
+    await session.accept_chunk(_audio(20_001))
+    await session.accept_chunk(_image(30_000))
+    await asyncio.sleep(0)
+
+    assert session.runtime_metrics["scheduled_assessment_count"] == 3
+    assert session.assessment_count == 0
+
+    recognizer.release.set()
+    await session.wait_for_analysis()
+
+    assert recognizer.observed_windows == [10_000, 20_000, 30_000]
+    assert sorted(recognizer.judged_windows) == [10_000, 20_000, 30_000]
+    # Judgment calls can overlap; final boundary application remains chronological.
+    assert len(recognizer.history_lengths) == 3
+    assert recognizer.history_lengths[0] == 0
+    assert all(length <= index for index, length in enumerate(recognizer.history_lengths))
+    assert session.assessment_count == 3
+    assert len([event for event in events if event["type"] == "state_update"]) == 3
+    await session.stop("completed")
 
 
 def test_session_runs_four_modules_and_observes_post_intervention_response() -> None:
@@ -313,26 +477,31 @@ async def _exercise_four_module_loop() -> None:
     )
     assert handled is True
     assert session.window.snapshot() is None
+    assert session.delivery_reports[-1]["delivery_timeline_ms"] == 30_200
+    delivery_receipt = next(
+        event for event in events if event["type"] == "delivery_execution_received"
+    )
+    assert delivery_receipt["delivery_timeline_ms"] == 30_200
 
     await session.accept_chunk(_audio(41_300))
     await session.accept_chunk(_image(41_301))
     await session.analyze_now()
 
     updates = [event for event in events if event["type"] == "state_update"]
-    assert updates[-1]["state"] == "normal"
+    assert updates[-1]["state"] == "fluctuation"
     assert updates[-1]["model_state"] == "normal"
-    assert updates[-1]["boundary_rule_applied"] is False
+    assert updates[-1]["boundary_rule_applied"] is True
     assert "boundary_signals" in updates[-1]
-    assert updates[-1]["recovery_status"] == "recovered"
+    assert updates[-1]["recovery_status"] == "partial_recovery"
     assert updates[-1]["post_intervention_response_observed"] is True
     assert session.controller.awaiting_post_intervention_response is False
-    assert session.api_call_count == 4
+    assert session.api_call_count == 2
     assert len(session.intervention_outcomes) == 1
     outcome = session.intervention_outcomes[0]
     assert outcome["strategy_id"] == "PARENT_TONE_AND_PACE"
-    assert outcome["recovery_status"] == "recovered"
-    assert outcome["effect_category"] == "positive"
-    assert outcome["observed_interaction_performance"] == ["steady coordination"]
+    assert outcome["recovery_status"] == "partial_recovery"
+    assert outcome["effect_category"] == "limited"
+    assert outcome["observed_interaction_performance"] == ["brief task stall"]
     assert any(event["type"] == "intervention_outcome" for event in events)
 
 
@@ -394,9 +563,7 @@ async def _exercise_pause_and_resume() -> None:
         turn_boundary_detector=lambda _: True,
     )
     await session.start()
-    assert await session.handle_control(
-        {"type": "pause_interventions", "recorded_at_ms": 10}
-    )
+    assert await session.handle_control({"type": "pause_interventions", "recorded_at_ms": 10})
     await _reach_confirmed_dysregulation(session)
 
     assert session.runtime_metrics["interventions_paused"] is True
@@ -404,15 +571,13 @@ async def _exercise_pause_and_resume() -> None:
     assert any(event["type"] == "intervention_held" for event in events)
     assert session.controller.awaiting_post_intervention_response is False
 
-    assert await session.handle_control(
-        {"type": "resume_interventions", "recorded_at_ms": 200}
-    )
+    assert await session.handle_control({"type": "resume_interventions", "recorded_at_ms": 200})
     assert session.runtime_metrics["interventions_paused"] is False
     assert any(event["type"] == "interventions_paused" for event in events)
     assert any(event["type"] == "interventions_resumed" for event in events)
 
 
-def test_held_actor_routing_releases_response_guard() -> None:
+def test_both_actor_routing_uses_safe_dyadic_card() -> None:
     asyncio.run(_exercise_held_actor_routing())
 
 
@@ -432,10 +597,10 @@ async def _exercise_held_actor_routing() -> None:
     await session.start()
     await _reach_confirmed_dysregulation(session)
 
-    assert not any(event["type"] == "intervention" for event in events)
-    held = next(event for event in events if event["type"] == "intervention_held")
-    assert held["reason"] == "target_actor_evidence_insufficient"
-    assert session.controller.awaiting_post_intervention_response is False
+    intervention = next(event for event in events if event["type"] == "intervention")
+    assert intervention["target_actor"] == "both"
+    assert intervention["strategy_id"] == "DYAD_RELATIONSHIP_RESET"
+    assert session.controller.awaiting_post_intervention_response is True
 
 
 def test_expert_takeover_uses_approved_strategy_and_records_family_response() -> None:

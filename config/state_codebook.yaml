@@ -1,4 +1,4 @@
-version: 4
+version: 6
 source: "Formative study: 63 WOZ intervention episodes and expert interviews"
 
 classification_principles:
@@ -18,11 +18,18 @@ operational_boundary:
   fluctuation_stagnation_minimum_ms: 10000
   dysregulation_stagnation_minimum_ms: 30000
   spontaneous_recovery_window_ms: 30000
+  trajectory_window_ms: 60000
+  recovery_confirmation_ms: 20000
   uncertain_evidence_retention_ms: 30000
   parental_prompt_rate_window_ms: 60000
+  parental_prompt_rate_minimum_observation_ms: 30000
   high_parental_prompt_rate_per_minute_exclusive: 4.0
+  required_disruption_window_count: 3
+  required_consecutive_disruption_window_count: 2
   required_corroborating_signal_count: 1
   model_dysregulation_requires_operational_confirmation: true
+  allow_immediate_dysregulation_for_marked_current_evidence: true
+  marked_current_evidence_requires_independent_corroboration: true
   coordination_disruption_task_processes:
     - "sustained_stall"
     - "pace_mismatch"
@@ -43,14 +50,20 @@ operational_boundary:
     - "both_crossed"
   guidance: >-
     Ten to 30 seconds of observed coordination disruption supports fluctuation.
-    Disruption includes task stagnation and the expert-coded dysregulation patterns
-    of sustained pace conflict, misaligned understanding, escalating negative
-    interaction, or child disengagement. At least 30 seconds of valid observed
-    disruption supports dysregulation only when self-recovery is not observed and
-    at least one corroborating signal is present. An uncertain window neither adds
-    duration nor erases prior valid evidence; the unresolved candidate expires after
-    the existing 30-second recovery window. Effective task progress together with
-    restored dyadic balance ends the episode. Absolute sound-pressure, numeric
+    Within a rolling 60-second trajectory, dysregulation requires at least three
+    disrupted windows, including at least two consecutive windows, at least 30 seconds
+    of disruption, and at least one independent corroborating signal. The disrupted
+    task trajectory is one dimension; high parental prompting, child disengagement,
+    conflict action, or both actors crossing their regulation boundary supplies a
+    second dimension. Gaze aversion, silence, compliance, or one transcribed word cannot independently
+    establish dysregulation. Marked current evidence can support immediate
+    dysregulation only when it is repeated, cross-actor, or independently corroborated
+    across modalities. One stable window moves an active dysregulation episode into
+    provisional fluctuation; at least 20 seconds of effective progress with restored
+    dyadic balance confirms normal recovery and clears the episode. An uncertain
+    window neither adds duration nor erases prior valid evidence; the unresolved
+    candidate expires after the existing 30-second uncertainty window. Absolute
+    sound-pressure, numeric
     pose-angle, and numeric gaze thresholds are deferred until the live measurement
     pipeline uses the same calibrated measurement protocol as the source data.
 
@@ -96,8 +109,8 @@ states:
     label: "Fluctuation"
     definition: >-
       Coordination becomes temporarily uneven during a 10-to-30-second task stall,
-      but at least one participant remains stable and the dyad retains the capacity
-      to recover without intervention.
+      but the sequence contains observable evidence of recovery capacity. Continued
+      compliance or looking at the task alone does not establish recovery.
     interaction_performance:
       - "brief task stall"
       - "child comprehension difficulty"
@@ -108,12 +121,13 @@ states:
   dysregulation:
     label: "Dysregulation"
     definition: >-
-      Coordination disruption has persisted for at least 30 seconds without
-      spontaneous recovery. The disruption may be a sustained task stall or a
-      repeated pace, understanding, engagement, or escalating-interaction problem,
-      and the sequence contains corroborating evidence such as high-rate parental
-      prompting, child disengagement, conflict action, or both participants crossing
-      the regulation boundary.
+      Coordination disruption is sustained or repeatedly returns within the recent
+      trajectory without confirmed recovery. The disruption must be supported by
+      evidence from more than one dimension, such as parental pressure together with
+      child withdrawal, task stoppage together with an unresolved understanding
+      mismatch, or a marked conflict with an observable counterpart response. A child
+      may still answer or comply while the dyad is dysregulated, but passive compliance
+      alone is not evidence of dysregulation.
     interaction_performance:
       - "sustained task stall"
       - "pace conflict"

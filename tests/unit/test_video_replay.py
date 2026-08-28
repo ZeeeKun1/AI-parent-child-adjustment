@@ -84,7 +84,7 @@ def test_dry_run_writes_traceable_artifacts_without_api(tmp_path: Path) -> None:
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
     assert valid is True
     assert manifest["source"]["filename"] == "synthetic.mkv"
-    assert manifest["research_basis"]["codebook_version"] == 4
+    assert manifest["research_basis"]["codebook_version"] == 6
     assert manifest["research_basis"]["acoustic_analysis_version"] == 1
     assert manifest["media"]["image_timestamp_labels"] is True
     assert acoustics["quality"] == "insufficient"

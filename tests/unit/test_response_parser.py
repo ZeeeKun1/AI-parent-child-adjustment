@@ -3,6 +3,7 @@ import pytest
 from coregulation_poc.codebook import load_state_codebook
 from coregulation_poc.fusion.response_parser import (
     RealtimeResponseAccumulator,
+    constrain_assessment_evidence_to_window,
     validate_assessment_context,
 )
 from coregulation_poc.models import CoregulationState
@@ -52,6 +53,39 @@ def test_accumulator_rejects_unstructured_response() -> None:
 
     with pytest.raises(ValueError, match="did not contain"):
         accumulator.parse_assessment()
+
+
+def test_context_validation_normalises_session_id_from_runtime() -> None:
+    accumulator = RealtimeResponseAccumulator()
+    accumulator.add(
+        {
+            "type": "response.text.delta",
+            "delta": (
+                '{"session_id":"model-copy-error","assessed_at_ms":12000,'
+                '"state":"fluctuation","previous_state":null,"trajectory":"stable",'
+                '"evidence_sufficiency":"sufficient","confidence":"medium",'
+                '"alternative_state":"normal","ambiguity_reason":"Boundary uncertain",'
+                '"interaction_performance":["brief task stall"],'
+                '"task_process":"brief_stall","support_need":"none",'
+                '"support_target":"unknown","interruptibility":"natural_pause",'
+                '"modality_evidence":{"audio":{"sufficiency":"sufficient","items":'
+                '[{"modality":"audio","actor":"unknown","start_ms":5000,'
+                '"end_ms":7000,"code":"brief task stall","observation":"Brief stall",'
+                '"quote":"three"}]},"video":{"sufficiency":"insufficient","items":[],'
+                '"limitation_reason":"Not visible"}},"reason":"Brief fluctuation"}'
+            ),
+        }
+    )
+
+    validated = validate_assessment_context(
+        accumulator.parse_assessment(),
+        expected_session_id="S01",
+        duration_ms=12_000,
+        codebook=load_state_codebook(),
+    )
+
+    assert validated.session_id == "S01"
+    assert "normalised_session_id_to_runtime" in validated.limitations
 
 
 def test_accumulator_surfaces_transcription_failure_for_audit() -> None:
@@ -121,3 +155,41 @@ def test_context_validation_rejects_evidence_outside_clip() -> None:
             duration_ms=12_000,
             codebook=load_state_codebook(),
         )
+
+
+def test_small_evidence_timestamp_drift_is_clamped_without_losing_window() -> None:
+    accumulator = RealtimeResponseAccumulator()
+    accumulator.add(
+        {
+            "type": "response.text.delta",
+            "delta": (
+                '{"session_id":"S01","assessed_at_ms":12000,"state":"normal",'
+                '"previous_state":null,"trajectory":"stable",'
+                '"evidence_sufficiency":"sufficient","confidence":"high",'
+                '"interaction_performance":["normal task progression"],'
+                '"task_process":"smooth_progress","support_need":"none",'
+                '"support_target":"unknown","interruptibility":"natural_pause",'
+                '"modality_evidence":{"audio":{"sufficiency":"sufficient","items":'
+                '[{"modality":"audio","actor":"unknown","start_ms":11000,'
+                '"end_ms":12020,"code":"task_talk","observation":"Task talk",'
+                '"quote":"four"}]},"video":{"sufficiency":"insufficient","items":[],'
+                '"limitation_reason":"Not visible"}},"reason":"Normal progression"}'
+            ),
+        }
+    )
+
+    constrained = constrain_assessment_evidence_to_window(
+        accumulator.parse_assessment(),
+        window_start_ms=2_000,
+        window_end_ms=12_000,
+    )
+
+    assert constrained.state is CoregulationState.NORMAL
+    assert constrained.modality_evidence.audio.items[0].end_ms == 12_000
+    assert "clamped_audio_evidence_to_window" in constrained.limitations
+    validate_assessment_context(
+        constrained,
+        expected_session_id="S01",
+        duration_ms=12_000,
+        codebook=load_state_codebook(),
+    )

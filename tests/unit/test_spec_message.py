@@ -1,9 +1,11 @@
-"""Tests 22-27: Constrained message generation and fallback.
+"""Tests 22-27: Constrained contextual message generation.
 
 Verifies that the LLM-generated observation clause is validated against
-strategy card constraints, and that any violation causes the system to
-fall back to the approved template rather than using the LLM output.
+strategy-card constraints. Invalid drafts are never delivered and repeated
+generation failure holds the intervention instead of silently substituting a
+generic template.
 """
+
 from __future__ import annotations
 
 import json
@@ -11,10 +13,8 @@ from typing import Any
 
 from coregulation_poc.control import StateTrajectoryController, load_intervention_policy
 from coregulation_poc.intervention import StrategySelector, load_strategy_library
-from coregulation_poc.intervention.message_prompt import LLMMessageResult
-from coregulation_poc.intervention.models import MessageSource
+from coregulation_poc.intervention.models import StrategyHoldReason
 from coregulation_poc.models import (
-    Actor,
     ControlObservation,
     StateAssessment,
 )
@@ -95,14 +95,14 @@ def _make_llm_json(
     strategy_id: str = "PARENT_PACE_RESET",
     target_actor: str = "parent",
     evidence_ids: list[str] | None = None,
-    observation_clause: str = "孩子刚才还在思考",
+    message: str = "家长，孩子刚才还在思考，可以先放慢一点，只问一个问题。",
 ) -> str:
     return json.dumps(
         {
             "strategy_id": strategy_id,
             "target_actor": target_actor,
             "evidence_ids": evidence_ids if evidence_ids is not None else ["evidence_0"],
-            "observation_clause": observation_clause,
+            "message": message,
         },
         ensure_ascii=False,
     )
@@ -130,83 +130,55 @@ def _run_selection(selector: StrategySelector):
     )
 
 
-# Test 22: LLM output contains an answer indicator -> fallback to template
-def test_llm_output_with_answer_falls_back_to_template() -> None:
-    mock = _MockLLMProvider(
-        _make_llm_json(observation_clause="答案是三所以不用再想了")
-    )
+# Test 22: LLM output contains an answer indicator -> hold after rewrite failure
+def test_llm_output_with_answer_is_not_delivered() -> None:
+    mock = _MockLLMProvider(_make_llm_json(message="答案是三所以不用再想了"))
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
 
-# Test 23: LLM output contains blame/command indicator -> fallback to template
-def test_llm_output_with_blame_falls_back_to_template() -> None:
-    mock = _MockLLMProvider(
-        _make_llm_json(observation_clause="你必须停下来听孩子说")
-    )
+# Test 23: LLM output contains blame/command indicator -> do not deliver
+def test_llm_output_with_blame_is_not_delivered() -> None:
+    mock = _MockLLMProvider(_make_llm_json(message="你必须停下来听孩子说"))
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
 
-# Test 24: LLM returns target_actor that does not match the card -> fallback
-def test_llm_actor_mismatch_falls_back_to_template() -> None:
-    mock = _MockLLMProvider(
-        _make_llm_json(target_actor="child")
-    )
+# Test 24: LLM returns target_actor that does not match the card -> do not deliver
+def test_llm_actor_mismatch_is_not_delivered() -> None:
+    mock = _MockLLMProvider(_make_llm_json(target_actor="child"))
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
 
-# Test 25: LLM returns strategy_id that does not match the card -> fallback
-def test_llm_strategy_id_mismatch_falls_back_to_template() -> None:
-    mock = _MockLLMProvider(
-        _make_llm_json(strategy_id="CHILD_PACE_RESET")
-    )
+# Test 25: LLM returns strategy_id that does not match the card -> do not deliver
+def test_llm_strategy_id_mismatch_is_not_delivered() -> None:
+    mock = _MockLLMProvider(_make_llm_json(strategy_id="CHILD_PACE_RESET"))
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
 
-# Test 26: LLM references non-existent evidence -> fallback
-def test_llm_invalid_evidence_id_falls_back_to_template() -> None:
-    mock = _MockLLMProvider(
-        _make_llm_json(evidence_ids=["evidence_99"])
-    )
+# Test 26: LLM references non-existent evidence -> do not deliver
+def test_llm_invalid_evidence_id_is_not_delivered() -> None:
+    mock = _MockLLMProvider(_make_llm_json(evidence_ids=["evidence_99"]))
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED
 
 
-# Test 27: LLM call fails entirely -> fallback to template
-def test_llm_failure_falls_back_to_template() -> None:
+# Test 27: LLM call fails entirely -> hold instead of generic template
+def test_llm_failure_holds_intervention() -> None:
     mock = _MockLLMProvider(raise_error=True)
     result = _run_selection(_selector_with_mock(mock))
 
-    assert result.plan is not None
-    assert result.plan.message_source is MessageSource.APPROVED_TEMPLATE_FALLBACK
-    card = load_strategy_library().cards
-    expected = next(c for c in card if c.strategy_id == "PARENT_PACE_RESET")
-    assert result.plan.message == expected.approved_template
+    assert result.plan is None
+    assert result.hold_reason is StrategyHoldReason.MESSAGE_GENERATION_FAILED

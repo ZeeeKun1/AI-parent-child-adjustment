@@ -1,14 +1,8 @@
-"""Prompt construction for LLM-based intervention message generation.
+"""Prompt construction for contextual intervention message generation.
 
-The LLM generates only an ``observation_clause`` -- a short situational
-description of what was observed in the current evidence.  The code then
-assembles the final message by combining:
-
-    [address_word], [observation_clause], [approved_action_clause]
-
-The ``approved_action_clause`` comes directly from the strategy card and
-cannot be modified by the LLM.  This keeps the strategy intent fixed while
-allowing the observation to adapt to the current context.
+The selected strategy card defines the approved intent, target and safety
+boundary.  The LLM writes the complete message for the current interaction;
+the reviewed template is used only when generation is unavailable or unsafe.
 
 The LLM must output JSON:
 
@@ -16,7 +10,7 @@ The LLM must output JSON:
       "strategy_id": "<selected strategy ID>",
       "target_actor": "<parent/child/both>",
       "evidence_ids": ["<evidence ID>"],
-      "observation_clause": "<<= 30 char situational description>"
+      "message": "<complete contextual intervention message>"
     }
 """
 
@@ -40,7 +34,7 @@ class LLMMessageResult(BaseModel):
     strategy_id: str = Field(min_length=1)
     target_actor: str = Field(min_length=1)
     evidence_ids: list[str] = Field(default_factory=list)
-    observation_clause: str = Field(min_length=1)
+    message: str = Field(min_length=1)
 
 
 def _actor_label(target_actor: str) -> str:
@@ -62,12 +56,13 @@ def build_message_prompt(
     task_context: dict[str, Any] | None = None,
     previous_state: str | None = None,
     recovery_status: str | None = None,
+    previous_draft: str | None = None,
+    failed_checks: list[str] | None = None,
 ) -> str:
-    """Build the prompt that asks the LLM to generate an observation clause.
+    """Build the prompt that asks the LLM for one complete contextual message.
 
-    The LLM receives the strategy card's identity, target actor, and fixed
-    action clause so it knows what to describe.  It must NOT change the
-    action clause -- it only generates the observation.
+    The card's approved action clause is an intent and safety anchor rather
+    than a sentence that must be copied verbatim.
 
     Parameters
     ----------
@@ -76,9 +71,9 @@ def build_message_prompt(
     evidence:
         Evidence references from the current assessment.
     max_characters:
-        Hard character limit for the *assembled* message.
+        Hard character limit for the complete message.
     max_sentences:
-        Hard sentence limit for the *assembled* message.
+        Hard sentence limit for the complete message.
     banned_phrases:
         Phrases that must not appear in the output.
     task_context:
@@ -118,43 +113,62 @@ def build_message_prompt(
     context_block = "\n".join(context_lines) if context_lines else "（无额外上下文）"
 
     banned_str = "、".join(banned_phrases)
+    repair_lines: list[str] = []
+    if previous_draft is not None:
+        repair_lines = [
+            "",
+            "上一版话术没有通过程序校验，请改写而不是照抄：",
+            previous_draft,
+            "未通过项目：" + "、".join(failed_checks or ["格式或安全约束"]),
+            "保留当前情境和策略意图，只修正上述问题。",
+        ]
 
-    return "\n".join([
-        "你是一个亲子作业辅导干预系统的话术生成模块。",
-        "你的任务是根据当前观察到的证据，生成一句简短的情境观察描述（observation_clause）。",
-        "你不需要生成建议动作，建议动作由系统固定提供。",
-        "",
-        "当前策略信息：",
-        f"- 策略ID：{card.strategy_id}",
-        f"- 干预对象：{card.target_actor.value}（{actor_label}）",
-        f"- 固定建议动作：{card.approved_action_clause}",
-        "",
-        "当前观察到的互动证据：",
-        evidence_block,
-        "",
-        "会话上下文：",
-        context_block,
-        "",
-        "请输出JSON格式（不要输出JSON以外的任何内容）：",
-        "{",
-        '  "strategy_id": "<策略ID>",',
-        '  "target_actor": "<parent/child/both>",',
-        '  "evidence_ids": ["<证据ID>"],',
-        '  "observation_clause": "<不超过30字的情境描述>"',
-        "}",
-        "",
-        "硬性约束（违反则话术作废）：",
-        f"1. observation_clause 不超过30个字",
-        f"2. 最终话术（地址词+观察描述+建议动作）不超过{max_characters}个字符",
-        f"3. 最终话术不超过{max_sentences}句话",
-        f"4. 不得包含以下短语：{banned_str}",
-        '5. 不得直接给出答案（如"答案是"等）',
-        "6. 不得使用责备、命令或诊断性语气",
-        "7. observation_clause 只描述观察到的情境，不要包含建议动作",
-        "8. evidence_ids 必须来自上方列出的证据ID",
-        "9. strategy_id 必须与当前策略ID一致",
-        "10. target_actor 必须与当前干预对象一致",
-    ])
+    return "\n".join(
+        [
+            "你是一个亲子作业辅导干预系统的话术生成模块。",
+            "你的任务是结合当前互动情境与已选策略，生成可以直接呈现给家庭的完整中文话术。",
+            "策略卡限定干预意图和安全边界，但不要机械照抄模板；请针对当前证据自然表达。",
+            "",
+            "当前策略信息：",
+            f"- 策略ID：{card.strategy_id}",
+            f"- 干预对象：{card.target_actor.value}（{actor_label}）",
+            f"- 必须保持的策略意图：{card.action}",
+            f"- 经审核的表达参考：{card.approved_action_clause}",
+            f"- 适用情境：{'；'.join(card.use_when)}",
+            f"- 避免情境：{'；'.join(card.avoid_when)}",
+            "",
+            "当前观察到的互动证据：",
+            evidence_block,
+            "",
+            "会话上下文：",
+            context_block,
+            "",
+            "请输出JSON格式（不要输出JSON以外的任何内容）：",
+            "{",
+            '  "strategy_id": "<策略ID>",',
+            '  "target_actor": "<parent/child/both>",',
+            '  "evidence_ids": ["<证据ID>"],',
+            '  "message": "<可直接呈现的完整情境化话术>"',
+            "}",
+            "",
+            "硬性约束（违反则话术作废）：",
+            f"1. 完整话术不超过{max_characters}个字符",
+            f"2. 完整话术不超过{max_sentences}句话",
+            f"3. 不得包含以下短语：{banned_str}",
+            '4. 不得直接给出作业答案（如"答案是"等）',
+            "5. 不得责备、贴标签、诊断或使用强迫命令语气",
+            "6. 必须同时体现当前情境和策略意图，不能只复述观察，也不能只给通用建议",
+            "7. 可以改写审核参考，不要求逐字复制，但不能改变策略的主要行动方向",
+            "8. evidence_ids 必须来自上方列出的证据ID",
+            "9. strategy_id 必须与当前策略ID一致",
+            "10. target_actor 必须与当前干预对象一致",
+            (
+                "11. 不得编造题目内容、学科材料或具体操作方法；只有任务上下文或证据"
+                "明确出现时才能提及。上下文不足时使用不依赖学科的情境化表达"
+            ),
+        ]
+        + repair_lines
+    )
 
 
 def parse_llm_response(text: str) -> LLMMessageResult:

@@ -38,50 +38,42 @@ from coregulation_poc.models import (
 
 logger = logging.getLogger(__name__)
 
-_ADDRESS_WORD: dict[str, str] = {
-    "parent": "家长",
-    "child": "小朋友",
-    "both": "你们",
-}
+
+class ContextualMessageGenerationError(RuntimeError):
+    """Raised when two contextual generation attempts cannot produce a safe message."""
 
 _ANSWER_INDICATORS: list[str] = [
-    "答案是", "答案为", "正确答案", "答案：", "答案:",
+    "答案是",
+    "答案为",
+    "正确答案",
+    "答案：",
+    "答案:",
 ]
 
 _BLAME_COMMAND_INDICATORS: list[str] = [
-    "你必须", "你应该", "你需要", "你错了", "家长错了",
-    "你应该反思", "你必须道歉", "赶紧", "马上", "立刻",
-    "诊断为", "多动症", "自闭症",
+    "你必须",
+    "你应该",
+    "你需要",
+    "你错了",
+    "家长错了",
+    "你应该反思",
+    "你必须道歉",
+    "赶紧",
+    "马上",
+    "立刻",
+    "诊断为",
+    "多动症",
+    "自闭症",
 ]
-
-_OBSERVATION_MAX_LENGTH = 30
-
-# Strategy families that directly address task progress and therefore
-# require a matching task_process.  When task_process is None or unclear,
-# candidates from these families are removed to prevent selecting a
-# task-specific strategy without task evidence.
-_TASK_DEPENDENT_FAMILIES: frozenset[str] = frozenset({
-    "task_pacing",
-    "learning_support",
-    "autonomy_support",
-})
 
 
 class StrategySelector:
     """Select one approved card after module two authorizes intervention.
 
-    Exact rules remain the first path. If their soft fields do not produce a
-    card, an optional LLM may choose among a bounded set of cards that already
-    satisfy hard state, target, evidence and non-repetition constraints.
-
-    1. Collect all routing rules matching state + interaction_performance.
-    2. Merge all candidate strategy IDs.
-    3. Filter by ``support_need``.
-    4. Filter by ``task_process`` (skip when None or unclear).
-    5. Filter by ``support_target`` → ``target_actor`` mapping.
-    6. Verify evidence exists for the support target.
-    7. Exclude the previously used strategy.
-    8. Select by ``priority`` (lower value = higher priority).
+    State authorization and an explicit target are hard constraints.  The
+    observed performance, support need, task process and recent strategy are
+    soft ranking dimensions.  Therefore an actionable state always receives
+    the closest approved card even when one auxiliary label is absent.
     """
 
     def __init__(
@@ -119,32 +111,47 @@ class StrategySelector:
 
         routed = self._route(assessment, decision)
         if routed is None:
-            return self._held(StrategyHoldReason.NO_ROUTED_STRATEGY)
-        performance, candidate_ids, selection_reason = routed
+            performance = "; ".join(assessment.interaction_performance) or assessment.state.value
+            candidate_ids: list[str] = []
+        else:
+            performance, candidate_ids, _ = routed
         evidence = assessment.modality_evidence.all_items
-        if not self._support_target_has_evidence(assessment.support_target, evidence):
-            return self._held(StrategyHoldReason.TARGET_ACTOR_EVIDENCE_INSUFFICIENT)
 
-        selection_source = StrategySelectionSource.EXACT_RULE
-        semantic_confidence: ConfidenceLevel | None = None
-        semantic_relaxed_dimensions: list[str] = []
-        selection_checks: dict[str, bool] = {}
+        semantic_candidates = self._semantic_candidates(
+            routed_candidate_ids=candidate_ids,
+            assessment=assessment,
+            previous_plan=previous_plan,
+        )
+        if not semantic_candidates:
+            return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_NO_MATCH)
+
         card = self._select_best_card(
-            candidate_ids,
+            [item.strategy_id for item in semantic_candidates],
             assessment=assessment,
             previous_plan=previous_plan,
             difficulty_feedback_boost=difficulty_feedback_boost,
+            routed_candidate_ids=candidate_ids,
         )
         if card is None:
-            if self.strategy_choice_generator is None:
-                return self._held(StrategyHoldReason.TARGET_ACTOR_EVIDENCE_INSUFFICIENT)
-            semantic_candidates = self._semantic_candidates(
-                routed_candidate_ids=candidate_ids,
-                assessment=assessment,
-                previous_plan=previous_plan,
-            )
-            if not semantic_candidates:
-                return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_NO_MATCH)
+            return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_NO_MATCH)
+
+        selection_source = StrategySelectionSource.EXACT_RULE
+        semantic_confidence: ConfidenceLevel | None = None
+        semantic_relaxed_dimensions = self._relaxed_dimensions(
+            card=card,
+            routed_candidate_ids=candidate_ids,
+            assessment=assessment,
+        )
+        selection_reason = (
+            "状态授权后，在同状态、同对象的批准策略卡中，依据互动表现、"
+            "支持需要与任务过程进行相似度排序。"
+        )
+        selection_checks: dict[str, bool] = {
+            "strategy_from_approved_library": True,
+            "strategy_state_authorized": assessment.state in card.states,
+            "strategy_target_explicit": card.target_actor is not Actor.UNKNOWN,
+        }
+        if self.strategy_choice_generator is not None and len(semantic_candidates) > 1:
             try:
                 choice = self.strategy_choice_generator.generate(
                     assessment=assessment,
@@ -153,39 +160,52 @@ class StrategySelector:
                 )
             except Exception:
                 logger.warning("bounded strategy selection failed", exc_info=True)
-                return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_UNAVAILABLE)
-            if choice.strategy_id is None:
-                return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_NO_MATCH)
-            candidate_map = {item.strategy_id: item for item in semantic_candidates}
-            card = candidate_map.get(choice.strategy_id)
-            if card is None or choice.confidence is ConfidenceLevel.LOW:
-                return self._held(StrategyHoldReason.SEMANTIC_SELECTOR_REJECTED)
+                selection_source = StrategySelectionSource.DETERMINISTIC_FALLBACK
+            else:
+                candidate_map = {item.strategy_id: item for item in semantic_candidates}
+                llm_card = candidate_map.get(choice.strategy_id)
+                if llm_card is not None and choice.confidence is not ConfidenceLevel.LOW:
+                    card = llm_card
+                    semantic_relaxed_dimensions = self._relaxed_dimensions(
+                        card=card,
+                        routed_candidate_ids=candidate_ids,
+                        assessment=assessment,
+                    )
+                    selection_source = StrategySelectionSource.BOUNDED_LLM
+                    semantic_confidence = choice.confidence
+                    selection_reason = (
+                        "状态和对象由规则限定；大模型从批准策略卡中选择与当前情境"
+                        f"最接近的 {card.strategy_id}：{choice.reason}"
+                    )
+                    selection_checks = self._semantic_selection_checks(
+                        choice=choice,
+                        card=card,
+                        candidates=semantic_candidates,
+                        assessment=assessment,
+                        evidence=evidence,
+                    )
+                else:
+                    selection_source = StrategySelectionSource.DETERMINISTIC_FALLBACK
+                    selection_reason += " 语义选择不确定，采用程序计算的最接近卡片。"
 
-            semantic_relaxed_dimensions = self._relaxed_dimensions(
-                card=card,
-                routed_candidate_ids=candidate_ids,
-                assessment=assessment,
+        try:
+            message, message_source, message_checks = self._resolve_message(
+                card,
+                assessment,
+                evidence,
+                task_context=task_context,
+                previous_state=(
+                    decision.previous_state.value if decision.previous_state else None
+                ),
+                recovery_status=decision.recovery_status.value,
             )
-            selection_source = StrategySelectionSource.BOUNDED_LLM
-            semantic_confidence = choice.confidence
-            selection_reason = (
-                "规则已完成干预授权及状态、对象、证据硬约束校验；"
-                f"受限语义选择从批准卡片中选择 {card.strategy_id}：{choice.reason}"
+        except ContextualMessageGenerationError:
+            logger.warning(
+                "contextual message generation failed twice for %s",
+                card.strategy_id,
+                exc_info=True,
             )
-            selection_checks = self._semantic_selection_checks(
-                choice=choice,
-                card=card,
-                candidates=semantic_candidates,
-                assessment=assessment,
-                evidence=evidence,
-            )
-
-        message, message_source, message_checks = self._resolve_message(
-            card, assessment, evidence,
-            task_context=task_context,
-            previous_state=(decision.previous_state.value if decision.previous_state else None),
-            recovery_status=decision.recovery_status.value,
-        )
+            return self._held(StrategyHoldReason.MESSAGE_GENERATION_FAILED)
         checks = {**selection_checks, **message_checks}
         plan = InterventionPlan(
             session_id=assessment.session_id,
@@ -209,9 +229,7 @@ class StrategySelector:
             expected_recovery=card.expected_recovery,
             outcome_interpretation=self.library.outcome_mapping,
             validation_checks=checks,
-            previous_strategy_id=(
-                None if previous_plan is None else previous_plan.strategy_id
-            ),
+            previous_strategy_id=(None if previous_plan is None else previous_plan.strategy_id),
             progressive_support=decision.action is InterventionAction.PROGRESSIVE_SUPPORT,
             research_codes=card.research_codes,
             research_sources=self.library.source,
@@ -225,30 +243,27 @@ class StrategySelector:
         assessment: StateAssessment,
         previous_plan: InterventionPlan | None,
     ) -> list[StrategyCard]:
-        """Return approved cards satisfying every hard selection constraint."""
+        """Return approved same-state cards for the requested target.
+
+        Performance, support need and task process intentionally remain soft
+        dimensions.  Repetition is avoided when alternatives exist, but it is
+        not allowed to erase the only safe option.
+        """
 
         expected_actor = self._support_target_to_target_actor(assessment.support_target)
-        routed_ids = set(routed_candidate_ids)
-        need_value = assessment.support_need.value if assessment.support_need else None
-        process_value = assessment.task_process.value if assessment.task_process else None
         candidates: list[StrategyCard] = []
         for card in self.library.cards:
             if card.inactive or assessment.state not in card.states:
                 continue
             if card.target_actor is not expected_actor:
                 continue
-            if previous_plan is not None and card.strategy_id == previous_plan.strategy_id:
-                continue
-            semantic_anchor = any(
-                (
-                    card.strategy_id in routed_ids,
-                    need_value is not None and need_value in card.support_needs,
-                    process_value is not None and process_value in card.task_processes,
-                )
-            )
-            if not semantic_anchor:
-                continue
             candidates.append(card)
+        if previous_plan is not None and len(candidates) > 1:
+            without_previous = [
+                card for card in candidates if card.strategy_id != previous_plan.strategy_id
+            ]
+            if without_previous:
+                candidates = without_previous
         return sorted(candidates, key=lambda item: (item.priority, item.strategy_id))
 
     @staticmethod
@@ -287,15 +302,13 @@ class StrategySelector:
     ) -> dict[str, bool]:
         """Revalidate an LLM choice against program-controlled hard facts."""
 
-        expected_actor = self._support_target_to_target_actor(assessment.support_target)
         return {
             "semantic_strategy_from_approved_candidates": card.strategy_id
             in {item.strategy_id for item in candidates},
             "semantic_state_hard_constraint": assessment.state in card.states,
-            "semantic_target_hard_constraint": card.target_actor is expected_actor,
-            "semantic_evidence_hard_constraint": self._support_target_has_evidence(
-                assessment.support_target, evidence
-            ),
+            "semantic_target_hard_constraint": card.target_actor
+            is self._support_target_to_target_actor(assessment.support_target),
+            "semantic_evidence_traceable": bool(evidence),
             "semantic_confidence_accepted": choice.confidence
             in {ConfidenceLevel.HIGH, ConfidenceLevel.MEDIUM},
         }
@@ -347,10 +360,10 @@ class StrategySelector:
         assessment: StateAssessment,
         previous_plan: InterventionPlan | None,
         difficulty_feedback_boost: bool = False,
+        routed_candidate_ids: list[str] | None = None,
     ) -> StrategyCard | None:
-        """Apply the 8-step filtering pipeline to select the best card."""
+        """Rank approved cards without turning auxiliary fields into vetoes."""
 
-        # Steps 1-2: deduplicate and collect valid candidates
         candidates: list[StrategyCard] = []
         for strategy_id in dict.fromkeys(candidate_ids):
             card = self.cards.get(strategy_id)
@@ -363,69 +376,34 @@ class StrategySelector:
         if not candidates:
             return None
 
-        # Step 3: filter by support_need
-        if assessment.support_need is not None:
-            need_value = assessment.support_need.value
-            candidates = [
-                c for c in candidates if need_value in c.support_needs
-            ]
-
-        # Step 4: filter by task_process
-        if (
-            assessment.task_process is not None
-            and assessment.task_process is not TaskProcess.UNCLEAR
-        ):
-            process_value = assessment.task_process.value
-            candidates = [
-                c for c in candidates if process_value in c.task_processes
-            ]
-        else:
-            # task_process is None or unclear: exclude task-dependent
-            # strategy families (task_pacing, learning_support,
-            # autonomy_support) that require specific task evidence.
-            candidates = [
-                c for c in candidates
-                if c.strategy_family not in _TASK_DEPENDENT_FAMILIES
-            ]
-
-        # Step 5: filter by support_target → target_actor
         expected_actor = self._support_target_to_target_actor(assessment.support_target)
-        if expected_actor is not None:
-            candidates = [c for c in candidates if c.target_actor is expected_actor]
-
-        # If no cards match the target actor, hold (do not switch actors)
+        candidates = [c for c in candidates if c.target_actor is expected_actor]
         if not candidates:
             return None
 
-        # Step 6: verify evidence exists for the support target
-        evidence = assessment.modality_evidence.all_items
-        if not self._support_target_has_evidence(assessment.support_target, evidence):
-            return None
+        routed_ids = set(routed_candidate_ids or [])
+        need_value = assessment.support_need.value if assessment.support_need else None
+        process_value = assessment.task_process.value if assessment.task_process else None
+        boost_families = {"task_pacing", "learning_support"}
 
-        # Step 7: exclude previously used strategy
-        if previous_plan is not None:
-            candidates = [
-                c for c in candidates if c.strategy_id != previous_plan.strategy_id
-            ]
+        def ranking(card: StrategyCard) -> tuple[int, int, str]:
+            similarity = 0
+            if card.strategy_id in routed_ids:
+                similarity += 5
+            if need_value not in {None, "none", "unclear"} and need_value in card.support_needs:
+                similarity += 4
+            if (
+                process_value not in {None, TaskProcess.UNCLEAR.value}
+                and process_value in card.task_processes
+            ):
+                similarity += 3
+            if difficulty_feedback_boost and card.strategy_family in boost_families:
+                similarity += 2
+            if previous_plan is not None and card.strategy_id == previous_plan.strategy_id:
+                similarity -= 2
+            return (-similarity, card.priority, card.strategy_id)
 
-        if not candidates:
-            return None
-
-        # Step 8: select by priority (lower = higher priority).
-        # When difficulty_feedback_boost is active, give task_pacing and
-        # learning_support families a -1 priority bonus so they are
-        # preferred over equally-priority alternatives.
-        _BOOST_FAMILIES = frozenset({"task_pacing", "learning_support"})
-        if difficulty_feedback_boost:
-            candidates.sort(
-                key=lambda c: (
-                    c.priority - 1
-                    if c.strategy_family in _BOOST_FAMILIES
-                    else c.priority
-                )
-            )
-        else:
-            candidates.sort(key=lambda c: c.priority)
+        candidates.sort(key=ranking)
         return candidates[0]
 
     @staticmethod
@@ -479,42 +457,53 @@ class StrategySelector:
     ) -> tuple[str, MessageSource, dict[str, bool]]:
         """Resolve the intervention message.
 
-        When no generator is configured, returns the approved template.
-        When the LLM succeeds and passes all validation checks, returns
-        the assembled message (address + observation + action clause)
-        with source ``CONSTRAINED_LLM``.  When the LLM fails or
-        validation fails, falls back to the approved template as the
-        complete message with source ``APPROVED_TEMPLATE_FALLBACK``.
+        The LLM writes the complete contextual message while the selected card
+        fixes its target and strategy intent. A failed first draft is repaired
+        once with explicit validation feedback; production does not silently
+        replace it with a generic approved template.
         """
         if self.message_generator is None:
             message, checks = self._validated_template(card)
             return message, MessageSource.APPROVED_TEMPLATE, checks
 
-        try:
-            result = self.message_generator.generate(
-                card, evidence,
-                task_context=task_context,
-                previous_state=previous_state,
-                recovery_status=recovery_status,
-            )
-            checks = self._validate_llm_result(result, card, assessment, evidence)
-            if all(checks.values()):
-                message = self._assemble_message(result, card)
-                return message, MessageSource.CONSTRAINED_LLM, checks
-            logger.warning(
-                "LLM message for %s failed validation, falling back: %s",
-                card.strategy_id,
-                checks,
-            )
-        except Exception:
-            logger.warning(
-                "LLM message generation failed for %s, falling back to approved template",
-                card.strategy_id,
-                exc_info=True,
-            )
-
-        message, checks = self._validated_template(card)
-        return message, MessageSource.APPROVED_TEMPLATE_FALLBACK, checks
+        previous_result: LLMMessageResult | None = None
+        failed_checks: list[str] = []
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                result = self.message_generator.generate(
+                    card,
+                    evidence,
+                    task_context=task_context,
+                    previous_state=previous_state,
+                    recovery_status=recovery_status,
+                    previous_result=previous_result,
+                    failed_checks=failed_checks,
+                )
+                checks = self._validate_llm_result(result, card, assessment, evidence)
+                if all(checks.values()):
+                    message = self._assemble_message(result)
+                    if attempt:
+                        checks["contextual_rewrite_completed"] = True
+                    return message, MessageSource.CONSTRAINED_LLM, checks
+                previous_result = result
+                failed_checks = [name for name, passed in checks.items() if not passed]
+                logger.warning(
+                    "LLM message for %s failed validation; requesting rewrite: %s",
+                    card.strategy_id,
+                    failed_checks,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM message generation attempt %s failed for %s",
+                    attempt + 1,
+                    card.strategy_id,
+                    exc_info=True,
+                )
+        raise ContextualMessageGenerationError(
+            f"unable to generate a valid contextual message for {card.strategy_id}"
+        ) from last_error
 
     def _validate_llm_result(
         self,
@@ -524,7 +513,7 @@ class StrategySelector:
         evidence: list[EvidenceReference],
     ) -> dict[str, bool]:
         """Validate an LLM-generated structured result."""
-        assembled = self._assemble_message(result, card)
+        assembled = self._assemble_message(result)
         sentence_count = len(
             [part for part in re.split(r"(?<=[。！？!?])", assembled) if part.strip()]
         )
@@ -539,12 +528,9 @@ class StrategySelector:
         return {
             "strategy_id_matches": result.strategy_id == card.strategy_id,
             "target_actor_matches": result.target_actor == expected_actor_value,
-            "evidence_ids_valid": bool(result.evidence_ids) and all(
-                eid in valid_evidence_ids for eid in result.evidence_ids
-            ),
-            "observation_within_limit": (
-                len(result.observation_clause) <= _OBSERVATION_MAX_LENGTH
-            ),
+            "evidence_ids_valid": bool(result.evidence_ids)
+            and all(eid in valid_evidence_ids for eid in result.evidence_ids),
+            "message_non_empty": bool(assembled),
             "within_character_limit": (
                 len(assembled) <= self.library.principles.maximum_message_characters
             ),
@@ -554,22 +540,17 @@ class StrategySelector:
             "contains_no_banned_phrase": not any(
                 phrase in assembled for phrase in self.library.banned_phrases
             ),
-            "contains_no_answer": not any(
-                phrase in assembled for phrase in _ANSWER_INDICATORS
-            ),
+            "contains_no_answer": not any(phrase in assembled for phrase in _ANSWER_INDICATORS),
             "contains_no_blame_command": not any(
                 phrase in assembled for phrase in _BLAME_COMMAND_INDICATORS
             ),
-            "action_clause_unchanged": card.approved_action_clause in assembled,
             "target_actor_explicit": card.target_actor is not Actor.UNKNOWN,
         }
 
     @staticmethod
-    def _assemble_message(result: LLMMessageResult, card: StrategyCard) -> str:
-        """Assemble the final message from LLM observation and card action."""
-        address_word = _ADDRESS_WORD.get(result.target_actor, result.target_actor)
-        observation = result.observation_clause.strip().rstrip("。！？!?，,;；")
-        return f"{address_word}，{observation}，{card.approved_action_clause}"
+    def _assemble_message(result: LLMMessageResult) -> str:
+        """Normalise the complete contextual message returned by the LLM."""
+        return re.sub(r"\s+", " ", result.message).strip()
 
     def _validate_message(self, text: str, card: StrategyCard) -> dict[str, bool]:
         """Validate a plain-text LLM message (legacy compatibility)."""
@@ -588,9 +569,7 @@ class StrategySelector:
             "contains_no_banned_phrase": not any(
                 phrase in message for phrase in self.library.banned_phrases
             ),
-            "contains_no_answer": not any(
-                phrase in message for phrase in _ANSWER_INDICATORS
-            ),
+            "contains_no_answer": not any(phrase in message for phrase in _ANSWER_INDICATORS),
             "contains_no_blame_command": not any(
                 phrase in message for phrase in _BLAME_COMMAND_INDICATORS
             ),
@@ -613,9 +592,7 @@ class StrategySelector:
             "contains_no_banned_phrase": not any(
                 phrase in message for phrase in self.library.banned_phrases
             ),
-            "contains_no_answer": not any(
-                phrase in message for phrase in _ANSWER_INDICATORS
-            ),
+            "contains_no_answer": not any(phrase in message for phrase in _ANSWER_INDICATORS),
             "contains_no_blame_command": not any(
                 phrase in message for phrase in _BLAME_COMMAND_INDICATORS
             ),
@@ -634,11 +611,7 @@ class StrategySelector:
 
 
 class MessageGenerator:
-    """Wrap the LLM provider and prompt builder for observation generation.
-
-    The generator asks the LLM to produce only an ``observation_clause``.
-    The selector assembles the final message by combining the observation
-    with the strategy card's fixed ``approved_action_clause``.
+    """Wrap the LLM provider and prompt builder for complete message generation.
 
     In tests, a mock or ``None`` can be supplied, while in production a
     real :class:`QwenTextChatProvider` is used.
@@ -666,8 +639,10 @@ class MessageGenerator:
         task_context: dict[str, Any] | None = None,
         previous_state: str | None = None,
         recovery_status: str | None = None,
+        previous_result: LLMMessageResult | None = None,
+        failed_checks: list[str] | None = None,
     ) -> LLMMessageResult:
-        """Generate a structured observation result for the given card.
+        """Generate a complete contextual message for the given card.
 
         Raises
         ------
@@ -684,10 +659,18 @@ class MessageGenerator:
             task_context=task_context,
             previous_state=previous_state,
             recovery_status=recovery_status,
+            previous_draft=(
+                None if previous_result is None else self._normalise_draft(previous_result)
+            ),
+            failed_checks=failed_checks,
         )
         self.call_count += 1
         result = self.provider.generate(prompt)
         return parse_llm_response(result.text)
+
+    @staticmethod
+    def _normalise_draft(result: LLMMessageResult) -> str:
+        return re.sub(r"\s+", " ", result.message).strip()
 
 
 class StrategyChoiceGenerator:

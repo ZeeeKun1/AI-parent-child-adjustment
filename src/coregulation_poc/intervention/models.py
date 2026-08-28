@@ -44,6 +44,7 @@ class StrategySelectionStatus(StrEnum):
 class StrategySelectionSource(StrEnum):
     EXACT_RULE = "exact_rule"
     BOUNDED_LLM = "bounded_llm"
+    DETERMINISTIC_FALLBACK = "deterministic_fallback"
 
 
 class StrategyHoldReason(StrEnum):
@@ -55,6 +56,7 @@ class StrategyHoldReason(StrEnum):
     SEMANTIC_SELECTOR_UNAVAILABLE = "semantic_selector_unavailable"
     SEMANTIC_SELECTOR_NO_MATCH = "semantic_selector_no_match"
     SEMANTIC_SELECTOR_REJECTED = "semantic_selector_rejected"
+    MESSAGE_GENERATION_FAILED = "message_generation_failed"
 
 
 class StrategyPrinciples(BaseModel):
@@ -64,7 +66,7 @@ class StrategyPrinciples(BaseModel):
     normal_requires_positive_maintenance_authorization: bool
     target_actor_must_be_explicit: bool
     one_card_one_primary_action: bool
-    llm_generates_observation_only: bool
+    llm_generates_contextual_message: bool
     llm_strategy_selection_is_bounded: bool
     llm_cannot_create_strategy_cards: bool
     approved_template_fallback_required: bool
@@ -129,18 +131,11 @@ class StrategyLibraryConfig(BaseModel):
             ),
             "target_actor_must_be_explicit": self.principles.target_actor_must_be_explicit,
             "one_card_one_primary_action": self.principles.one_card_one_primary_action,
-            "llm_generates_observation_only": (
-                self.principles.llm_generates_observation_only
-            ),
+            "llm_generates_contextual_message": (self.principles.llm_generates_contextual_message),
             "llm_strategy_selection_is_bounded": (
                 self.principles.llm_strategy_selection_is_bounded
             ),
-            "llm_cannot_create_strategy_cards": (
-                self.principles.llm_cannot_create_strategy_cards
-            ),
-            "approved_template_fallback_required": (
-                self.principles.approved_template_fallback_required
-            ),
+            "llm_cannot_create_strategy_cards": (self.principles.llm_cannot_create_strategy_cards),
             "do_not_repeat_before_observing_response": (
                 self.principles.do_not_repeat_before_observing_response
             ),
@@ -161,9 +156,7 @@ class StrategyLibraryConfig(BaseModel):
                 if strategy_id not in cards:
                     raise ValueError(f"routing rule references unknown strategy: {strategy_id}")
                 if cards[strategy_id].inactive:
-                    raise ValueError(
-                        f"routing rule references inactive strategy: {strategy_id}"
-                    )
+                    raise ValueError(f"routing rule references inactive strategy: {strategy_id}")
                 if rule.state not in cards[strategy_id].states:
                     raise ValueError(
                         f"strategy {strategy_id} does not support state {rule.state.value}"
@@ -192,9 +185,7 @@ class StrategyLibraryConfig(BaseModel):
         }
         actual_routes = {
             state: {
-                rule.interaction_performance
-                for rule in self.routing_rules
-                if rule.state is state
+                rule.interaction_performance for rule in self.routing_rules if rule.state is state
             }
             for state in expected_routes
         }

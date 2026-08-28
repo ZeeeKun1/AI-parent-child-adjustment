@@ -1,19 +1,19 @@
-version: 4
+version: 5
 source:
   - "三阶段主题分析3.0：专家干预策略类别、适用状态与干预对象（二级code实例拆分为单方卡）"
   - "形成性研究3.4.3：干预应根据亲子共调节状态匹配策略"
   - "WOZ后果编码：家长调整、儿童重新参与、任务继续推进与亲子关系缓和"
-  - "混合策略选择：规则执行干预授权与硬约束，受限大模型仅在批准策略卡中进行语义选择"
+  - "混合策略选择：规则执行干预授权与状态安全边界，受限大模型在批准策略卡中进行语义排序并生成情境化话术"
 
 principles:
   module_two_authorization_required: true
   normal_requires_positive_maintenance_authorization: true
   target_actor_must_be_explicit: true
   one_card_one_primary_action: true
-  llm_generates_observation_only: true
+  llm_generates_contextual_message: true
   llm_strategy_selection_is_bounded: true
   llm_cannot_create_strategy_cards: true
-  approved_template_fallback_required: true
+  approved_template_fallback_required: false
   do_not_repeat_before_observing_response: true
   maximum_message_characters: 90
   maximum_message_sentences: 2
@@ -114,7 +114,7 @@ cards:
 
   - strategy_id: "DYAD_RELATIONSHIP_RESET"
     name: "双方理解重置"
-    states: ["dysregulation"]
+    states: ["dysregulation", "high_risk"]
     target_actor: "both"
     repair_target: "relationship_repair"
     strategy_family: "relationship_repair"

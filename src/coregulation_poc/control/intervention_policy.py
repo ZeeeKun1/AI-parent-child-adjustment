@@ -23,11 +23,15 @@ class PolicyPrinciples(BaseModel):
     retain_authorized_intervention_until_safe_boundary: bool
     require_post_intervention_response_before_repeat: bool
     post_intervention_max_wait_count: int = Field(ge=1)
+    same_episode_observation_ms: int = Field(ge=30_000)
+    max_interventions_per_episode: int = Field(ge=1, le=3)
+    repeat_requires_escalation_or_changed_need: bool
     low_confidence_action: InterventionAction
     insufficient_evidence_action: InterventionAction
     post_intervention_full_window_required: bool
     fluctuation_is_non_intervention: bool
     fluctuation_no_reinforcement: bool
+    positive_maintenance_enabled: bool
 
 
 class DecisionRule(BaseModel):
@@ -83,6 +87,9 @@ class InterventionPolicy(BaseModel):
             InterventionDecisionReason.LOW_CONFIDENCE,
             InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY,
             InterventionDecisionReason.WAITING_FOR_POST_INTERVENTION_RESPONSE,
+            InterventionDecisionReason.SAME_EPISODE_OBSERVATION_PERIOD,
+            InterventionDecisionReason.SAME_EPISODE_NO_ESCALATION,
+            InterventionDecisionReason.SAME_EPISODE_INTERVENTION_LIMIT,
             InterventionDecisionReason.HISTORY_REQUIRED,
             InterventionDecisionReason.SUPPORT_NEED_NOT_IDENTIFIED,
             InterventionDecisionReason.SUPPORT_TARGET_UNIDENTIFIED,
@@ -109,8 +116,10 @@ class InterventionPolicy(BaseModel):
             raise ValueError("positive maintenance must wait for a natural turn boundary")
 
         for state in (CoregulationState.DYSREGULATION, CoregulationState.HIGH_RISK):
-            if not self.state_actions[state].requires_natural_turn_boundary:
-                raise ValueError(f"state {state.value} must wait for a natural turn boundary")
+            if self.state_actions[state].requires_natural_turn_boundary:
+                raise ValueError(
+                    f"state {state.value} must be delivered immediately after authorization"
+                )
         if not self.state_actions[CoregulationState.HIGH_RISK].history_required:
             raise ValueError("high-risk progressive support requires interaction history")
 
@@ -127,18 +136,22 @@ class InterventionPolicy(BaseModel):
             raise ValueError("dysregulation requires a corroborating signal")
         if self.principles.use_single_signal_as_trigger:
             raise ValueError("a single signal cannot trigger intervention")
-        if not self.principles.require_natural_turn_boundary_for_intervention:
-            raise ValueError("the policy must protect the dyad's natural interaction rhythm")
-        if not self.principles.retain_authorized_intervention_until_safe_boundary:
-            raise ValueError(
-                "authorized interventions must be retained until a safe boundary"
-            )
+        if self.principles.require_natural_turn_boundary_for_intervention:
+            raise ValueError("actionable states must not wait for a natural turn boundary")
+        if self.principles.retain_authorized_intervention_until_safe_boundary:
+            raise ValueError("authorized interventions are delivered rather than queued")
         if not self.principles.require_post_intervention_response_before_repeat:
             raise ValueError("the policy must observe intervention consequences before repeating")
         if self.principles.low_confidence_action is not InterventionAction.HOLD:
             raise ValueError("low-confidence assessments must hold intervention")
         if self.principles.insufficient_evidence_action is not InterventionAction.HOLD:
             raise ValueError("insufficient evidence must hold intervention")
+        if self.principles.same_episode_observation_ms < 120_000:
+            raise ValueError("same-episode observation period must be at least 120 seconds")
+        if self.principles.max_interventions_per_episode != 2:
+            raise ValueError("one dysregulation episode must allow at most two interventions")
+        if not self.principles.repeat_requires_escalation_or_changed_need:
+            raise ValueError("repeat intervention must require escalation or a changed need")
 
         referenced_basis = {
             basis

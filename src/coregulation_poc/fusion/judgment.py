@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from coregulation_poc.fusion.response_parser import normalize_assessment_payload
 from coregulation_poc.models import (
     AcousticFeatures,
     PerceptionReport,
@@ -33,8 +34,7 @@ def _format_perception_report(report: PerceptionReport) -> str:
         lines.append("\nSPEECH TURNS:")
         for i, turn in enumerate(report.speech_turns, 1):
             lines.append(
-                f"  {i}. [{turn.start_ms}-{turn.end_ms} ms] "
-                f"{turn.speaker.value}: \"{turn.text}\""
+                f'  {i}. [{turn.start_ms}-{turn.end_ms} ms] {turn.speaker.value}: "{turn.text}"'
             )
     else:
         lines.append("\nSPEECH TURNS: (none transcribed)")
@@ -42,10 +42,7 @@ def _format_perception_report(report: PerceptionReport) -> str:
     if report.visual_observations:
         lines.append("\nVISUAL OBSERVATIONS:")
         for i, obs in enumerate(report.visual_observations, 1):
-            lines.append(
-                f"  {i}. [{obs.timestamp_ms} ms] "
-                f"{obs.actor.value}: {obs.description}"
-            )
+            lines.append(f"  {i}. [{obs.timestamp_ms} ms] {obs.actor.value}: {obs.description}")
     else:
         lines.append("\nVISUAL OBSERVATIONS: (none observed)")
 
@@ -65,12 +62,11 @@ def _format_acoustic_features(features: AcousticFeatures) -> str:
         lines.append("\nVOICED SEGMENTS:")
         for i, seg in enumerate(features.segments, 1):
             f0_str = (
-                f"mean_F0={seg.mean_f0_hz:.0f} Hz, "
-                f"median_F0={seg.median_f0_hz:.0f} Hz"
+                f"mean_F0={seg.mean_f0_hz:.0f} Hz, median_F0={seg.median_f0_hz:.0f} Hz"
                 if seg.mean_f0_hz
                 else "F0=N/A"
             )
-            text_str = f", text=\"{seg.text}\"" if seg.text else ""
+            text_str = f', text="{seg.text}"' if seg.text else ""
             lines.append(
                 f"  {i}. [{seg.start_ms}-{seg.end_ms} ms] "
                 f"{seg.speaker}: {f0_str}, RMS={seg.rms_energy:.3f}{text_str}"
@@ -81,10 +77,7 @@ def _format_acoustic_features(features: AcousticFeatures) -> str:
     if features.silence_gaps:
         lines.append("\nSILENCE GAPS (>= 500 ms):")
         for i, gap in enumerate(features.silence_gaps, 1):
-            lines.append(
-                f"  {i}. [{gap.start_ms}-{gap.end_ms} ms] "
-                f"duration={gap.duration_ms} ms"
-            )
+            lines.append(f"  {i}. [{gap.start_ms}-{gap.end_ms} ms] duration={gap.duration_ms} ms")
     else:
         lines.append("\nSILENCE GAPS: (none >= 500 ms)")
 
@@ -122,15 +115,19 @@ def build_judgment_system_prompt(
             ),
             (
                 "Classify the interaction sequence as a whole, not a single word, "
-                "gesture, or acoustic value. Never treat a raw acoustic feature "
-                "as an emotion or state label."
+                "gesture, gaze direction, silence, compliance response, prompt count, "
+                "or acoustic value. A potentially hostile transcribed word is weak "
+                "evidence when its speaker, context, or recognition is ambiguous. Never "
+                "treat a raw acoustic feature as an emotion or state label."
             ),
             (
                 "ASSESS THE INTERACTION TRAJECTORY, NOT ISOLATED EVENTS. An "
                 "isolated wrong answer followed by smooth supportive correction "
                 "can remain normal. Use fluctuation only when the sequence shows "
                 "temporarily uneven coordination while the dyad still retains "
-                "recovery capacity."
+                "observable recovery capacity. A child continuing to answer, look "
+                "at the task, or comply does not by itself prove recovery when "
+                "repeated prompting, pace conflict, or passive withdrawal persists."
             ),
             (
                 "Do NOT classify high_risk from one isolated turn; it requires a "
@@ -251,12 +248,14 @@ def build_judgment_system_prompt(
                 "Use null when the parent cannot be identified or speech evidence is "
                 "insufficient.\n"
                 "3. conflict_action_observed: true only for a directly observed "
-                "physical conflict action such as forceful pointing, throwing a pen, "
-                "or tearing an eraser; false only when the relevant behavior is "
-                "visible throughout; otherwise null.\n"
+                "physical conflict action or contextually unambiguous repeated hostile "
+                "language. One possibly mistranscribed word is not sufficient. Use false "
+                "only when the relevant behavior is observable throughout; otherwise null.\n"
                 "4. child_disengaged_observed: true only when the child is directly "
-                "observed withdrawing attention or participation from the homework; "
-                "do not equate ordinary thinking silence with disengagement.\n"
+                "observed withdrawing participation through explicit refusal, prolonged "
+                "non-response, leaving the task, or sustained passive withdrawal. Do not "
+                "equate ordinary thinking silence, looking down, touching the face, or one "
+                "slow answer with disengagement.\n"
                 "5. regulation_balance: both_stable, one_stable, both_crossed, or "
                 "unclear. one_stable means one participant still maintains a rational, "
                 "task-oriented response while the other deviates. both_crossed means "
@@ -276,13 +275,17 @@ def build_judgment_system_prompt(
                 "6. Do not output intervention actions or intervention scripts; "
                 "assess only the observable state and its attributes.\n"
                 "7. Use the codebook's operational_boundary as a trajectory-level "
-                "anchor. Ten to 30 seconds of observed coordination disruption "
-                "supports fluctuation. Disruption may be a task stall, pace conflict, "
-                "misaligned understanding, escalating negative interaction, or child "
-                "disengagement. At least 30 seconds without explicit recovery plus "
-                "corroborating evidence supports actionable dysregulation. The runtime "
-                "performs the final cross-window duration calculation, so never invent "
-                "missing duration or counts."
+                "anchor. Ten to 30 seconds of observed coordination disruption supports "
+                "fluctuation. Dysregulation normally requires at least three disrupted "
+                "windows in the supplied 60-second trajectory, including two consecutive "
+                "windows, and evidence from at least two dimensions. A single prompt "
+                "rate, gaze pattern, silence, compliance response, or transcribed word is "
+                "not enough. Immediate dysregulation requires marked current evidence "
+                "that is independently corroborated across actors, modalities, or repeated "
+                "turns. One stable window is provisional fluctuation; 20 seconds of "
+                "effective balanced progress confirms normal recovery. The runtime "
+                "performs final cross-window calculations, so never invent missing "
+                "duration, counts, or corroboration."
             ),
             "Return exactly one JSON object. Do not use Markdown or add commentary.",
             (
@@ -348,28 +351,31 @@ def build_judgment_system_prompt(
             EXAMPLE 3 — DYSREGULATION
 
             Observed sequence:
-            - The child repeatedly gets stuck on the same English word and says,
-            "哎呀烦死了。"
-            - The parent repeatedly says, "重读重读," and asks several questions
-            without allowing sufficient processing time.
-            - The child bites a finger, appears confused, and gives increasingly
-            limited responses.
-            - The interaction remains stuck in the same prompting-and-withdrawal loop.
+            - Recent windows show repeated English-reading errors followed by the
+            parent's commands to restart from the beginning.
+            - The child proposes reviewing one item, but the parent overrides the
+            proposal and repeats the restart instruction.
+            - The child still complies at first, then repeatedly stops responding,
+            turns away from the task, or explicitly says that they do not want to continue.
+            - The prompting-and-withdrawal pattern repeatedly returns without a
+            sustained period of balanced task progress.
 
             Expected judgment:
             - state: dysregulation
-            - task_process: sustained_stall
-            - support_need: mutual_understanding
-            - support_target: both
+            - task_process: pace_mismatch
+            - support_need: task_pacing
+            - support_target: parent
             - boundary_signals: task_stall_observed=true,
-              parental_prompt_count=3, conflict_action_observed=false,
-              child_disengaged_observed=true, regulation_balance=both_crossed
+              parental_prompt_count=2, conflict_action_observed=false,
+              child_disengaged_observed=true, regulation_balance=one_stable
 
             Reason:
-            The sequence shows a sustained task stall, pace conflict, rising tension,
-            and no observed self-recovery. Do not automatically classify it as
-            high_risk because this episode alone does not establish a persistent
-            pattern across prior windows.
+            The recent trajectory shows a repeated pace conflict and increasingly
+            passive participation without confirmed recovery. Continued compliance
+            does not make the interaction normal. Explicit physical conflict or total
+            disengagement is not required for dysregulation. Do not automatically
+            classify it as high_risk because this episode alone does not establish a
+            persistent controlling-dependent pattern.
 
 
             EXAMPLE 4 — HIGH_RISK
@@ -404,9 +410,8 @@ def build_judgment_system_prompt(
             - A wrong answer or brief difficulty can remain normal when supportive
             coordination and task progress are maintained.
             - Fluctuation means temporary unevenness with observable recovery capacity.
-            - Dysregulation means an unresolved negative interaction cycle within the
-              current sequence; the runtime confirms the 30-second cross-window
-              operational boundary before authorizing intervention.
+            - Dysregulation means an unresolved or repeatedly returning negative
+              interaction cycle across the current window and recent trajectory.
             - High_risk requires a persistent pattern supported by current evidence
             and prior-window history.
             - Acoustic features may corroborate a trajectory, but pitch, RMS energy,
@@ -460,15 +465,16 @@ def build_judgment_user_prompt(
                 "copy this value exactly, including null."
             ),
             (
-                "Compact prior assessment history (context only; current-window "
-                "evidence is still required). Each entry includes state, "
+                "Recent trajectory history (up to the preceding 60 seconds; "
+                "current-window evidence is still required). Treat one normal "
+                "window as provisional recovery rather than proof that a recurring "
+                "pattern ended. Each entry includes state, "
                 "confidence, interaction_performance, task_process, "
                 "support_need, trajectory, and boundary_signals: "
                 + json.dumps(history_summary, ensure_ascii=False)
             ),
             (
-                "Task context: "
-                + json.dumps(task_context, ensure_ascii=False)
+                "Task context: " + json.dumps(task_context, ensure_ascii=False)
                 if task_context
                 else "Task context: (not provided)"
             ),
@@ -529,6 +535,6 @@ def parse_judgment_result(response_text: str) -> StateAssessment:
                     if observation is None and isinstance(quote, str) and quote.strip():
                         item["observation"] = quote.strip()
     try:
-        return StateAssessment.model_validate(payload)
+        return StateAssessment.model_validate(normalize_assessment_payload(payload))
     except ValidationError as exc:
         raise ValueError(f"Judgment JSON did not match StateAssessment: {exc}") from exc

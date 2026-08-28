@@ -73,6 +73,10 @@ const elements = {
   summaryImprovements: document.querySelector("#summary-improvements"),
   summarySupports: document.querySelector("#summary-supports"),
   newSession: document.querySelector("#new-session-button"),
+  wizardTabs: Array.from(document.querySelectorAll(".wizard-tab")),
+  wizardPanels: Array.from(document.querySelectorAll(".wizard-panel")),
+  wizardPrev: document.querySelector("#wizard-prev"),
+  wizardNext: document.querySelector("#wizard-next"),
 };
 
 let socket = null;
@@ -112,6 +116,7 @@ let sessionAccessToken = null;
 const selectedRoles = { parent: null, child: null };
 let latestSessionSummary = null;
 let sessionInsights = createSessionInsights();
+let currentStep = 1;
 
 const PHASE_ART = {
   setup: "/static/img/companion-observing.png",
@@ -596,6 +601,70 @@ function readStudyContext() {
   };
 }
 
+function validateStep(step) {
+  if (step === 1) {
+    const parentAge = elements.parentAge.valueAsNumber;
+    const childAge = elements.childAge.valueAsNumber;
+    return Number.isInteger(parentAge) && parentAge >= 18 && parentAge <= 80
+      && Number.isInteger(childAge) && childAge >= 5 && childAge <= 18
+      && Boolean(elements.childGrade.value.trim())
+      && Boolean(elements.taskName.value.trim())
+      && Boolean(elements.taskType.value)
+      && Boolean(elements.taskDifficulty.value);
+  }
+  if (step === 2) {
+    return Boolean(selectedRoles.parent && selectedRoles.child)
+      && bindingState.parent && bindingState.child;
+  }
+  return true;
+}
+
+function canEnterStep(step) {
+  for (let prior = 1; prior < step; prior += 1) {
+    if (!validateStep(prior)) return false;
+  }
+  return true;
+}
+
+function goToStep(step) {
+  if (step < 1 || step > 3) return;
+  currentStep = step;
+  elements.wizardTabs.forEach((tab) => {
+    const tabStep = Number(tab.dataset.step);
+    tab.classList.toggle("active", tabStep === step);
+    tab.setAttribute("aria-selected", String(tabStep === step));
+    tab.disabled = tabStep > step && !canEnterStep(tabStep);
+  });
+  elements.wizardPanels.forEach((panel) => {
+    const panelStep = Number(panel.dataset.step);
+    panel.hidden = panelStep !== step;
+    panel.classList.toggle("active", panelStep === step);
+  });
+  elements.wizardPrev.hidden = step === 1;
+  const isFinal = step === 3;
+  elements.wizardNext.hidden = isFinal;
+  elements.start.hidden = !isFinal;
+  const wizardBody = document.querySelector(".wizard-body");
+  if (wizardBody) wizardBody.scrollTop = 0;
+  updateStartButton();
+}
+
+function nextStep() {
+  if (currentStep < 3 && validateStep(currentStep)) {
+    goToStep(currentStep + 1);
+  } else if (!validateStep(currentStep)) {
+    if (currentStep === 1) {
+      window.alert("请先填完基本信息和作业内容。");
+    } else if (currentStep === 2) {
+      window.alert("请先选择角色并录完两段声音。");
+    }
+  }
+}
+
+function prevStep() {
+  if (currentStep > 1) goToStep(currentStep - 1);
+}
+
 function updateStartButton() {
   const rolesReady = Boolean(selectedRoles.parent && selectedRoles.child);
   const voicesReady = bindingState.parent && bindingState.child;
@@ -653,6 +722,11 @@ function updateStartButton() {
   } else {
     elements.startRequirement.textContent = "都准备好了，可以开始。";
   }
+  elements.wizardNext.disabled = !validateStep(currentStep);
+  elements.wizardTabs.forEach((tab) => {
+    const tabStep = Number(tab.dataset.step);
+    tab.disabled = tabStep > currentStep && !canEnterStep(tabStep);
+  });
 }
 
 async function ensureSessionAdmission() {
@@ -1435,7 +1509,7 @@ function resetPreparation() {
   elements.homeNav.setAttribute("aria-current", "page");
   updateFamilyDisplay();
   setPhase("setup");
-  updateStartButton();
+  goToStep(1);
 }
 
 async function stopCapture(normal = true, reason = null) {
@@ -1524,6 +1598,14 @@ elements.bindingButtons.forEach((button) => {
 elements.consent.addEventListener("change", updateStartButton);
 elements.deviceCheckButton.addEventListener("click", () => void checkDevices());
 elements.start.addEventListener("click", () => void startCapture());
+elements.wizardNext.addEventListener("click", nextStep);
+elements.wizardPrev.addEventListener("click", prevStep);
+elements.wizardTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    const step = Number(tab.dataset.step);
+    if (canEnterStep(step)) goToStep(step);
+  });
+});
 const devSkipButton = document.querySelector("#dev-skip-button");
 if (["localhost", "127.0.0.1", "::1"].includes(window.location.hostname)) {
   devSkipButton.hidden = false;
@@ -1589,6 +1671,7 @@ elements.homeNav.addEventListener("click", () => {
   elements.homeNav.classList.add("active");
   elements.homeNav.setAttribute("aria-current", "page");
   setPhase("setup");
+  goToStep(1);
 });
 window.addEventListener("pagehide", () => {
   stopCheckedMediaStream();
@@ -1599,4 +1682,4 @@ updateFamilyDisplay();
 updateCounters();
 updateInterventionPauseControl();
 updateVoiceToggleControl();
-updateStartButton();
+goToStep(1);

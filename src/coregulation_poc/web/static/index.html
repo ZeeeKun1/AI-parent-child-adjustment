@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:">
     <title>家庭作业亲子调节助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=10">
+    <link rel="stylesheet" href="/static/styles.css?v=18">
   </head>
   <body data-phase="setup">
     <header class="nav-bar">
@@ -70,196 +70,190 @@
     </div>
 
     <div class="modal-overlay" id="start-card">
-      <section class="modal-content" aria-labelledby="setup-title">
+      <section class="modal-content wizard" aria-labelledby="setup-title">
         <header class="setup-hero">
           <img src="/static/img/companion-logo.png" alt="" class="setup-logo">
           <div>
-            <h2 id="setup-title">开始前，先准备一下</h2>
-            <p>活动中会使用摄像头和麦克风，并在需要时显示提示。提示可以忽略，活动也可以随时暂停或结束。</p>
+            <h2 id="setup-title">开始前，准备三件事</h2>
+            <p>填好作业信息、分别录一段声音，再确认摄像头和麦克风。</p>
           </div>
         </header>
 
-        <ol class="setup-steps" aria-label="准备步骤">
-          <li><span>1</span>填写信息</li>
-          <li><span>2</span>选择角色</li>
-          <li><span>3</span>录制声音</li>
-          <li><span>4</span>检查设备</li>
-          <li><span>5</span>确认开始</li>
-        </ol>
+        <nav class="wizard-steps" role="tablist" aria-label="准备步骤">
+          <button class="wizard-tab active" data-step="1" role="tab" aria-selected="true" type="button"><span>1</span> 填写信息</button>
+          <button class="wizard-tab" data-step="2" role="tab" aria-selected="false" type="button"><span>2</span> 录制声音</button>
+          <button class="wizard-tab" data-step="3" role="tab" aria-selected="false" type="button"><span>3</span> 检查设备</button>
+        </nav>
 
-        <section class="setup-section" aria-labelledby="basic-info-title">
-          <div class="section-heading">
-            <div>
-              <h3 id="basic-info-title">填写基本信息</h3>
-            </div>
-            <p>不需要填写姓名或联系方式。</p>
-          </div>
-          <div class="study-fields basic-fields">
-            <label class="form-field">
-              <span>家长年龄</span>
-              <input id="parent-age" type="number" min="18" max="80" inputmode="numeric" placeholder="18–80">
-            </label>
-            <label class="form-field">
-              <span>儿童年龄</span>
-              <input id="child-age" type="number" min="5" max="18" inputmode="numeric" placeholder="5–18">
-            </label>
-            <label class="form-field">
-              <span>儿童年级</span>
-              <input id="child-grade" type="text" maxlength="20" autocomplete="off" placeholder="如：三年级">
-            </label>
-          </div>
-        </section>
-
-        <section class="setup-section" aria-labelledby="family-role-title">
-          <div class="section-heading">
-            <div>
-              <h3 id="family-role-title">选择参与角色</h3>
-            </div>
-            <p>选好后，页面会显示对应的称呼和头像。</p>
-          </div>
-          <div class="role-selectors">
-            <fieldset class="role-selector" data-role-group="parent">
-              <legend>选择家长</legend>
-              <button class="role-option" type="button" data-role-group="parent" data-role="mother" data-label="妈妈" data-avatar="/static/img/avatar-mother.png" aria-pressed="false">
-                <img src="/static/img/avatar-mother.png" alt="">
-                <span>妈妈</span>
-              </button>
-              <button class="role-option" type="button" data-role-group="parent" data-role="father" data-label="爸爸" data-avatar="/static/img/avatar-father.png" aria-pressed="false">
-                <img src="/static/img/avatar-father.png" alt="">
-                <span>爸爸</span>
-              </button>
-            </fieldset>
-            <fieldset class="role-selector" data-role-group="child">
-              <legend>选择孩子</legend>
-              <button class="role-option" type="button" data-role-group="child" data-role="boy" data-label="儿子" data-avatar="/static/img/avatar-boy.png" aria-pressed="false">
-                <img src="/static/img/avatar-boy.png" alt="">
-                <span>儿子</span>
-              </button>
-              <button class="role-option" type="button" data-role-group="child" data-role="girl" data-label="女儿" data-avatar="/static/img/avatar-girl.png" aria-pressed="false">
-                <img src="/static/img/avatar-girl.png" alt="">
-                <span>女儿</span>
-              </button>
-            </fieldset>
-          </div>
-        </section>
-
-        <fieldset class="speaker-binding setup-section" id="speaker-binding">
-          <legend>声音绑定</legend>
-          <div class="section-heading binding-heading">
-            <div>
-              <h3>分别录一段声音</h3>
-            </div>
-            <span class="binding-count" id="binding-count">0 / 2</span>
-          </div>
-          <p class="binding-intro">请家长和孩子轮流朗读下面的句子，每段约 5 秒。录音会发送至腾讯云区分说话人，本地不保存，实验结束后删除云端声纹。</p>
-          <div class="binding-people">
-            <div class="binding-person" data-speaker="parent" data-bound="false">
-              <img id="parent-binding-avatar" class="binding-avatar" src="/static/img/avatar-mother.png" alt="">
-              <div class="binding-person-body">
-                <div class="binding-person-copy">
-                  <strong id="parent-role-label">家长</strong>
-                  <span id="parent-binding-status">未录音</span>
+        <div class="wizard-body">
+          <!-- Step 1: Basic info + Task info -->
+          <div class="wizard-panel active" data-step="1" role="tabpanel">
+            <div class="wizard-grid">
+              <div class="wizard-col">
+                <h3 class="wizard-col-title">基本信息</h3>
+                <p class="wizard-col-hint">不需要填写姓名或联系方式。</p>
+                <div class="study-fields basic-fields">
+                  <label class="form-field">
+                    <span>家长年龄</span>
+                    <input id="parent-age" type="number" min="18" max="80" inputmode="numeric" placeholder="18–80">
+                  </label>
+                  <label class="form-field">
+                    <span>儿童年龄</span>
+                    <input id="child-age" type="number" min="5" max="18" inputmode="numeric" placeholder="5–18">
+                  </label>
+                  <label class="form-field">
+                    <span>儿童年级</span>
+                    <input id="child-grade" type="text" maxlength="20" autocomplete="off" placeholder="如：三年级">
+                  </label>
                 </div>
-                <p>请说：“我是今天陪孩子做作业的家长，我们准备开始了。”</p>
-                <button class="binding-button" type="button" data-speaker="parent">录家长声音</button>
-                <div class="binding-progress" aria-hidden="true"><span></span></div>
               </div>
-            </div>
-            <div class="binding-person" data-speaker="child" data-bound="false">
-              <img id="child-binding-avatar" class="binding-avatar" src="/static/img/avatar-boy.png" alt="">
-              <div class="binding-person-body">
-                <div class="binding-person-copy">
-                  <strong id="child-role-label">孩子</strong>
-                  <span id="child-binding-status">未录音</span>
+              <div class="wizard-col">
+                <h3 class="wizard-col-title">今天的作业</h3>
+                <p class="wizard-col-hint">填上作业内容、学科和难度。</p>
+                <div class="study-fields task-fields">
+                  <label class="form-field wide">
+                    <span>任务名称</span>
+                    <input id="task-name" type="text" maxlength="100" autocomplete="off" placeholder="如：数学练习册第 3 页">
+                  </label>
+                  <label class="form-field">
+                    <span>作业学科</span>
+                    <select id="task-type">
+                      <option value="">请选择</option>
+                      <option value="chinese">语文</option>
+                      <option value="mathematics">数学</option>
+                      <option value="english">英语</option>
+                      <option value="morality_and_law">道德与法治</option>
+                      <option value="science">科学</option>
+                      <option value="information_technology">信息技术</option>
+                      <option value="history">历史</option>
+                      <option value="geography">地理</option>
+                      <option value="physics">物理</option>
+                      <option value="chemistry">化学</option>
+                      <option value="biology">生物</option>
+                      <option value="other">其他</option>
+                    </select>
+                  </label>
+                  <label class="form-field">
+                    <span>任务难度</span>
+                    <select id="task-difficulty">
+                      <option value="">请选择</option>
+                      <option value="easy">较简单</option>
+                      <option value="moderate">适中</option>
+                      <option value="challenging">有挑战</option>
+                    </select>
+                  </label>
                 </div>
-                <p>请说：“我是今天要做作业的孩子，我们准备开始了。”</p>
-                <button class="binding-button" type="button" data-speaker="child">录孩子声音</button>
-                <div class="binding-progress" aria-hidden="true"><span></span></div>
               </div>
             </div>
           </div>
-          <p class="binding-feedback" id="binding-feedback" role="status" aria-live="polite">选好角色后，分别录一段声音。</p>
-        </fieldset>
 
-        <section class="device-check setup-section" aria-labelledby="device-check-title">
-          <div class="section-heading device-check-heading">
-            <div>
-              <h3 id="device-check-title">检查摄像头和麦克风</h3>
-            </div>
-          </div>
-          <p class="device-check-intro">录好两段声音后进行检查。画面只用于确认采集范围，不在本地保存。</p>
-          <div class="device-check-layout">
-            <div class="device-preview" id="device-preview" data-active="false">
-              <video id="preview" muted playsinline aria-label="摄像头检查画面"></video>
-              <div class="device-preview-placeholder">检查后在这里确认画面范围</div>
-            </div>
-            <div class="device-state-list" aria-live="polite">
-              <div class="device-state" data-device-status="camera" data-state="unchecked">
-                <span class="device-state-dot" aria-hidden="true"></span>
-                <span>摄像头</span>
-                <strong>未检查</strong>
+          <!-- Step 2: Role selection + Voice binding -->
+          <div class="wizard-panel" data-step="2" role="tabpanel" hidden>
+            <div class="wizard-section">
+              <h3 class="wizard-col-title">今天是谁一起完成作业？</h3>
+              <p class="wizard-col-hint">选择称呼后，分别录下家长和孩子的声音。</p>
+              <div class="role-selectors">
+                <fieldset class="role-selector" data-role-group="parent">
+                  <legend>选择家长</legend>
+                  <button class="role-option" type="button" data-role-group="parent" data-role="mother" data-label="妈妈" data-avatar="/static/img/avatar-mother.png" aria-pressed="false">
+                    <img src="/static/img/avatar-mother.png" alt="">
+                    <span>妈妈</span>
+                  </button>
+                  <button class="role-option" type="button" data-role-group="parent" data-role="father" data-label="爸爸" data-avatar="/static/img/avatar-father.png" aria-pressed="false">
+                    <img src="/static/img/avatar-father.png" alt="">
+                    <span>爸爸</span>
+                  </button>
+                </fieldset>
+                <fieldset class="role-selector" data-role-group="child">
+                  <legend>选择孩子</legend>
+                  <button class="role-option" type="button" data-role-group="child" data-role="boy" data-label="儿子" data-avatar="/static/img/avatar-boy.png" aria-pressed="false">
+                    <img src="/static/img/avatar-boy.png" alt="">
+                    <span>儿子</span>
+                  </button>
+                  <button class="role-option" type="button" data-role-group="child" data-role="girl" data-label="女儿" data-avatar="/static/img/avatar-girl.png" aria-pressed="false">
+                    <img src="/static/img/avatar-girl.png" alt="">
+                    <span>女儿</span>
+                  </button>
+                </fieldset>
               </div>
-              <div class="device-state" data-device-status="microphone" data-state="unchecked">
-                <span class="device-state-dot" aria-hidden="true"></span>
-                <span>麦克风</span>
-                <strong>未检查</strong>
+            </div>
+
+            <hr class="wizard-divider">
+
+            <div class="wizard-section">
+              <div class="binding-heading">
+                <h3>分别录一段声音</h3>
+                <span class="binding-count" id="binding-count">0 / 2</span>
               </div>
-              <p id="device-check-feedback" class="device-check-feedback" role="status">请先完成家长和孩子的声音录制。</p>
-              <button id="device-check-button" class="secondary-action" type="button" disabled>录完声音后可检查</button>
+              <p class="binding-intro">请轮流朗读下面的句子，每段约 5 秒。两段录音只用于本次活动中区分家长和孩子。</p>
+              <div class="binding-people">
+                <div class="binding-person" data-speaker="parent" data-bound="false">
+                  <img id="parent-binding-avatar" class="binding-avatar" src="/static/img/avatar-mother.png" alt="">
+                  <div class="binding-person-body">
+                    <div class="binding-person-copy">
+                      <strong id="parent-role-label">家长</strong>
+                      <span id="parent-binding-status">未录音</span>
+                    </div>
+                    <p>请说："我是今天陪孩子做作业的家长，我们准备开始了。"</p>
+                    <button class="binding-button" type="button" data-speaker="parent">录家长声音</button>
+                    <div class="binding-progress" aria-hidden="true"><span></span></div>
+                  </div>
+                </div>
+                <div class="binding-person" data-speaker="child" data-bound="false">
+                  <img id="child-binding-avatar" class="binding-avatar" src="/static/img/avatar-boy.png" alt="">
+                  <div class="binding-person-body">
+                    <div class="binding-person-copy">
+                      <strong id="child-role-label">孩子</strong>
+                      <span id="child-binding-status">未录音</span>
+                    </div>
+                    <p>请说："我是今天要做作业的孩子，我们准备开始了。"</p>
+                    <button class="binding-button" type="button" data-speaker="child">录孩子声音</button>
+                    <div class="binding-progress" aria-hidden="true"><span></span></div>
+                  </div>
+                </div>
+              </div>
+              <p class="binding-feedback" id="binding-feedback" role="status" aria-live="polite">选好角色后，分别录一段声音。</p>
             </div>
           </div>
-        </section>
 
-        <section class="setup-section" aria-labelledby="task-context-title">
-          <div class="section-heading">
-            <div>
-              <h3 id="task-context-title">填写今天的作业</h3>
+          <!-- Step 3: Device check + Consent + Start -->
+          <div class="wizard-panel" data-step="3" role="tabpanel" hidden>
+            <h3 class="wizard-col-title">确认画面和声音</h3>
+            <p class="wizard-col-hint">检查通过后，确认采集说明即可开始。</p>
+            <div class="device-check-layout">
+              <div class="device-preview" id="device-preview" data-active="false">
+                <video id="preview" muted playsinline aria-label="摄像头检查画面"></video>
+                <div class="device-preview-placeholder">检查后在这里确认画面范围</div>
+              </div>
+              <div class="device-state-list">
+                <div class="device-state" data-device-status="camera" data-state="unchecked">
+                  <span class="device-state-dot" aria-hidden="true"></span>
+                  <span>摄像头</span>
+                  <strong>未检查</strong>
+                </div>
+                <div class="device-state" data-device-status="microphone" data-state="unchecked">
+                  <span class="device-state-dot" aria-hidden="true"></span>
+                  <span>麦克风</span>
+                  <strong>未检查</strong>
+                </div>
+                <p id="device-check-feedback" class="device-check-feedback" role="status">请先完成家长和孩子的声音录制。</p>
+                <button id="device-check-button" class="secondary-action" type="button" disabled>录完声音后可检查</button>
+                <label class="consent">
+                  <input id="consent" type="checkbox">
+                  <span>我们已了解采集说明，并同意开始本次活动。</span>
+                </label>
+              </div>
             </div>
-            <p>填上作业内容、学科、难度和孩子的年级。</p>
           </div>
-          <div class="study-fields task-fields">
-            <label class="form-field wide">
-              <span>任务名称</span>
-              <input id="task-name" type="text" maxlength="100" autocomplete="off" placeholder="如：数学练习册第 3 页">
-            </label>
-            <label class="form-field">
-              <span>作业学科</span>
-              <select id="task-type">
-                <option value="">请选择</option>
-                <option value="chinese">语文</option>
-                <option value="mathematics">数学</option>
-                <option value="english">英语</option>
-                <option value="morality_and_law">道德与法治</option>
-                <option value="science">科学</option>
-                <option value="information_technology">信息技术</option>
-                <option value="history">历史</option>
-                <option value="geography">地理</option>
-                <option value="physics">物理</option>
-                <option value="chemistry">化学</option>
-                <option value="biology">生物</option>
-                <option value="other">其他</option>
-              </select>
-            </label>
-            <label class="form-field">
-              <span>任务难度</span>
-              <select id="task-difficulty">
-                <option value="">请选择</option>
-                <option value="easy">较简单</option>
-                <option value="moderate">适中</option>
-                <option value="challenging">有挑战</option>
-              </select>
-            </label>
+        </div>
+
+        <footer class="wizard-footer">
+          <p class="start-requirement" id="start-requirement">先填写基本信息。</p>
+          <div class="wizard-nav">
+            <button id="wizard-prev" class="ctrl-btn" type="button" hidden>上一步</button>
+            <button id="wizard-next" class="ctrl-btn primary" type="button">下一步</button>
+            <button id="start-button" class="start-btn" type="button" disabled hidden>开始活动</button>
           </div>
-        </section>
-
-
-        <footer class="setup-footer">
-          <label class="consent">
-            <input id="consent" type="checkbox">
-            <span>我们已了解采集说明，并同意开始本次活动。</span>
-          </label>
-          <p class="start-requirement" id="start-requirement">先选择家长和孩子，再录好两段声音。</p>
-          <button id="start-button" class="start-btn" type="button" disabled>开始活动</button>
           <button id="dev-skip-button" class="dev-skip-btn" type="button" hidden>开发者直入</button>
         </footer>
       </section>
@@ -335,6 +329,6 @@
       <div class="camera-empty" id="camera-empty" hidden>摄像头预览</div>
     </details>
 
-    <script src="/static/app.js?v=12" defer></script>
+    <script src="/static/app.js?v=14" defer></script>
   </body>
 </html>

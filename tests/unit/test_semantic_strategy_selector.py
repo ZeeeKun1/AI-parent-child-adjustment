@@ -30,7 +30,7 @@ class FakeProvider:
         return Result()
 
 
-def _assessment() -> StateAssessment:
+def _assessment(*, support_target: str = "both") -> StateAssessment:
     return StateAssessment(
         session_id="semantic-strategy",
         assessed_at_ms=10_000,
@@ -42,7 +42,7 @@ def _assessment() -> StateAssessment:
         interaction_performance=["sustained task stall"],
         task_process="sustained_stall",
         support_need="mutual_understanding",
-        support_target="both",
+        support_target=support_target,
         interruptibility="natural_pause",
         modality_evidence={
             "audio": {
@@ -101,7 +101,30 @@ def _choice(strategy_id: str | None, confidence: str = "high") -> dict[str, obje
 
 
 def test_bounded_llm_resolves_soft_field_mismatch() -> None:
-    assessment = _assessment()
+    assessment = _assessment(support_target="parent")
+    provider = FakeProvider(_choice("PARENT_INTENT_TRANSLATION"))
+    selector = StrategySelector(
+        load_strategy_library(),
+        strategy_choice_generator=StrategyChoiceGenerator(provider),
+    )
+
+    result = selector.select(assessment=assessment, decision=_decision(assessment))
+
+    assert result.plan is not None
+    assert result.plan.strategy_id == "PARENT_INTENT_TRANSLATION"
+    assert result.plan.strategy_selection_source is StrategySelectionSource.BOUNDED_LLM
+    assert result.plan.semantic_selection_confidence == "high"
+    assert result.plan.semantic_relaxed_dimensions == [
+        "interaction_performance",
+        "task_process",
+    ]
+    assert provider.call_count == 1
+    assert provider.last_prompt is not None
+    assert "PARENT_INTENT_TRANSLATION" in provider.last_prompt
+
+
+def test_bounded_llm_cannot_select_unapproved_candidate() -> None:
+    assessment = _assessment(support_target="parent")
     provider = FakeProvider(_choice("DYAD_RELATIONSHIP_RESET"))
     selector = StrategySelector(
         load_strategy_library(),
@@ -111,35 +134,12 @@ def test_bounded_llm_resolves_soft_field_mismatch() -> None:
     result = selector.select(assessment=assessment, decision=_decision(assessment))
 
     assert result.plan is not None
-    assert result.plan.strategy_id == "DYAD_RELATIONSHIP_RESET"
-    assert result.plan.strategy_selection_source is StrategySelectionSource.BOUNDED_LLM
-    assert result.plan.semantic_selection_confidence == "high"
-    assert result.plan.semantic_relaxed_dimensions == [
-        "interaction_performance",
-        "task_process",
-    ]
-    assert provider.call_count == 1
-    assert provider.last_prompt is not None
-    assert "DYAD_RELATIONSHIP_RESET" in provider.last_prompt
-
-
-def test_bounded_llm_cannot_select_unapproved_candidate() -> None:
-    assessment = _assessment()
-    provider = FakeProvider(_choice("PARENT_INTENT_TRANSLATION"))
-    selector = StrategySelector(
-        load_strategy_library(),
-        strategy_choice_generator=StrategyChoiceGenerator(provider),
-    )
-
-    result = selector.select(assessment=assessment, decision=_decision(assessment))
-
-    assert result.plan is None
-    assert result.hold_reason == "semantic_selector_rejected"
+    assert result.plan.strategy_selection_source is StrategySelectionSource.DETERMINISTIC_FALLBACK
 
 
 def test_low_confidence_semantic_choice_is_held() -> None:
-    assessment = _assessment()
-    provider = FakeProvider(_choice("DYAD_RELATIONSHIP_RESET", confidence="low"))
+    assessment = _assessment(support_target="parent")
+    provider = FakeProvider(_choice("PARENT_INTENT_TRANSLATION", confidence="low"))
     selector = StrategySelector(
         load_strategy_library(),
         strategy_choice_generator=StrategyChoiceGenerator(provider),
@@ -147,12 +147,12 @@ def test_low_confidence_semantic_choice_is_held() -> None:
 
     result = selector.select(assessment=assessment, decision=_decision(assessment))
 
-    assert result.plan is None
-    assert result.hold_reason == "semantic_selector_rejected"
+    assert result.plan is not None
+    assert result.plan.strategy_selection_source is StrategySelectionSource.DETERMINISTIC_FALLBACK
 
 
 def test_semantic_selector_failure_holds_output() -> None:
-    assessment = _assessment()
+    assessment = _assessment(support_target="parent")
     selector = StrategySelector(
         load_strategy_library(),
         strategy_choice_generator=StrategyChoiceGenerator(FakeProvider()),
@@ -160,16 +160,16 @@ def test_semantic_selector_failure_holds_output() -> None:
 
     result = selector.select(assessment=assessment, decision=_decision(assessment))
 
-    assert result.plan is None
-    assert result.hold_reason == "semantic_selector_unavailable"
+    assert result.plan is not None
+    assert result.plan.strategy_selection_source is StrategySelectionSource.DETERMINISTIC_FALLBACK
 
 
-def test_without_semantic_selector_preserves_conservative_hold() -> None:
+def test_without_semantic_selector_uses_deterministic_closest_card() -> None:
     assessment = _assessment()
     result = StrategySelector(load_strategy_library()).select(
         assessment=assessment,
         decision=_decision(assessment),
     )
 
-    assert result.plan is None
-    assert result.hold_reason == "target_actor_evidence_insufficient"
+    assert result.plan is not None
+    assert result.plan.strategy_selection_source is StrategySelectionSource.EXACT_RULE

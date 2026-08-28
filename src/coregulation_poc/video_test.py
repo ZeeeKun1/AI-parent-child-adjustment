@@ -248,7 +248,7 @@ async def run_video_test(
                 if event_type == "response.done":
                     completed = True
         assessment = accumulator.parse_assessment()
-        validate_assessment_context(
+        assessment = validate_assessment_context(
             assessment,
             expected_session_id=session_id,
             duration_ms=media.metadata.duration_ms,
@@ -289,9 +289,7 @@ async def run_video_test(
 
     finished_ns = time.monotonic_ns()
     store.write_text("model_response.txt", accumulator.response_text)
-    store.write_text(
-        "input_transcript_best_effort.txt", accumulator.best_effort_input_transcript
-    )
+    store.write_text("input_transcript_best_effort.txt", accumulator.best_effort_input_transcript)
     store.write_json("transcription_events.json", accumulator.transcript_events)
     store.write_json("input_emotions.json", accumulator.input_emotion_observations)
     audit_result = _build_audit_result(

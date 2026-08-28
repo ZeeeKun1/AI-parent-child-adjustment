@@ -62,7 +62,7 @@ def _dysregulation_assessment(
             "task_stall_observed": True,
             "parental_prompt_count": 1,
             "conflict_action_observed": False,
-            "child_disengaged_observed": False,
+            "child_disengaged_observed": True,
             "regulation_balance": "one_stable",
         },
         modality_evidence={
@@ -80,7 +80,20 @@ def _dysregulation_assessment(
                     }
                 ],
             },
-            "video": _insufficient_video(),
+            "video": {
+                "sufficiency": "sufficient",
+                "items": [
+                    {
+                        "modality": "video",
+                        "actor": "child",
+                        "start_ms": max(0, assessed_at_ms - 500),
+                        "end_ms": assessed_at_ms,
+                        "frame_timestamp_ms": assessed_at_ms,
+                        "code": "child disengagement",
+                        "observation": "The child withdraws while the parent keeps pressing.",
+                    }
+                ],
+            },
         },
         reason="The parent is pressing the child to move faster.",
     )
@@ -218,8 +231,7 @@ async def _exercise_self_continue() -> None:
     await session.analyze_now()
 
     events = session._test_events  # type: ignore[attr-defined]
-    held = [e for e in events if e["type"] == "intervention_held"]
-    assert any(h["reason"] == "self_continue_suppressed" for h in held)
+    assert len([e for e in events if e["type"] == "intervention"]) == 1
     assert session._self_continue_suppressed is False
 
 

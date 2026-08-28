@@ -31,11 +31,18 @@ class BoundaryRuleConfig(BaseModel):
     fluctuation_stagnation_minimum_ms: int = Field(gt=0)
     dysregulation_stagnation_minimum_ms: int = Field(gt=0)
     spontaneous_recovery_window_ms: int = Field(gt=0)
+    trajectory_window_ms: int = Field(gt=0)
+    recovery_confirmation_ms: int = Field(gt=0)
     uncertain_evidence_retention_ms: int = Field(gt=0)
     parental_prompt_rate_window_ms: int = Field(gt=0)
+    parental_prompt_rate_minimum_observation_ms: int = Field(gt=0)
     high_parental_prompt_rate_per_minute_exclusive: float = Field(ge=0)
+    required_disruption_window_count: int = Field(ge=2)
+    required_consecutive_disruption_window_count: int = Field(ge=2)
     required_corroborating_signal_count: int = Field(ge=1)
     model_dysregulation_requires_operational_confirmation: bool
+    allow_immediate_dysregulation_for_marked_current_evidence: bool
+    marked_current_evidence_requires_independent_corroboration: bool
     coordination_disruption_task_processes: list[TaskProcess] = Field(min_length=1)
     coordination_disruption_performances: list[str] = Field(min_length=1)
     explicit_recovery_task_processes: list[TaskProcess] = Field(min_length=1)
@@ -52,9 +59,22 @@ class BoundaryRuleConfig(BaseModel):
             )
         if self.uncertain_evidence_retention_ms != self.spontaneous_recovery_window_ms:
             raise ValueError(
-                "uncertain evidence retention must use the existing 30-second "
-                "recovery boundary"
+                "uncertain evidence retention must use the existing 30-second recovery boundary"
             )
+        if self.trajectory_window_ms < self.dysregulation_stagnation_minimum_ms:
+            raise ValueError("trajectory window must include the dysregulation boundary")
+        if self.recovery_confirmation_ms > self.spontaneous_recovery_window_ms:
+            raise ValueError("recovery confirmation must fit the recovery window")
+        if (
+            self.parental_prompt_rate_minimum_observation_ms
+            > self.parental_prompt_rate_window_ms
+        ):
+            raise ValueError("prompt-rate observation must fit its rolling window")
+        if (
+            self.required_consecutive_disruption_window_count
+            > self.required_disruption_window_count
+        ):
+            raise ValueError("consecutive disruption count cannot exceed total count")
         return self
 
 
@@ -80,6 +100,8 @@ class BoundaryResolution:
     rule_applied: bool
     reason_code: str
     active_stall_duration_ms: int | None
+    rolling_disruption_window_count: int
+    consecutive_disruption_window_count: int
     rolling_parental_prompt_rate_per_minute: float | None
     corroborating_signals: tuple[str, ...]
     spontaneous_recovery: bool
@@ -90,9 +112,9 @@ class BoundaryResolution:
             "boundary_rule_applied": self.rule_applied,
             "boundary_reason_code": self.reason_code,
             "active_stall_duration_ms": self.active_stall_duration_ms,
-            "active_coordination_disruption_duration_ms": (
-                self.active_stall_duration_ms
-            ),
+            "active_coordination_disruption_duration_ms": (self.active_stall_duration_ms),
+            "rolling_disruption_window_count": self.rolling_disruption_window_count,
+            "consecutive_disruption_window_count": self.consecutive_disruption_window_count,
             "rolling_parental_prompt_rate_per_minute": (
                 self.rolling_parental_prompt_rate_per_minute
             ),
@@ -118,12 +140,12 @@ class BoundaryStateTracker:
     ) -> None:
         self.config = config
         self.allowed_performances = allowed_performances
-        self._active_disruption_started_at_ms: int | None = None
-        self._active_disruption_observed_ms: int = 0
-        self._last_counted_disruption_end_ms: int | None = None
+        self._disruption_windows: deque[tuple[int, int]] = deque()
+        self._recovery_windows: deque[tuple[int, int]] = deque()
         self._uncertainty_started_at_ms: int | None = None
-        self._episode_corroborating_signals: set[str] = set()
+        self._corroborating_windows: deque[tuple[int, tuple[str, ...]]] = deque()
         self._prompt_windows: deque[tuple[int, int, int]] = deque()
+        self._dysregulation_active = False
 
     @classmethod
     def from_codebook(cls) -> BoundaryStateTracker:
@@ -147,6 +169,7 @@ class BoundaryStateTracker:
             or assessment.confidence is ConfidenceLevel.LOW
             or model_state is None
         )
+        self._prune_trajectory(window_end_ms)
         if not evidence_available:
             return self._resolve_uncertainty(
                 assessment=assessment,
@@ -168,25 +191,59 @@ class BoundaryStateTracker:
 
         if explicit_recovery and not disruption_observed:
             active_duration_ms = self._active_disruption_duration()
+            if active_duration_ms is None:
+                self._recovery_windows.clear()
+                return self._resolution(
+                    assessment=assessment,
+                    model_state=model_state,
+                    reason_code="no_active_coordination_disruption",
+                    prompt_rate=prompt_rate,
+                    corroborating=current_corroborating,
+                )
+            recovery_duration_ms = self._record_recovery_window(
+                window_start_ms=window_start_ms,
+                window_end_ms=window_end_ms,
+            )
+            if recovery_duration_ms < self.config.recovery_confirmation_ms:
+                recovery_assessment = assessment
+                if self._dysregulation_active:
+                    recovery_assessment = self._replace_state(
+                        assessment,
+                        CoregulationState.FLUCTUATION,
+                        "dysregulation_recovery_provisional",
+                    )
+                return self._resolution(
+                    assessment=recovery_assessment,
+                    model_state=model_state,
+                    reason_code=(
+                        "dysregulation_recovery_provisional"
+                        if self._dysregulation_active
+                        else "recovery_candidate_retained_until_confirmed"
+                    ),
+                    stall_duration_ms=active_duration_ms,
+                    prompt_rate=prompt_rate,
+                    corroborating=self._ordered_episode_corroborating(window_end_ms),
+                )
             spontaneous_recovery = (
-                active_duration_ms is not None
-                and active_duration_ms <= self.config.spontaneous_recovery_window_ms
+                active_duration_ms <= self.config.spontaneous_recovery_window_ms
             )
             self._clear_active_disruption()
             return self._resolution(
                 assessment=assessment,
                 model_state=model_state,
-                reason_code=(
-                    "spontaneous_recovery_within_30_seconds"
-                    if spontaneous_recovery
-                    else "no_active_task_stall"
-                ),
+                reason_code="recovery_confirmed_after_stable_coordination",
                 prompt_rate=prompt_rate,
                 corroborating=current_corroborating,
                 spontaneous_recovery=spontaneous_recovery,
             )
 
         if not disruption_observed:
+            if model_state is CoregulationState.DYSREGULATION:
+                assessment = self._replace_state(
+                    assessment,
+                    CoregulationState.FLUCTUATION,
+                    "dysregulation_without_current_disruption_downgraded",
+                )
             return self._resolve_uncertainty(
                 assessment=assessment,
                 model_state=model_state,
@@ -201,10 +258,15 @@ class BoundaryStateTracker:
             window_start_ms=window_start_ms,
             window_end_ms=window_end_ms,
         )
-        self._episode_corroborating_signals.update(current_corroborating)
-        corroborating = self._ordered_episode_corroborating()
+        self._recovery_windows.clear()
+        self._uncertainty_started_at_ms = None
+        self._record_corroborating_window(window_end_ms, current_corroborating)
+        corroborating = self._ordered_episode_corroborating(window_end_ms)
+        disruption_window_count = len(self._disruption_windows)
+        consecutive_disruption_window_count = self._consecutive_disruption_window_count()
 
         if model_state is CoregulationState.HIGH_RISK:
+            self._dysregulation_active = True
             return self._resolution(
                 assessment=assessment,
                 model_state=model_state,
@@ -216,23 +278,51 @@ class BoundaryStateTracker:
 
         target_state = model_state
         reason_code = "disruption_below_fluctuation_boundary"
-        if disruption_duration_ms >= self.config.dysregulation_stagnation_minimum_ms:
-            if len(corroborating) >= self.config.required_corroborating_signal_count:
-                target_state = CoregulationState.DYSREGULATION
-                reason_code = "dysregulation_30_seconds_disruption_with_corroboration"
-            else:
-                if self.config.model_dysregulation_requires_operational_confirmation:
-                    target_state = CoregulationState.FLUCTUATION
-                reason_code = "dysregulation_duration_met_waiting_for_corroboration"
+        marked_current = (
+            self.config.allow_immediate_dysregulation_for_marked_current_evidence
+            and self._marked_current_disruption(assessment, current_corroborating)
+        )
+        trajectory_confirmed = all(
+            (
+                disruption_duration_ms
+                >= self.config.dysregulation_stagnation_minimum_ms,
+                disruption_window_count >= self.config.required_disruption_window_count,
+                consecutive_disruption_window_count
+                >= self.config.required_consecutive_disruption_window_count,
+                len(corroborating) >= self.config.required_corroborating_signal_count,
+            )
+        )
+        if marked_current:
+            target_state = CoregulationState.DYSREGULATION
+            reason_code = "marked_current_disruption_supports_dysregulation"
+        elif self._dysregulation_active:
+            target_state = CoregulationState.DYSREGULATION
+            reason_code = "active_dysregulation_continues_with_current_disruption"
+        elif trajectory_confirmed:
+            target_state = CoregulationState.DYSREGULATION
+            reason_code = "dysregulation_rolling_trajectory_with_independent_corroboration"
+        elif disruption_duration_ms >= self.config.dysregulation_stagnation_minimum_ms:
+            if self.config.model_dysregulation_requires_operational_confirmation:
+                target_state = CoregulationState.FLUCTUATION
+            reason_code = "dysregulation_candidate_waiting_for_balanced_evidence"
         elif disruption_duration_ms >= self.config.fluctuation_stagnation_minimum_ms:
-            target_state = CoregulationState.FLUCTUATION
-            reason_code = "fluctuation_10_to_30_seconds_coordination_disruption"
+            if (
+                model_state is CoregulationState.DYSREGULATION
+                and not self.config.model_dysregulation_requires_operational_confirmation
+            ):
+                reason_code = "model_dysregulation_preserved_with_early_disruption_evidence"
+            else:
+                target_state = CoregulationState.FLUCTUATION
+                reason_code = "fluctuation_10_to_30_seconds_coordination_disruption"
         elif (
             model_state is CoregulationState.DYSREGULATION
             and self.config.model_dysregulation_requires_operational_confirmation
         ):
             target_state = CoregulationState.FLUCTUATION
             reason_code = "dysregulation_candidate_waiting_for_duration"
+
+        if target_state is CoregulationState.DYSREGULATION:
+            self._dysregulation_active = True
 
         resolved = self._replace_state(assessment, target_state, reason_code)
         return self._resolution(
@@ -248,9 +338,7 @@ class BoundaryStateTracker:
         signals = assessment.boundary_signals
         if signals.task_stall_observed is True:
             return True
-        if assessment.task_process in set(
-            self.config.coordination_disruption_task_processes
-        ):
+        if assessment.task_process in set(self.config.coordination_disruption_task_processes):
             return True
         return bool(
             set(assessment.interaction_performance).intersection(
@@ -263,9 +351,7 @@ class BoundaryStateTracker:
         return all(
             (
                 signals.task_stall_observed is False,
-                assessment.task_process in set(
-                    self.config.explicit_recovery_task_processes
-                ),
+                assessment.task_process in set(self.config.explicit_recovery_task_processes),
                 assessment.trajectory
                 in {InteractionTrajectory.STABLE, InteractionTrajectory.RECOVERING},
                 signals.conflict_action_observed is False,
@@ -280,18 +366,71 @@ class BoundaryStateTracker:
         window_start_ms: int,
         window_end_ms: int,
     ) -> int:
-        if self._active_disruption_started_at_ms is None:
-            self._active_disruption_started_at_ms = window_start_ms
-        counted_start = window_start_ms
-        if self._last_counted_disruption_end_ms is not None:
-            counted_start = max(counted_start, self._last_counted_disruption_end_ms)
-        self._active_disruption_observed_ms += max(0, window_end_ms - counted_start)
-        self._last_counted_disruption_end_ms = max(
-            window_end_ms,
-            self._last_counted_disruption_end_ms or 0,
-        )
+        self._disruption_windows.append((window_start_ms, window_end_ms))
+        self._prune_trajectory(window_end_ms)
+        return self._active_disruption_duration() or 0
+
+    def _record_recovery_window(
+        self,
+        *,
+        window_start_ms: int,
+        window_end_ms: int,
+    ) -> int:
+        if (
+            self._recovery_windows
+            and window_start_ms
+            > self._recovery_windows[-1][1] + self.config.expected_window_ms
+        ):
+            self._recovery_windows.clear()
+        self._recovery_windows.append((window_start_ms, window_end_ms))
         self._uncertainty_started_at_ms = None
-        return self._active_disruption_observed_ms
+        return self._merged_duration(self._recovery_windows)
+
+    def _record_corroborating_window(
+        self,
+        window_end_ms: int,
+        signals: tuple[str, ...],
+    ) -> None:
+        if signals:
+            self._corroborating_windows.append((window_end_ms, signals))
+
+    def _prune_trajectory(self, window_end_ms: int) -> None:
+        cutoff = window_end_ms - self.config.trajectory_window_ms
+        while self._disruption_windows and self._disruption_windows[0][1] <= cutoff:
+            self._disruption_windows.popleft()
+        while self._corroborating_windows and self._corroborating_windows[0][0] <= cutoff:
+            self._corroborating_windows.popleft()
+        if not self._disruption_windows:
+            self._recovery_windows.clear()
+
+    def _consecutive_disruption_window_count(self) -> int:
+        """Count the most recent approximately consecutive disrupted windows."""
+
+        if not self._disruption_windows:
+            return 0
+        count = 1
+        windows = tuple(self._disruption_windows)
+        for previous, current in zip(
+            reversed(windows[:-1]), reversed(windows[1:]), strict=True
+        ):
+            if current[0] > previous[1] + self.config.expected_window_ms:
+                break
+            count += 1
+        return count
+
+    @staticmethod
+    def _merged_duration(windows: deque[tuple[int, int]]) -> int:
+        if not windows:
+            return 0
+        duration_ms = 0
+        current_start, current_end = windows[0]
+        for start_ms, end_ms in tuple(windows)[1:]:
+            if start_ms <= current_end:
+                current_end = max(current_end, end_ms)
+                continue
+            duration_ms += current_end - current_start
+            current_start, current_end = start_ms, end_ms
+        return duration_ms + current_end - current_start
 
     def _resolve_uncertainty(
         self,
@@ -331,27 +470,66 @@ class BoundaryStateTracker:
             reason_code=f"{reason_code}_candidate_retained",
             stall_duration_ms=active_duration_ms,
             prompt_rate=prompt_rate,
-            corroborating=self._ordered_episode_corroborating(),
+            corroborating=self._ordered_episode_corroborating(window_end_ms),
         )
 
     def _active_disruption_duration(self) -> int | None:
-        if self._active_disruption_started_at_ms is None:
+        if not self._disruption_windows:
             return None
-        return self._active_disruption_observed_ms
+        return self._merged_duration(self._disruption_windows)
 
-    def _ordered_episode_corroborating(self) -> tuple[str, ...]:
+    def _ordered_episode_corroborating(self, window_end_ms: int) -> tuple[str, ...]:
+        self._prune_trajectory(window_end_ms)
+        observed = {
+            signal
+            for _, signals in self._corroborating_windows
+            for signal in signals
+        }
         return tuple(
             item
             for item in self.config.corroborating_signals
-            if item in self._episode_corroborating_signals
+            if item in observed
         )
 
     def _clear_active_disruption(self) -> None:
-        self._active_disruption_started_at_ms = None
-        self._active_disruption_observed_ms = 0
-        self._last_counted_disruption_end_ms = None
+        self._disruption_windows.clear()
+        self._recovery_windows.clear()
+        self._corroborating_windows.clear()
         self._uncertainty_started_at_ms = None
-        self._episode_corroborating_signals.clear()
+        self._dysregulation_active = False
+
+    def _marked_current_disruption(
+        self,
+        assessment: StateAssessment,
+        current_corroborating: tuple[str, ...],
+    ) -> bool:
+        signals = assessment.boundary_signals
+        evidence = assessment.modality_evidence.all_items
+        actors = {item.actor.value for item in evidence}
+        modalities = {item.modality.value for item in evidence}
+        independently_corroborated = bool(
+            {"parent", "child"}.issubset(actors)
+            or "both" in actors
+            or len(modalities) >= 2
+        )
+        explicit_disengagement = bool(
+            signals.child_disengaged_observed is True
+            and assessment.task_process is TaskProcess.DISENGAGED
+            and independently_corroborated
+        )
+        marked_conflict = bool(
+            signals.conflict_action_observed is True
+            and (
+                signals.child_disengaged_observed is True
+                or (
+                    signals.regulation_balance is RegulationBalance.BOTH_CROSSED
+                    and independently_corroborated
+                )
+            )
+        )
+        if not self.config.marked_current_evidence_requires_independent_corroboration:
+            return bool(marked_conflict or explicit_disengagement or current_corroborating)
+        return marked_conflict or explicit_disengagement
 
     def _record_prompt_window(
         self,
@@ -370,7 +548,7 @@ class BoundaryStateTracker:
         cutoff = window_end_ms - self.config.parental_prompt_rate_window_ms
         eligible = [item for item in self._prompt_windows if item[1] > cutoff]
         observed_ms = sum(end - start for start, end, _ in eligible)
-        if observed_ms <= 0:
+        if observed_ms < self.config.parental_prompt_rate_minimum_observation_ms:
             return None
         prompt_count = sum(count for _, _, count in eligible)
         return round(prompt_count * 60_000 / observed_ms, 3)
@@ -405,9 +583,7 @@ class BoundaryStateTracker:
             return assessment
 
         allowed = self.allowed_performances[target_state]
-        performances = [
-            item for item in assessment.interaction_performance if item in allowed
-        ]
+        performances = [item for item in assessment.interaction_performance if item in allowed]
         if not performances:
             performances = [
                 "brief task stall"
@@ -431,15 +607,13 @@ class BoundaryStateTracker:
                 ),
                 "interaction_performance": performances,
                 "support_need": support_need,
-                "reason": (
-                    f"{assessment.reason} Data-derived boundary rule: {reason_code}."
-                ),
+                "reason": (f"{assessment.reason} Data-derived boundary rule: {reason_code}."),
             }
         )
         return StateAssessment.model_validate(payload)
 
-    @staticmethod
     def _resolution(
+        self,
         *,
         assessment: StateAssessment,
         model_state: CoregulationState | None,
@@ -455,6 +629,8 @@ class BoundaryStateTracker:
             rule_applied=assessment.state is not model_state,
             reason_code=reason_code,
             active_stall_duration_ms=stall_duration_ms,
+            rolling_disruption_window_count=len(self._disruption_windows),
+            consecutive_disruption_window_count=self._consecutive_disruption_window_count(),
             rolling_parental_prompt_rate_per_minute=prompt_rate,
             corroborating_signals=corroborating,
             spontaneous_recovery=spontaneous_recovery,
