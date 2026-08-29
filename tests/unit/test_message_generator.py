@@ -232,6 +232,23 @@ class TestMessagePrompt:
         )
         assert "快点写" in prompt
 
+    def test_prompt_contains_recent_messages_as_wording_context_only(self) -> None:
+        library = load_strategy_library()
+        card = library.cards[2]
+        prompt = build_message_prompt(
+            card=card,
+            evidence=[],
+            max_characters=90,
+            max_sentences=2,
+            banned_phrases=[],
+            recent_messages=["家长先慢一点，让孩子把这一句说完。"],
+        )
+
+        assert "近期已经呈现的话术" in prompt
+        assert "家长先慢一点，让孩子把这一句说完。" in prompt
+        assert "只用于避免表达重复" in prompt
+        assert "不得改变所选策略" in prompt
+
 
 # ---------------------------------------------------------------------------
 # Selector + LLM tests
@@ -304,6 +321,52 @@ class TestSelectorWithGenerator:
         assert result.plan.message_source is MessageSource.CONSTRAINED_LLM
         assert all(result.plan.validation_checks.values())
         assert result.plan.validation_checks["contextual_rewrite_completed"] is True
+        assert provider.call_count == 2
+
+    def test_recently_repeated_wording_is_rewritten_once(self) -> None:
+        repeated = "家长，孩子刚才还在思考，可以先放慢语速，只问一个问题。"
+        varied = "刚才的问题有些密，可以留一点时间，让孩子先把想法说完。"
+        provider = SequenceTextChatProvider(
+            _llm_json(message=repeated),
+            _llm_json(message=varied),
+        )
+        selector = _selector(_generator(provider))
+        observation = _observation()
+        decision = _decision()
+
+        result = selector.select(
+            assessment=observation.assessment,
+            decision=decision,
+            recent_messages=[repeated],
+        )
+
+        assert result.plan is not None
+        assert result.plan.message == varied
+        assert result.plan.validation_checks["contextual_rewrite_completed"] is True
+        assert result.plan.validation_checks["recent_message_variation_reviewed"] is True
+        assert provider.call_count == 2
+        assert provider.last_prompt is not None
+        assert "与近期话术表达过于相似" in provider.last_prompt
+
+    def test_failed_variation_rewrite_keeps_first_safe_message(self) -> None:
+        repeated = "家长，孩子刚才还在思考，可以先放慢语速，只问一个问题。"
+        provider = SequenceTextChatProvider(
+            _llm_json(message=repeated),
+            _llm_json(message="答案是三"),
+        )
+        selector = _selector(_generator(provider))
+        observation = _observation()
+        decision = _decision()
+
+        result = selector.select(
+            assessment=observation.assessment,
+            decision=decision,
+            recent_messages=[repeated],
+        )
+
+        assert result.plan is not None
+        assert result.plan.message == repeated
+        assert result.plan.validation_checks["variation_rewrite_fallback_used"] is True
         assert provider.call_count == 2
 
     def test_llm_with_banned_phrase_falls_back(self) -> None:

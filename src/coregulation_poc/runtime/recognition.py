@@ -12,7 +12,6 @@ from coregulation_poc.acoustics.speaker_binding import SpeakerBinding, bind_spea
 from coregulation_poc.acoustics.tencent_voiceprint import (
     SpeakerEnrollmentRecord,
     TencentSpeakerEnrollment,
-    TencentVoiceprintError,
     TencentVoiceprintService,
 )
 from coregulation_poc.capture.media import MediaChunk, MediaKind
@@ -61,9 +60,9 @@ class StateRecognizer(Protocol):
 class WindowObservation:
     """Window-local observations produced before trajectory judgment.
 
-    Perception can run in parallel for consecutive media windows.  Judgment
-    remains chronological so every window receives the latest completed state
-    history instead of losing windows while the multimodal model is busy.
+    Perception and window-local judgment can run concurrently for consecutive
+    windows. The runtime commits their results chronologically and owns the
+    final cross-window boundary state.
     """
 
     session_id: str
@@ -172,7 +171,7 @@ class QwenWindowRecognizer:
     ) -> WindowObservation:
         """Extract window-local multimodal facts without judging trajectory."""
         # --- Speaker binding ------------------------------------------------
-        # Formal browser sessions use Tencent 1:N voiceprint matching. Legacy
+        # Formal browser sessions use pairwise Tencent 1:1 voiceprint matching. Legacy
         # file enrollment remains available for offline/local diagnostics.
         audio_chunks = window.audio_chunks
         if isinstance(self.enrollment, TencentSpeakerEnrollment):
@@ -180,22 +179,16 @@ class QwenWindowRecognizer:
                 raise RuntimeError(
                     "Tencent voiceprint enrollment is present but the service is unavailable"
                 )
-            # The Tencent SDK client is shared by one family session.  Keep
-            # enrollment lookup serialized while allowing the more expensive
-            # multimodal perception requests to overlap.
+            # The Tencent SDK client is shared by one family session. Keep the
+            # two-role comparison serialized while allowing multimodal
+            # perception requests to overlap. Provider-level retries and
+            # low-confidence fallback are handled inside identify_speakers.
             async with self._voiceprint_lock:
-                for attempt in range(2):
-                    try:
-                        binding = await asyncio.to_thread(
-                            self.voiceprint_service.identify_speakers,
-                            audio_chunks,
-                            self.enrollment,
-                        )
-                        break
-                    except TencentVoiceprintError:
-                        if attempt:
-                            raise
-                        await asyncio.sleep(0.4)
+                binding = await asyncio.to_thread(
+                    self.voiceprint_service.identify_speakers,
+                    audio_chunks,
+                    self.enrollment,
+                )
             self.voiceprint_api_call_count += binding.provider_request_count
             self.api_call_count += binding.provider_request_count
         else:
@@ -241,7 +234,7 @@ class QwenWindowRecognizer:
         history: tuple[StateAssessment, ...],
         history_available: bool,
     ) -> StateAssessment:
-        """Judge one prepared observation using the latest ordered history."""
+        """Judge one prepared observation using an immutable history snapshot."""
 
         # --- Stage 2: Judgment (text model via HTTP) -------------------------
         return await self._assess_judgment(

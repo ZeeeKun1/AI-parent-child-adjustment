@@ -143,6 +143,8 @@ async def run_pipeline_test(
             "history_assessments": loop_config.history_assessments,
             "max_parallel_perception": loop_config.max_parallel_perception,
             "max_parallel_judgment": loop_config.max_parallel_judgment,
+            "analysis_deadline_seconds": loop_config.analysis_deadline_seconds,
+            "max_pending_analysis_jobs": loop_config.max_pending_analysis_jobs,
             "max_intervention_staleness_ms": (
                 loop_config.max_intervention_staleness_ms
             ),

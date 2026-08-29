@@ -213,16 +213,20 @@ class _SlowStagedRecognizer:
     def __init__(self) -> None:
         self.api_call_count = 0
         self.release = asyncio.Event()
+        self.judgment_release = asyncio.Event()
+        self.two_judgments_started = asyncio.Event()
         self.observed_windows: list[int] = []
         self.judged_windows: list[int] = []
         self.history_lengths: list[int] = []
+        self.active_judgments = 0
+        self.max_active_judgments = 0
 
     async def observe(self, *, session_id: str, window: MediaWindow) -> object:
-        del session_id
         self.observed_windows.append(window.end_ms)
         await self.release.wait()
         self.api_call_count += 1
         return SimpleNamespace(
+            session_id=session_id,
             window=window,
             speaker_binding=None,
             acoustic_features=None,
@@ -241,14 +245,25 @@ class _SlowStagedRecognizer:
         self.judged_windows.append(window.end_ms)
         self.history_lengths.append(len(history))
         self.api_call_count += 1
-        return _assessment(
-            session_id="no-loss-test",
-            assessed_at_ms=window.end_ms,
-            state="normal",
-            performance="steady coordination",
-            actor="both",
-            previous_state=previous_state,
+        self.active_judgments += 1
+        self.max_active_judgments = max(
+            self.max_active_judgments,
+            self.active_judgments,
         )
+        if self.active_judgments >= 2:
+            self.two_judgments_started.set()
+        try:
+            await self.judgment_release.wait()
+            return _assessment(
+                session_id=observation.session_id,
+                assessed_at_ms=window.end_ms,
+                state="normal",
+                performance="steady coordination",
+                actor="both",
+                previous_state=previous_state,
+            )
+        finally:
+            self.active_judgments -= 1
 
     async def assess(self, **_: object) -> StateAssessment:
         raise AssertionError("staged recognition should use observe then judge")
@@ -347,7 +362,7 @@ async def _exercise_queue_cancelled_on_recovery() -> None:
     assert not any(event["type"] == "intervention_queue_cancelled" for event in events)
 
 
-def test_model_latency_alone_does_not_cancel_an_actionable_intervention() -> None:
+def test_stale_actionable_result_is_recorded_without_obsolete_intervention() -> None:
     asyncio.run(_exercise_latency_without_superseding_judgment())
 
 
@@ -374,17 +389,19 @@ async def _exercise_latency_without_superseding_judgment() -> None:
     await session.accept_chunk(_image(10_000))
     await recognizer.started.wait()
 
-    # Capture keeps moving while the model is slow, but no newer judgment has
-    # superseded the actionable result.
+    # Capture keeps moving while the model is slow. The state remains part of
+    # the research record, but its prompt no longer matches the live moment.
     await session.accept_chunk(_audio(40_000))
     await session.accept_chunk(_image(40_001))
     recognizer.release.set()
     await session.wait_for_analysis()
 
-    assert any(event["type"] == "intervention" for event in events)
-    assert not any(
-        event.get("reason") == "superseded_stale_assessment" for event in events
+    assert any(event["type"] == "state_update" for event in events)
+    assert not any(event["type"] == "intervention" for event in events)
+    assert any(
+        event.get("reason") == "stale_assessment_record_only" for event in events
     )
+    assert session.runtime_metrics["stale_intervention_count"] == 1
     await session.stop("completed")
 
 
@@ -436,14 +453,109 @@ async def _exercise_no_loss_staged_pipeline() -> None:
     assert session.assessment_count == 0
 
     recognizer.release.set()
+    await recognizer.two_judgments_started.wait()
+    assert recognizer.max_active_judgments == 2
+    recognizer.judgment_release.set()
     await session.wait_for_analysis()
 
     assert recognizer.observed_windows == [10_000, 20_000, 30_000]
     assert sorted(recognizer.judged_windows) == [10_000, 20_000, 30_000]
-    # Perception calls can overlap, but judgment sees every earlier result.
-    assert recognizer.history_lengths == [0, 1, 2]
+    # Each model call uses a scheduling-time snapshot. The ordered local
+    # controller, not a mutable prompt history, owns cross-window continuity.
+    assert recognizer.history_lengths == [0, 0, 0]
     assert session.assessment_count == 3
-    assert len([event for event in events if event["type"] == "state_update"]) == 3
+    updates = [event for event in events if event["type"] == "state_update"]
+    assert len(updates) == 3
+    assert [event["sequence"] for event in updates] == [1, 2, 3]
+    assert [event["previous_state"] for event in updates] == [None, "normal", "normal"]
+    await session.stop("completed")
+
+
+def test_timed_out_window_keeps_ordered_slot_and_late_result_is_record_only() -> None:
+    asyncio.run(_exercise_timed_out_ordered_slot())
+
+
+async def _exercise_timed_out_ordered_slot() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    recognizer = _SlowStagedRecognizer()
+    session = RealtimeSession(
+        session_id="deadline-test",
+        recognizer=recognizer,
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=10_000,
+            analysis_deadline_seconds=0.02,
+        ),
+    )
+    await session.start()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    recognizer.release.set()
+    await session.wait_for_analysis()
+
+    update = next(event for event in events if event["type"] == "state_update")
+    assert update["sequence"] == 1
+    assert update["state"] is None
+    assert update["evidence_sufficiency"] == "insufficient"
+    assert session.runtime_metrics["analysis_timeout_count"] == 1
+
+    recognizer.judgment_release.set()
+    for _ in range(20):
+        if any(event["type"] == "late_analysis_result" for event in events):
+            break
+        await asyncio.sleep(0.01)
+    late = next(event for event in events if event["type"] == "late_analysis_result")
+    assert late["state"] == "normal"
+    assert late["record_only"] is True
+    assert session.assessment_count == 1
+    await session.stop("completed")
+
+
+def test_analysis_capacity_is_bounded_without_losing_timeline_slots() -> None:
+    asyncio.run(_exercise_bounded_analysis_capacity())
+
+
+async def _exercise_bounded_analysis_capacity() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    recognizer = _SlowStagedRecognizer()
+    session = RealtimeSession(
+        session_id="capacity-test",
+        recognizer=recognizer,
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=10_000,
+            max_pending_analysis_jobs=2,
+        ),
+    )
+    await session.start()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    for end_ms in (20_000, 30_000, 40_000, 50_000):
+        await session.accept_chunk(_audio(end_ms - 9_999))
+        await session.accept_chunk(_image(end_ms))
+
+    recognizer.release.set()
+    await recognizer.two_judgments_started.wait()
+    recognizer.judgment_release.set()
+    await session.wait_for_analysis()
+
+    updates = [event for event in events if event["type"] == "state_update"]
+    event_summary = [
+        (event["type"], event.get("message"), event.get("reason")) for event in events
+    ]
+    assert not [event for event in events if event["type"] == "loop_error"]
+    assert [event["sequence"] for event in updates] == [1, 2, 3, 4, 5], event_summary
+    assert len([event for event in updates if event["state"] is None]) == 3
+    assert session.runtime_metrics["analysis_capacity_skip_count"] == 3
+    assert len([event for event in events if event["type"] == "analysis_skipped"]) == 3
     await session.stop("completed")
 
 
@@ -568,6 +680,7 @@ async def _exercise_four_module_loop() -> None:
         event for event in events if event["type"] == "delivery_execution_received"
     )
     assert delivery_receipt["delivery_timeline_ms"] == 30_200
+    assert session.runtime_metrics["recent_intervention_message_count"] == 1
 
     await session.accept_chunk(_audio(41_300))
     await session.accept_chunk(_image(41_301))

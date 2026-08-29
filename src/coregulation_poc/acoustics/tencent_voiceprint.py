@@ -2,9 +2,10 @@
 
 The browser sends short PCM16 enrollment recordings to the application server.
 This module registers those recordings with Tencent Cloud, keeps only opaque
-voiceprint identifiers in memory for the active experiment, performs 1:N group
-verification on voiced interaction segments, and deletes the remote records at
-the end of the experiment.
+voiceprint identifiers in memory for the active experiment, compares every
+voiced interaction segment with the enrolled parent and child using two 1:1
+verification requests, and deletes the remote records at the end of the
+experiment.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import base64
 import secrets
 import string
 import threading
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -55,7 +57,7 @@ class TencentSpeakerEnrollment:
     family_id: str
     group_id: str = field(repr=False)
     speakers: dict[str, TencentEnrolledSpeaker] = field(default_factory=dict)
-    model_name: str = "tencent_voiceprint_1n"
+    model_name: str = "tencent_voiceprint_pairwise_1to1"
 
     @property
     def is_complete(self) -> bool:
@@ -97,6 +99,7 @@ class TencentVoiceprintService:
     """Synchronous official-SDK adapter; call from ``asyncio.to_thread``."""
 
     provider_name = "tencent_cloud_voiceprint"
+    minimum_score_margin = 5.0
 
     def __init__(
         self,
@@ -217,7 +220,7 @@ class TencentVoiceprintService:
         sample_rate: int = 16_000,
         min_segment_ms: int = 800,
     ) -> SpeakerBinding:
-        """Assign every accepted voiced segment to the best parent/child match."""
+        """Assign every voiced segment by comparing both enrolled family roles."""
 
         if not enrollment.is_complete:
             raise TencentVoiceprintError(
@@ -232,19 +235,16 @@ class TencentVoiceprintService:
         if not timed_segments:
             return SpeakerBinding(
                 bound=False,
-                method="tencent_voiceprint_1n",
+                method="tencent_voiceprint_pairwise_1to1",
                 limitation_reason="No sufficiently long voiced segment was available.",
             )
 
-        id_to_label = {
-            speaker.voiceprint_id: label
-            for label, speaker in enrollment.speakers.items()
-        }
         segments: list[SpeakerSegment] = []
         parent_count = 0
         child_count = 0
         low_confidence_count = 0
         request_count = 0
+        provider_failure_count = 0
 
         for start_ms, end_ms, start_sample, end_sample in timed_segments:
             segment_audio = samples[start_sample:end_sample]
@@ -263,54 +263,86 @@ class TencentVoiceprintService:
                 np.rint(request_audio * 32768.0), -32768, 32767
             ).astype("<i2").tobytes()
 
-            request = models.VoicePrintGroupVerifyRequest()
-            request.VoiceFormat = 0
-            request.SampleRate = sample_rate
-            request.Data = base64.b64encode(pcm_audio).decode("ascii")
-            request.GroupId = enrollment.group_id
-            request.TopN = 2
-            request_count += 1
-            try:
-                response = self._call("VoicePrintGroupVerify", request)
-            except TencentVoiceprintError:
-                if not is_short:
-                    raise
+            encoded_audio = base64.b64encode(pcm_audio).decode("ascii")
+            role_results: dict[str, tuple[float, int | None]] = {}
+            for label in ("parent", "child"):
+                enrolled_speaker = enrollment.speakers[label]
                 response = None
+                for attempt in range(2):
+                    request = models.VoicePrintVerifyRequest()
+                    request.VoiceFormat = 0
+                    request.SampleRate = sample_rate
+                    request.Data = encoded_audio
+                    request.VoicePrintId = enrolled_speaker.voiceprint_id
+                    request_count += 1
+                    try:
+                        response = self._call("VoicePrintVerify", request)
+                        break
+                    except TencentVoiceprintError:
+                        provider_failure_count += 1
+                        if attempt == 0:
+                            time.sleep(0.4)
 
-            verify_tops = getattr(getattr(response, "Data", None), "VerifyTops", None)
-            known_matches: list[tuple[float, str]] = []
-            for match in verify_tops or []:
-                voiceprint_id = getattr(match, "VoicePrintId", None)
-                label = id_to_label.get(voiceprint_id)
-                if label is None:
-                    continue
+                data = getattr(response, "Data", None)
                 try:
-                    score = float(match.Score)
+                    score = float(getattr(data, "Score", None))
                 except (TypeError, ValueError):
                     continue
-                known_matches.append((score, label))
+                if not np.isfinite(score) or not 0 <= score <= 100:
+                    continue
+                decision_value = getattr(data, "Decision", None)
+                decision = decision_value if isinstance(decision_value, int) else None
+                role_results[label] = (score, decision)
+
             voiced_f0, _ = _extract_segment_f0(segment_audio, sample_rate)
-            if not known_matches and not is_short:
-                raise TencentVoiceprintError(
-                    "Tencent 1:N verification returned no registered family speaker"
-                )
-            if known_matches:
-                score, label = max(known_matches, key=lambda item: item[0])
+            parent_result = role_results.get("parent")
+            child_result = role_results.get("child")
+            complete_comparison = parent_result is not None and child_result is not None
+
+            if complete_comparison:
+                parent_score = parent_result[0]
+                child_score = child_result[0]
+                label = "parent" if parent_score >= child_score else "child"
+                score = parent_score if label == "parent" else child_score
                 speaker = (
                     SpeakerLabel.PARENT if label == "parent" else SpeakerLabel.CHILD
                 )
             else:
-                # Last-resort role assignment for a short response when the
-                # provider cannot score it. It is never presented as a verified
-                # match; the state model receives the low-confidence marker.
-                score = None
-                median_f0 = float(np.median(voiced_f0)) if voiced_f0.size else 0.0
-                speaker = (
-                    SpeakerLabel.CHILD
-                    if median_f0 >= 260.0
-                    else SpeakerLabel.PARENT
-                )
-            forced_assignment = is_short or score is None or score < self.minimum_score
+                parent_score = None if parent_result is None else parent_result[0]
+                child_score = None if child_result is None else child_result[0]
+                usable_single = next(iter(role_results.items()), None)
+                if usable_single is not None and usable_single[1][0] >= self.minimum_score:
+                    label, (score, _decision) = usable_single
+                    speaker = (
+                        SpeakerLabel.PARENT
+                        if label == "parent"
+                        else SpeakerLabel.CHILD
+                    )
+                else:
+                    # A provider outage must not erase the entire state window.
+                    # F0 is only a continuity fallback and is always marked low
+                    # confidence; it never masquerades as a verified match.
+                    score = None
+                    median_f0 = float(np.median(voiced_f0)) if voiced_f0.size else 0.0
+                    speaker = (
+                        SpeakerLabel.CHILD
+                        if median_f0 >= 260.0
+                        else SpeakerLabel.PARENT
+                    )
+
+            ambiguous_scores = (
+                complete_comparison
+                and parent_score is not None
+                and child_score is not None
+                and abs(parent_score - child_score) < self.minimum_score_margin
+            )
+            forced_assignment = (
+                is_short
+                or not complete_comparison
+                or score is None
+                or score < self.minimum_score
+                or ambiguous_scores
+            )
             if forced_assignment:
                 low_confidence_count += 1
             confidence = "low" if forced_assignment else "high"
@@ -332,6 +364,12 @@ class TencentVoiceprintService:
                     voiced_frame_count=int(voiced_f0.size),
                     speaker=speaker,
                     provider_score=(None if score is None else round(score, 1)),
+                    parent_provider_score=(
+                        None if parent_score is None else round(parent_score, 1)
+                    ),
+                    child_provider_score=(
+                        None if child_score is None else round(child_score, 1)
+                    ),
                     confidence=confidence,
                     forced_assignment=forced_assignment,
                 )
@@ -344,8 +382,9 @@ class TencentVoiceprintService:
             segments=segments,
             parent_segment_count=parent_count,
             child_segment_count=child_count,
-            method="tencent_voiceprint_1n",
+            method="tencent_voiceprint_pairwise_1to1",
             provider_request_count=request_count,
+            provider_failure_count=provider_failure_count,
             low_confidence_segment_count=low_confidence_count,
         )
 

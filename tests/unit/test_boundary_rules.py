@@ -106,7 +106,8 @@ def test_default_realtime_cadence_covers_thirty_minutes_at_ten_seconds() -> None
     assert config.history_assessments == 6
     assert config.max_parallel_perception == 3
     assert config.max_parallel_judgment == 2
-    assert config.max_intervention_staleness_ms == 20_000
+    assert config.analysis_deadline_seconds == 35.0
+    assert config.max_intervention_staleness_ms == 35_000
 
 
 def test_boundary_config_uses_data_derived_cutoffs() -> None:

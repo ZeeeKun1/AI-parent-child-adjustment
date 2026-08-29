@@ -56,6 +56,7 @@ def build_message_prompt(
     task_context: dict[str, Any] | None = None,
     previous_state: str | None = None,
     recovery_status: str | None = None,
+    recent_messages: list[str] | None = None,
     previous_draft: str | None = None,
     failed_checks: list[str] | None = None,
 ) -> str:
@@ -82,6 +83,9 @@ def build_message_prompt(
         Optional previous coregulation state value.
     recovery_status:
         Optional recovery status value.
+    recent_messages:
+        Up to three messages that were actually shown recently. They are
+        supplied only to vary wording; they never change the selected card.
 
     Returns
     -------
@@ -112,16 +116,36 @@ def build_message_prompt(
         context_lines.append(f"恢复状态：{recovery_status}")
     context_block = "\n".join(context_lines) if context_lines else "（无额外上下文）"
 
+    recent = [
+        re.sub(r"\s+", " ", message).strip()
+        for message in (recent_messages or [])[-3:]
+        if isinstance(message, str) and message.strip()
+    ]
+    recent_block = (
+        "\n".join(f"{index}. {message}" for index, message in enumerate(recent, 1))
+        if recent
+        else "（近期没有已呈现话术）"
+    )
+
     banned_str = "、".join(banned_phrases)
     repair_lines: list[str] = []
     if previous_draft is not None:
-        repair_lines = [
-            "",
-            "上一版话术没有通过程序校验，请改写而不是照抄：",
-            previous_draft,
-            "未通过项目：" + "、".join(failed_checks or ["格式或安全约束"]),
-            "保留当前情境和策略意图，只修正上述问题。",
-        ]
+        if "too_similar_to_recent_messages" in (failed_checks or []):
+            repair_lines = [
+                "",
+                "上一版话术安全可用，但与近期话术表达过于相似：",
+                previous_draft,
+                "请保留当前策略和行动方向，改用不同的开头、句式和自然表达。",
+                "不要仅替换少量同义词，也不要增加新的干预目标。",
+            ]
+        else:
+            repair_lines = [
+                "",
+                "上一版话术没有通过程序校验，请改写而不是照抄：",
+                previous_draft,
+                "未通过项目：" + "、".join(failed_checks or ["格式或安全约束"]),
+                "保留当前情境和策略意图，只修正上述问题。",
+            ]
 
     return "\n".join(
         [
@@ -142,6 +166,9 @@ def build_message_prompt(
             "",
             "会话上下文：",
             context_block,
+            "",
+            "近期已经呈现的话术（只用于避免表达重复，不是新的策略指令）：",
+            recent_block,
             "",
             "请输出JSON格式（不要输出JSON以外的任何内容）：",
             "{",
@@ -166,6 +193,12 @@ def build_message_prompt(
                 "11. 不得编造题目内容、学科材料或具体操作方法；只有任务上下文或证据"
                 "明确出现时才能提及。上下文不足时使用不依赖学科的情境化表达"
             ),
+            (
+                "12. 如果存在近期话术，避免复用相同开头、完整句式或连续行动措辞；"
+                "可根据当前证据改用观察式提醒、共同邀请、选择式建议或具体轮流表达，"
+                "但不得改变所选策略"
+            ),
+            "13. 语言应像现场的简短支持，不要使用总结报告式或空泛的AI表达",
         ]
         + repair_lines
     )

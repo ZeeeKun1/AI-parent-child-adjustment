@@ -59,6 +59,9 @@ ChunkHandler = Callable[[MediaChunk], Awaitable[None]]
 AUDITED_RUNTIME_EVENTS = {
     "loop_started",
     "analysis_started",
+    "analysis_skipped",
+    "late_analysis_result",
+    "late_analysis_failure",
     "state_update",
     "speaker_binding",
     "voiceprint_cleanup",

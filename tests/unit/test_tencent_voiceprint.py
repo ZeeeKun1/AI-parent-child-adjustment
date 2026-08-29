@@ -40,9 +40,12 @@ class FakeTencentClient:
             Data=SimpleNamespace(VoicePrintId=request.VoicePrintId)
         )
 
-    def VoicePrintGroupVerify(self, request: object) -> object:
+    def VoicePrintVerify(self, request: object) -> object:
         self.verify_requests.append(request)
-        return self.verify_responses.pop(0)
+        response = self.verify_responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     def VoicePrintDelete(self, request: object) -> object:
         self.delete_requests.append(request)
@@ -55,6 +58,29 @@ def _service(client: FakeTencentClient, *, minimum_score: float = 70) -> Tencent
         secret_key="test-key",
         minimum_score=minimum_score,
         client=client,
+    )
+
+
+def _verify_response(score: float, decision: int = 1) -> object:
+    return SimpleNamespace(Data=SimpleNamespace(Score=str(score), Decision=decision))
+
+
+def _complete_enrollment() -> TencentSpeakerEnrollment:
+    return TencentSpeakerEnrollment(
+        family_id="family",
+        group_id="coreg_TestGroup",
+        speakers={
+            "parent": TencentEnrolledSpeaker(
+                label="parent",
+                duration_ms=5_000,
+                voiceprint_id="vp-parent",
+            ),
+            "child": TencentEnrolledSpeaker(
+                label="child",
+                duration_ms=5_000,
+                voiceprint_id="vp-child",
+            ),
+        },
     )
 
 
@@ -97,28 +123,13 @@ def test_re_recording_a_role_updates_instead_of_creating_an_orphan() -> None:
 
 @patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
 @patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
-def test_group_verification_always_assigns_parent_or_child_and_marks_low_score(
+def test_pairwise_verification_assigns_higher_role_and_marks_low_score(
     prepare_segments: object,
     extract_f0: object,
 ) -> None:
     client = FakeTencentClient()
     service = _service(client, minimum_score=70)
-    enrollment = TencentSpeakerEnrollment(
-        family_id="family",
-        group_id="coreg_TestGroup",
-        speakers={
-            "parent": TencentEnrolledSpeaker(
-                label="parent",
-                duration_ms=5_000,
-                voiceprint_id="vp-parent",
-            ),
-            "child": TencentEnrolledSpeaker(
-                label="child",
-                duration_ms=5_000,
-                voiceprint_id="vp-child",
-            ),
-        },
-    )
+    enrollment = _complete_enrollment()
     samples = np.zeros(32_000, dtype=np.float64)
     prepare_segments.return_value = (
         samples,
@@ -127,22 +138,10 @@ def test_group_verification_always_assigns_parent_or_child_and_marks_low_score(
     )
     extract_f0.return_value = (np.array([], dtype=np.float64), 0)
     client.verify_responses = [
-        SimpleNamespace(
-            Data=SimpleNamespace(
-                VerifyTops=[
-                    SimpleNamespace(VoicePrintId="vp-parent", Score="91.5"),
-                    SimpleNamespace(VoicePrintId="vp-child", Score="45.0"),
-                ]
-            )
-        ),
-        SimpleNamespace(
-            Data=SimpleNamespace(
-                VerifyTops=[
-                    SimpleNamespace(VoicePrintId="vp-child", Score="64.0"),
-                    SimpleNamespace(VoicePrintId="vp-parent", Score="50.0"),
-                ]
-            )
-        ),
+        _verify_response(91.5),
+        _verify_response(45.0, decision=0),
+        _verify_response(50.0, decision=0),
+        _verify_response(64.0, decision=0),
     ]
 
     binding = service.identify_speakers((), enrollment)
@@ -155,8 +154,42 @@ def test_group_verification_always_assigns_parent_or_child_and_marks_low_score(
     assert binding.segments[0].forced_assignment is False
     assert binding.segments[1].forced_assignment is True
     assert binding.low_confidence_segment_count == 1
-    assert binding.provider_request_count == 2
-    assert all(request.TopN == 2 for request in client.verify_requests)
+    assert binding.provider_request_count == 4
+    assert binding.provider_failure_count == 0
+    assert [request.VoicePrintId for request in client.verify_requests] == [
+        "vp-parent",
+        "vp-child",
+        "vp-parent",
+        "vp-child",
+    ]
+    assert binding.segments[0].parent_provider_score == 91.5
+    assert binding.segments[0].child_provider_score == 45.0
+    assert binding.segments[1].parent_provider_score == 50.0
+    assert binding.segments[1].child_provider_score == 64.0
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_close_pairwise_scores_are_assigned_but_never_claim_high_confidence(
+    prepare_segments: object,
+    extract_f0: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client)
+    prepare_segments.return_value = (
+        np.zeros(16_000, dtype=np.float64),
+        16_000,
+        [(0, 1_000, 0, 16_000)],
+    )
+    extract_f0.return_value = (np.array([180.0]), 1)
+    client.verify_responses = [_verify_response(84.0), _verify_response(81.0)]
+
+    binding = service.identify_speakers((), _complete_enrollment())
+
+    segment = binding.segments[0]
+    assert segment.speaker.value == "parent"
+    assert segment.confidence == "low"
+    assert segment.forced_assignment is True
 
 
 def test_cleanup_deletes_voiceprints_before_group_metadata() -> None:
@@ -197,18 +230,7 @@ def test_short_utterance_is_padded_and_forced_to_a_known_role(
 ) -> None:
     client = FakeTencentClient()
     service = _service(client, minimum_score=70)
-    enrollment = TencentSpeakerEnrollment(
-        family_id="family",
-        group_id="coreg_TestGroup",
-        speakers={
-            "parent": TencentEnrolledSpeaker(
-                label="parent", duration_ms=5_000, voiceprint_id="vp-parent"
-            ),
-            "child": TencentEnrolledSpeaker(
-                label="child", duration_ms=5_000, voiceprint_id="vp-child"
-            ),
-        },
-    )
+    enrollment = _complete_enrollment()
     prepare_segments.return_value = (
         np.zeros(6_400, dtype=np.float64),
         16_000,
@@ -216,11 +238,8 @@ def test_short_utterance_is_padded_and_forced_to_a_known_role(
     )
     extract_f0.return_value = (np.array([180.0]), 1)
     client.verify_responses = [
-        SimpleNamespace(
-            Data=SimpleNamespace(
-                VerifyTops=[SimpleNamespace(VoicePrintId="vp-parent", Score="92.0")]
-            )
-        )
+        _verify_response(92.0),
+        _verify_response(35.0, decision=0),
     ]
 
     binding = service.identify_speakers((), enrollment)
@@ -230,3 +249,104 @@ def test_short_utterance_is_padded_and_forced_to_a_known_role(
     assert binding.segments[0].forced_assignment is True
     assert binding.segments[0].confidence == "low"
     assert len(base64.b64decode(client.verify_requests[0].Data)) == 25_600
+    assert len(base64.b64decode(client.verify_requests[1].Data)) == 25_600
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint.time.sleep")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_pairwise_verification_retries_one_transient_role_failure(
+    prepare_segments: object,
+    extract_f0: object,
+    sleep: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client)
+    prepare_segments.return_value = (
+        np.zeros(16_000, dtype=np.float64),
+        16_000,
+        [(0, 1_000, 0, 16_000)],
+    )
+    extract_f0.return_value = (np.array([180.0]), 1)
+    client.verify_responses = [
+        TimeoutError("temporary timeout"),
+        _verify_response(91.0),
+        _verify_response(30.0, decision=0),
+    ]
+
+    binding = service.identify_speakers((), _complete_enrollment())
+
+    assert binding.segments[0].speaker.value == "parent"
+    assert binding.segments[0].confidence == "high"
+    assert binding.provider_request_count == 3
+    assert binding.provider_failure_count == 1
+    sleep.assert_called_once_with(0.4)
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint.time.sleep")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_one_unavailable_role_keeps_a_verified_assignment_but_marks_it_low(
+    prepare_segments: object,
+    extract_f0: object,
+    _sleep: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client)
+    prepare_segments.return_value = (
+        np.zeros(16_000, dtype=np.float64),
+        16_000,
+        [(0, 1_000, 0, 16_000)],
+    )
+    extract_f0.return_value = (np.array([180.0]), 1)
+    client.verify_responses = [
+        _verify_response(91.0),
+        TimeoutError("child timeout"),
+        TimeoutError("child timeout"),
+    ]
+
+    binding = service.identify_speakers((), _complete_enrollment())
+
+    segment = binding.segments[0]
+    assert segment.speaker.value == "parent"
+    assert segment.parent_provider_score == 91.0
+    assert segment.child_provider_score is None
+    assert segment.confidence == "low"
+    assert segment.forced_assignment is True
+    assert binding.provider_request_count == 3
+    assert binding.provider_failure_count == 2
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint.time.sleep")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_both_roles_unavailable_fall_back_to_f0_without_losing_the_window(
+    prepare_segments: object,
+    extract_f0: object,
+    sleep: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client)
+    prepare_segments.return_value = (
+        np.zeros(16_000, dtype=np.float64),
+        16_000,
+        [(0, 1_000, 0, 16_000)],
+    )
+    extract_f0.return_value = (np.array([310.0, 315.0]), 2)
+    client.verify_responses = [
+        TimeoutError("parent timeout"),
+        TimeoutError("parent timeout"),
+        TimeoutError("child timeout"),
+        TimeoutError("child timeout"),
+    ]
+
+    binding = service.identify_speakers((), _complete_enrollment())
+
+    segment = binding.segments[0]
+    assert segment.speaker.value == "child"
+    assert segment.provider_score is None
+    assert segment.confidence == "low"
+    assert segment.forced_assignment is True
+    assert binding.provider_request_count == 4
+    assert binding.provider_failure_count == 4
+    assert sleep.call_count == 2

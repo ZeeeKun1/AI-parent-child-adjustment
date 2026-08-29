@@ -44,6 +44,8 @@ class SpeakerSegment:
     parent_cosine: float | None = None
     child_cosine: float | None = None
     provider_score: float | None = None
+    parent_provider_score: float | None = None
+    child_provider_score: float | None = None
     confidence: str | None = None
     forced_assignment: bool = False
 
@@ -72,6 +74,7 @@ class SpeakerBinding:
     parent_mean_cosine: float | None = None
     child_mean_cosine: float | None = None
     provider_request_count: int = 0
+    provider_failure_count: int = 0
     low_confidence_segment_count: int = 0
 
     def to_prompt_description(self) -> str:
@@ -81,13 +84,14 @@ class SpeakerBinding:
                 "Speaker binding is not available. "
                 "Use actor=unknown unless the role is directly and unambiguously observable."
             )
-        is_tencent = self.method == "tencent_voiceprint_1n"
+        is_tencent = self.method.startswith("tencent_voiceprint")
         is_embedding = "embedding" in self.method
         if is_tencent:
             lines = [
                 (
-                    "Speaker roles are anchored by Tencent Cloud 1:N voiceprint "
-                    "matching; explicitly marked forced assignments are continuity "
+                    "Speaker roles are anchored by pairwise Tencent Cloud 1:1 "
+                    "voiceprint matching against both enrolled roles; explicitly "
+                    "marked forced assignments are continuity "
                     "inferences, not direct provider matches:"
                 ),
                 f"  Parent: {self.parent_segment_count} segments.",
@@ -96,15 +100,29 @@ class SpeakerBinding:
                     "  Low-confidence forced assignments: "
                     f"{self.low_confidence_segment_count}."
                 ),
-                "Voiced segments (start_ms-end_ms, speaker, score, confidence):",
+                f"  Provider request failures: {self.provider_failure_count}.",
+                (
+                    "Voiced segments (start_ms-end_ms, speaker, parent score, "
+                    "child score, confidence):"
+                ),
             ]
             for seg in self.segments:
-                score = "N/A" if seg.provider_score is None else f"{seg.provider_score:.1f}"
+                parent_score = (
+                    "N/A"
+                    if seg.parent_provider_score is None
+                    else f"{seg.parent_provider_score:.1f}"
+                )
+                child_score = (
+                    "N/A"
+                    if seg.child_provider_score is None
+                    else f"{seg.child_provider_score:.1f}"
+                )
                 confidence = seg.confidence or "unavailable"
                 suffix = ", forced assignment" if seg.forced_assignment else ""
                 lines.append(
                     f"  {seg.start_ms}-{seg.end_ms} ms: {seg.speaker.value} "
-                    f"(score {score}, {confidence}{suffix})"
+                    f"(parent {parent_score}, child {child_score}, "
+                    f"{confidence}{suffix})"
                 )
         elif is_embedding:
             parent_cos_str = (

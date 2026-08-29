@@ -262,6 +262,15 @@ def build_judgment_system_prompt(
                 "both participants show observable loss of coordination."
             ),
             (
+                "STREAMING EXECUTION RULE:\n"
+                "Consecutive windows may be judged concurrently. The supplied history "
+                "is an immutable scheduling-time snapshot and may not contain a window "
+                "that is still being processed. Classify the current window from its "
+                "own evidence, never invent missing history, and use history only as "
+                "supporting trajectory context. The runtime commits results in timestamp "
+                "order and performs the final cross-window state calculation."
+            ),
+            (
                 "JUDGMENT BOUNDARIES:\n"
                 "1. Do not classify the state from a single pitch, volume, or "
                 "facial expression; integrate multiple cues across the window.\n"
@@ -466,6 +475,8 @@ def build_judgment_user_prompt(
             ),
             (
                 "Recent trajectory history (up to the preceding 60 seconds; "
+                "this is a scheduling-time snapshot and may omit an immediately "
+                "preceding window that is still being processed; "
                 "current-window evidence is still required). Treat one normal "
                 "window as provisional recovery rather than proof that a recurring "
                 "pattern ended. Each entry includes state, "

@@ -48,6 +48,35 @@ def test_accumulator_parses_valid_assessment() -> None:
     )
 
 
+def test_accumulator_repairs_invalid_previous_state_without_losing_window() -> None:
+    accumulator = RealtimeResponseAccumulator()
+    accumulator.add(
+        {
+            "type": "response.text.delta",
+            "delta": (
+                '{"session_id":"S01","assessed_at_ms":12000,'
+                '"state":"fluctuation","previous_state":"fluctulation",'
+                '"trajectory":"stable","evidence_sufficiency":"sufficient",'
+                '"confidence":"medium","interaction_performance":["brief stall"],'
+                '"task_process":"brief_stall","support_need":"task_pacing",'
+                '"support_target":"parent","interruptibility":"natural_pause",'
+                '"modality_evidence":{"audio":{"sufficiency":"sufficient","items":'
+                '[{"modality":"audio","actor":"parent","start_ms":5000,'
+                '"end_ms":7000,"code":"prompt","observation":"Repeated prompt",'
+                '"quote":"再想想"}]},"video":{"sufficiency":"insufficient",'
+                '"items":[],"limitation_reason":"Not visible"}},'
+                '"reason":"Brief fluctuation"}'
+            ),
+        }
+    )
+
+    assessment = accumulator.parse_assessment()
+
+    assert assessment.state is CoregulationState.FLUCTUATION
+    assert assessment.previous_state is None
+    assert "normalised_invalid_previous_state" in assessment.limitations
+
+
 def test_accumulator_rejects_unstructured_response() -> None:
     accumulator = RealtimeResponseAccumulator(text_deltas=["not json"])
 

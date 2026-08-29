@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import re
+import time
 import wave
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -38,8 +39,17 @@ from coregulation_poc.intervention import (
 )
 from coregulation_poc.intervention.models import InterventionPlan
 from coregulation_poc.models import (
+    Actor,
+    BoundarySignals,
+    ConfidenceLevel,
     ControlObservation,
     CoregulationState,
+    EvidenceByModality,
+    EvidenceSufficiency,
+    InteractionTrajectory,
+    Interruptibility,
+    InterventionAction,
+    ModalityEvidence,
     StateAssessment,
 )
 from coregulation_poc.runtime.recognition import StateRecognizer, WindowObservation
@@ -60,7 +70,9 @@ class RealtimeLoopConfig:
     history_assessments: int = 6
     max_parallel_perception: int = 3
     max_parallel_judgment: int = 2
-    max_intervention_staleness_ms: int = 20_000
+    analysis_deadline_seconds: float = 35.0
+    max_pending_analysis_jobs: int = 12
+    max_intervention_staleness_ms: int = 35_000
     voice_synthesis_timeout_seconds: float = 8.0
     shutdown_drain_timeout_seconds: float = 30.0
     voice_enabled: bool = False
@@ -80,6 +92,10 @@ class RealtimeLoopConfig:
             raise ValueError("max_parallel_perception must be between 1 and 4")
         if not 1 <= self.max_parallel_judgment <= 4:
             raise ValueError("max_parallel_judgment must be between 1 and 4")
+        if self.analysis_deadline_seconds <= 0:
+            raise ValueError("analysis deadline must be positive")
+        if not 2 <= self.max_pending_analysis_jobs <= 60:
+            raise ValueError("max_pending_analysis_jobs must be between 2 and 60")
         if self.max_intervention_staleness_ms < 5_000:
             raise ValueError("intervention staleness must be at least 5000 ms")
         if self.voice_synthesis_timeout_seconds <= 0:
@@ -98,12 +114,14 @@ class VoiceAudio:
 
 @dataclass(slots=True)
 class _AnalysisJob:
-    """One immutable media window waiting for chronological judgment."""
+    """One immutable media window whose result is committed chronologically."""
 
     snapshot: MediaWindow
     observation_task: asyncio.Task[WindowObservation] | None
     judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None
     completed: asyncio.Future[None]
+    scheduled_monotonic: float
+    skip_reason: str | None = None
 
 
 class VoiceSynthesizer(Protocol):
@@ -201,6 +219,8 @@ class RealtimeSession:
         self.delivery = DeliveryCoordinator(load_delivery_policy())
         self.previous_state: CoregulationState | None = None
         self.previous_plan: InterventionPlan | None = None
+        self._recent_intervention_messages: list[str] = []
+        self._recorded_message_delivery_ids: set[str] = set()
         self.assessment_history: list[StateAssessment] = []
         self.pending_delivery: DeliveryPackage | None = None
         self._pending_plan: InterventionPlan | None = None
@@ -222,9 +242,13 @@ class RealtimeSession:
         self._judgment_tasks: set[
             asyncio.Task[tuple[WindowObservation, StateAssessment]]
         ] = set()
+        self._late_result_tasks: set[asyncio.Task[None]] = set()
         self._latest_media_timestamp_ms = 0
         self._latest_completed_judgment_ms = 0
         self._stale_intervention_count = 0
+        self._analysis_timeout_count = 0
+        self._analysis_capacity_skip_count = 0
+        self._late_analysis_result_count = 0
         self._analysis_error_count = 0
         self._consecutive_analysis_errors = 0
         self._speaker_binding_count = 0
@@ -267,6 +291,9 @@ class RealtimeSession:
             "judgment_inflight_count": sum(
                 1 for task in self._judgment_tasks if not task.done()
             ),
+            "late_result_inflight_count": sum(
+                1 for task in self._late_result_tasks if not task.done()
+            ),
             "api_call_count": self.api_call_count,
             "strategy_selection_llm_call_count": int(
                 getattr(self.selector.strategy_choice_generator, "call_count", 0)
@@ -284,6 +311,12 @@ class RealtimeSession:
             "analysis_error_count": self._analysis_error_count,
             "consecutive_analysis_error_count": self._consecutive_analysis_errors,
             "stale_intervention_count": self._stale_intervention_count,
+            "recent_intervention_message_count": len(
+                self._recent_intervention_messages
+            ),
+            "analysis_timeout_count": self._analysis_timeout_count,
+            "analysis_capacity_skip_count": self._analysis_capacity_skip_count,
+            "late_analysis_result_count": self._late_analysis_result_count,
             "speaker_binding_count": self._speaker_binding_count,
             "speaker_binding_success_count": self._speaker_binding_success_count,
             "boundary_adjustment_count": self._boundary_adjustment_count,
@@ -309,6 +342,13 @@ class RealtimeSession:
                 "type": "loop_started",
                 "window_duration_ms": self.config.window_duration_ms,
                 "assessment_interval_ms": self.config.assessment_interval_ms,
+                "max_parallel_perception": self.config.max_parallel_perception,
+                "max_parallel_judgment": self.config.max_parallel_judgment,
+                "analysis_deadline_seconds": self.config.analysis_deadline_seconds,
+                "max_pending_analysis_jobs": self.config.max_pending_analysis_jobs,
+                "max_intervention_staleness_ms": (
+                    self.config.max_intervention_staleness_ms
+                ),
                 "voice_enabled": self.config.voice_enabled,
             }
         )
@@ -366,22 +406,48 @@ class RealtimeSession:
         )
 
     async def _schedule_analysis(self, snapshot: MediaWindow) -> asyncio.Future[None]:
-        """Capture a due window even when earlier model calls are still running."""
+        """Start bounded model work while preserving chronological commit order."""
 
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[None] = loop.create_future()
         observation_task: asyncio.Task[WindowObservation] | None = None
         judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None = None
-        if self._supports_staged_recognition():
+        skip_reason: str | None = None
+        if self._analysis_queue.qsize() >= self.config.max_pending_analysis_jobs:
+            # Preserve the ten-second timeline slot without retaining another
+            # raw media payload or creating an unbounded cloud request queue.
+            skip_reason = "analysis_capacity_exceeded"
+            snapshot = MediaWindow(
+                chunks=(),
+                start_ms=snapshot.start_ms,
+                end_ms=snapshot.end_ms,
+            )
+            self._analysis_capacity_skip_count += 1
+        elif self._supports_staged_recognition():
+            history_snapshot = tuple(
+                self.assessment_history[-self.config.history_assessments :]
+            )
+            previous_state_snapshot = self.previous_state
             observation_task = asyncio.create_task(self._observe_window(snapshot))
             self._perception_tasks.add(observation_task)
             observation_task.add_done_callback(self._perception_tasks.discard)
+            judgment_task = asyncio.create_task(
+                self._judge_after_observation(
+                    observation_task,
+                    previous_state=previous_state_snapshot,
+                    history=history_snapshot,
+                )
+            )
+            self._judgment_tasks.add(judgment_task)
+            judgment_task.add_done_callback(self._judgment_tasks.discard)
         await self._analysis_queue.put(
             _AnalysisJob(
                 snapshot=snapshot,
                 observation_task=observation_task,
                 judgment_task=judgment_task,
                 completed=completed,
+                scheduled_monotonic=time.monotonic(),
+                skip_reason=skip_reason,
             )
         )
         self._last_scheduled_at_ms = snapshot.end_ms
@@ -403,20 +469,36 @@ class RealtimeSession:
                 window=snapshot,
             )
 
+    async def _judge_after_observation(
+        self,
+        observation_task: asyncio.Task[WindowObservation],
+        *,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
+    ) -> tuple[WindowObservation, StateAssessment]:
+        """Judge independently, then let the ordered worker commit the result."""
+
+        observation = await observation_task
+        return await self._judge_observation(
+            observation,
+            previous_state=previous_state,
+            history=history,
+        )
+
     async def _judge_observation(
         self,
         observation: WindowObservation,
+        *,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
     ) -> tuple[WindowObservation, StateAssessment]:
-        """Judge one prepared window after every earlier window has been applied."""
+        """Judge one window with an immutable scheduling-time history snapshot."""
 
         async with self._judgment_semaphore:
-            history = tuple(
-                self.assessment_history[-self.config.history_assessments :]
-            )
             staged_recognizer = cast(Any, self.recognizer)
             assessment = await staged_recognizer.judge(
                 observation=observation,
-                previous_state=self.previous_state,
+                previous_state=previous_state,
                 history=history,
                 history_available=bool(history),
             )
@@ -453,6 +535,11 @@ class RealtimeSession:
                 self._analysis_error_count += 1
                 self._consecutive_analysis_errors += 1
                 with suppress(ConnectionError, RuntimeError):
+                    await self._apply_missing_assessment(
+                        job,
+                        reason=str(exc),
+                    )
+                with suppress(ConnectionError, RuntimeError):
                     await self.send_event(
                         {
                             "type": "loop_error",
@@ -472,15 +559,37 @@ class RealtimeSession:
 
     async def _analyze_job(self, job: _AnalysisJob) -> None:
         snapshot = job.snapshot
+        if job.skip_reason is not None:
+            await self.send_event(
+                {
+                    "type": "analysis_skipped",
+                    "window_start_ms": snapshot.start_ms,
+                    "window_end_ms": snapshot.end_ms,
+                    "reason": job.skip_reason,
+                    "record_only": True,
+                }
+            )
+            await self._apply_missing_assessment(job, reason=job.skip_reason)
+            return
         history = tuple(self.assessment_history[-self.config.history_assessments :])
         history_available = bool(history)
-        if job.observation_task is not None:
-            observation = await job.observation_task
-            history = tuple(
-                self.assessment_history[-self.config.history_assessments :]
-            )
-            history_available = bool(history)
-            observation, model_assessment = await self._judge_observation(observation)
+        if job.judgment_task is not None:
+            elapsed = max(0.0, time.monotonic() - job.scheduled_monotonic)
+            remaining = max(0.0, self.config.analysis_deadline_seconds - elapsed)
+            try:
+                async with asyncio.timeout(remaining):
+                    observation, model_assessment = await asyncio.shield(
+                        job.judgment_task
+                    )
+            except TimeoutError:
+                self._analysis_timeout_count += 1
+                late_recorder = asyncio.create_task(self._record_late_analysis(job))
+                self._late_result_tasks.add(late_recorder)
+                late_recorder.add_done_callback(self._late_result_tasks.discard)
+                raise TimeoutError(
+                    "analysis deadline exceeded; chronological slot recorded as unavailable"
+                ) from None
+            history_available = bool(self.assessment_history)
         else:
             observation = None
             await self.send_event(
@@ -500,7 +609,7 @@ class RealtimeSession:
         # The chronological worker owns trajectory state.  This also protects
         # generic recognizers that may have started with slightly stale context.
         model_assessment = model_assessment.model_copy(
-            update={"previous_state": self.previous_state}
+            update={"previous_state": self._trajectory_previous_state()}
         )
         await self._apply_assessment(
             snapshot=snapshot,
@@ -508,6 +617,98 @@ class RealtimeSession:
             history_available=history_available,
             recognition_observation=observation,
         )
+
+    async def _record_late_analysis(self, job: _AnalysisJob) -> None:
+        """Persist a late model result without allowing it to change live state."""
+
+        task = job.judgment_task
+        if task is None:
+            return
+        try:
+            observation, assessment = await task
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            with suppress(ConnectionError, RuntimeError):
+                await self.send_event(
+                    {
+                        "type": "late_analysis_failure",
+                        "window_start_ms": job.snapshot.start_ms,
+                        "window_end_ms": job.snapshot.end_ms,
+                        "message": str(exc),
+                        "record_only": True,
+                    }
+                )
+            return
+        self._late_analysis_result_count += 1
+        perception_report = getattr(observation, "perception_report", None)
+        with suppress(ConnectionError, RuntimeError):
+            await self.send_event(
+                {
+                    "type": "late_analysis_result",
+                    "window_start_ms": job.snapshot.start_ms,
+                    "window_end_ms": job.snapshot.end_ms,
+                    "state": None if assessment.state is None else assessment.state.value,
+                    "assessment": assessment.model_dump(mode="json"),
+                    "perception_report": (
+                        perception_report.model_dump(mode="json")
+                        if perception_report is not None
+                        else None
+                    ),
+                    "record_only": True,
+                }
+            )
+
+    async def _apply_missing_assessment(
+        self,
+        job: _AnalysisJob,
+        *,
+        reason: str,
+    ) -> None:
+        """Keep one explicit timeline slot when cloud analysis is unavailable."""
+
+        limitation = f"Window analysis unavailable: {reason}"
+        insufficient = ModalityEvidence(
+            sufficiency=EvidenceSufficiency.INSUFFICIENT,
+            items=[],
+            limitation_reason=limitation,
+        )
+        assessment = StateAssessment(
+            session_id=self.session_id,
+            assessed_at_ms=job.snapshot.end_ms,
+            state=None,
+            previous_state=self._trajectory_previous_state(),
+            trajectory=InteractionTrajectory.UNCLEAR,
+            evidence_sufficiency=EvidenceSufficiency.INSUFFICIENT,
+            confidence=ConfidenceLevel.LOW,
+            alternative_state=None,
+            ambiguity_reason=limitation,
+            interaction_performance=[],
+            task_process=None,
+            support_need=None,
+            support_target=Actor.UNKNOWN,
+            interruptibility=Interruptibility.UNCLEAR,
+            boundary_signals=BoundarySignals(),
+            modality_evidence=EvidenceByModality(
+                audio=insufficient,
+                video=insufficient.model_copy(deep=True),
+            ),
+            reason=limitation,
+            limitations=[limitation],
+        )
+        await self._apply_assessment(
+            snapshot=job.snapshot,
+            model_assessment=assessment,
+            history_available=bool(self.assessment_history),
+            recognition_observation=None,
+        )
+
+    def _trajectory_previous_state(self) -> CoregulationState | None:
+        """Return the immediately preceding slot, including an unknown slot."""
+
+        if not self.assessment_history:
+            return None
+        return self.assessment_history[-1].state
 
     def _speaker_binding_event(
         self,
@@ -585,6 +786,10 @@ class RealtimeSession:
         history_available: bool,
         recognition_observation: WindowObservation | None,
     ) -> None:
+        analysis_staleness_ms = max(
+            0,
+            self._latest_media_timestamp_ms - snapshot.end_ms,
+        )
         post_response_observed = (
             self._post_response_not_before_ms is not None
             and snapshot.end_ms >= self._post_response_not_before_ms
@@ -618,7 +823,8 @@ class RealtimeSession:
             )
             self.assessment_count += 1
             self.assessment_history.append(assessment)
-            self.previous_state = assessment.state
+            if assessment.state is not None:
+                self.previous_state = assessment.state
             if post_response_observed:
                 if self._expert_pending is not None:
                     outcome = self._build_expert_intervention_outcome(assessment)
@@ -686,13 +892,30 @@ class RealtimeSession:
                         )
                         else None
                     ),
-                    "analysis_staleness_ms": max(
-                        0,
-                        self._latest_media_timestamp_ms - snapshot.end_ms,
+                    "analysis_staleness_ms": analysis_staleness_ms,
+                    "live_action_eligible": (
+                        analysis_staleness_ms
+                        <= self.config.max_intervention_staleness_ms
                     ),
                     **boundary_resolution.as_event_fields(),
                 }
             )
+            actionable = decision.action in {
+                InterventionAction.INTERVENE,
+                InterventionAction.PROGRESSIVE_SUPPORT,
+                InterventionAction.REINFORCE,
+            }
+            if (
+                actionable
+                and analysis_staleness_ms
+                > self.config.max_intervention_staleness_ms
+            ):
+                await self._hold_stale_intervention(
+                    sequence=decision.sequence,
+                    staleness_ms=analysis_staleness_ms,
+                )
+                self._self_continue_suppressed = False
+                return
             # Strategy ranking and contextual message generation may make one
             # or two HTTP calls.  Keep them off the event loop so camera/audio
             # capture continues while the result for this original window is
@@ -703,6 +926,7 @@ class RealtimeSession:
                 assessment=assessment,
                 decision=decision,
                 previous_plan=self.previous_plan,
+                recent_messages=list(self._recent_intervention_messages),
                 task_context=self._task_context,
                 difficulty_feedback_boost=self._difficulty_feedback_boost,
             )
@@ -738,6 +962,16 @@ class RealtimeSession:
                         "sequence": decision.sequence,
                         "reason": "self_continue_suppressed",
                     }
+                )
+                return
+            current_staleness_ms = max(
+                0,
+                self._latest_media_timestamp_ms - snapshot.end_ms,
+            )
+            if current_staleness_ms > self.config.max_intervention_staleness_ms:
+                await self._hold_stale_intervention(
+                    sequence=decision.sequence,
+                    staleness_ms=current_staleness_ms,
                 )
                 return
             preparation = self.delivery.prepare(
@@ -780,6 +1014,28 @@ class RealtimeSession:
                         "retryable": True,
                     }
                 )
+
+    async def _hold_stale_intervention(
+        self,
+        *,
+        sequence: int,
+        staleness_ms: int,
+    ) -> None:
+        """Record an actionable old state without showing an obsolete prompt."""
+
+        self._stale_intervention_count += 1
+        if self.controller.awaiting_post_intervention_response:
+            self.controller.mark_intervention_not_delivered()
+        self.pending_delivery = None
+        self._pending_plan = None
+        await self.send_event(
+            {
+                "type": "intervention_held",
+                "sequence": sequence,
+                "reason": "stale_assessment_record_only",
+                "analysis_staleness_ms": staleness_ms,
+            }
+        )
 
     async def _deliver(self, package: DeliveryPackage) -> None:
         if self._interventions_paused or self._expert_takeover_active:
@@ -991,6 +1247,16 @@ class RealtimeSession:
                 pending_plan.state,
                 delivered_at_ms=delivery_timeline_ms,
             )
+            if package.delivery_id not in self._recorded_message_delivery_ids:
+                shown_message = re.sub(
+                    r"\s+", " ", package.visual_prompt.message
+                ).strip()
+                if shown_message:
+                    self._recent_intervention_messages.append(shown_message)
+                    self._recent_intervention_messages = (
+                        self._recent_intervention_messages[-3:]
+                    )
+                self._recorded_message_delivery_ids.add(package.delivery_id)
             self._post_response_not_before_ms = (
                 delivery_timeline_ms + self.config.post_intervention_observation_ms
             )
@@ -1404,9 +1670,17 @@ class RealtimeSession:
             if self._analysis_worker_task is not None:
                 with suppress(asyncio.CancelledError, ConnectionError, RuntimeError):
                     await self._analysis_worker_task
-        for task in tuple(self._perception_tasks):
+        for task in (
+            *tuple(self._perception_tasks),
+            *tuple(self._judgment_tasks),
+            *tuple(self._late_result_tasks),
+        ):
             if not task.done():
                 task.cancel()
         if self._perception_tasks:
             await asyncio.gather(*self._perception_tasks, return_exceptions=True)
+        if self._judgment_tasks:
+            await asyncio.gather(*self._judgment_tasks, return_exceptions=True)
+        if self._late_result_tasks:
+            await asyncio.gather(*self._late_result_tasks, return_exceptions=True)
         self.window.clear()

@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     browser_capture_access_token: SecretStr | None = None
     research_console_access_token: SecretStr | None = None
 
-    # Tencent Cloud speaker registration and 1:N voiceprint verification.
+    # Tencent Cloud speaker registration and pairwise 1:1 voiceprint verification.
     # These credentials are server-side only and must never be sent to browsers.
     tencent_secret_id: SecretStr | None = None
     tencent_secret_key: SecretStr | None = None

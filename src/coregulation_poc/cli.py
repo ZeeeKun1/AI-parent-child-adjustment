@@ -387,7 +387,7 @@ def main() -> None:
                     "speaker_binding_method": (
                         "embedding_cosine" if enrollment is not None
                         else (
-                            "tencent_voiceprint_1n"
+                            "tencent_voiceprint_pairwise_1to1"
                             if voiceprint_service is not None
                             else "local_development"
                         )

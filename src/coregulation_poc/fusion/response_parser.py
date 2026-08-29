@@ -245,7 +245,14 @@ def normalize_assessment_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "regulation_balance": balance,
     }
-    data.setdefault("previous_state", None)
+    # ``previous_state`` is copied from runtime context and is not a state the
+    # model needs to infer.  A misspelling here must not discard an otherwise
+    # valid current-window assessment; the ordered runtime replaces it with
+    # the actual immediately preceding slot before trajectory resolution.
+    if data.get("previous_state") not in _STATES:
+        if data.get("previous_state") is not None:
+            limitations.append("normalised_invalid_previous_state")
+        data["previous_state"] = None
     data.setdefault("reason", "当前窗口已完成结构化状态判断。")
     data["limitations"] = list(dict.fromkeys(limitations))
     return data

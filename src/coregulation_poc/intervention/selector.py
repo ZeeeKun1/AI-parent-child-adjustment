@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from coregulation_poc.intervention.message_prompt import (
@@ -66,6 +67,8 @@ _BLAME_COMMAND_INDICATORS: list[str] = [
     "自闭症",
 ]
 
+_RECENT_MESSAGE_SIMILARITY_THRESHOLD = 0.72
+
 
 class StrategySelector:
     """Select one approved card after module two authorizes intervention.
@@ -93,6 +96,7 @@ class StrategySelector:
         assessment: StateAssessment,
         decision: InterventionDecision,
         previous_plan: InterventionPlan | None = None,
+        recent_messages: list[str] | None = None,
         task_context: dict[str, Any] | None = None,
         difficulty_feedback_boost: bool = False,
     ) -> StrategySelectionResult:
@@ -198,6 +202,7 @@ class StrategySelector:
                     decision.previous_state.value if decision.previous_state else None
                 ),
                 recovery_status=decision.recovery_status.value,
+                recent_messages=recent_messages,
             )
         except ContextualMessageGenerationError:
             logger.warning(
@@ -454,6 +459,7 @@ class StrategySelector:
         task_context: dict[str, Any] | None = None,
         previous_state: str | None = None,
         recovery_status: str | None = None,
+        recent_messages: list[str] | None = None,
     ) -> tuple[str, MessageSource, dict[str, bool]]:
         """Resolve the intervention message.
 
@@ -469,6 +475,7 @@ class StrategySelector:
         previous_result: LLMMessageResult | None = None
         failed_checks: list[str] = []
         last_error: Exception | None = None
+        safe_similar_result: tuple[str, dict[str, bool]] | None = None
         for attempt in range(2):
             try:
                 result = self.message_generator.generate(
@@ -477,14 +484,39 @@ class StrategySelector:
                     task_context=task_context,
                     previous_state=previous_state,
                     recovery_status=recovery_status,
+                    recent_messages=recent_messages,
                     previous_result=previous_result,
                     failed_checks=failed_checks,
                 )
                 checks = self._validate_llm_result(result, card, assessment, evidence)
                 if all(checks.values()):
                     message = self._assemble_message(result)
+                    similarity = self._recent_message_similarity(
+                        message,
+                        recent_messages or [],
+                    )
+                    if (
+                        attempt == 0
+                        and recent_messages
+                        and similarity >= _RECENT_MESSAGE_SIMILARITY_THRESHOLD
+                    ):
+                        # The first draft is safe and remains a valid fallback.
+                        # Ask once for more varied wording, but never lose the
+                        # intervention merely because the rewrite fails.
+                        safe_similar_result = (message, checks)
+                        previous_result = result
+                        failed_checks = ["too_similar_to_recent_messages"]
+                        logger.info(
+                            "LLM message for %s resembles a recent message "
+                            "(%.2f); requesting one wording variation",
+                            card.strategy_id,
+                            similarity,
+                        )
+                        continue
                     if attempt:
                         checks["contextual_rewrite_completed"] = True
+                    if recent_messages:
+                        checks["recent_message_variation_reviewed"] = True
                     return message, MessageSource.CONSTRAINED_LLM, checks
                 repairable_checks = {
                     "within_character_limit",
@@ -521,9 +553,30 @@ class StrategySelector:
                     card.strategy_id,
                     exc_info=True,
                 )
+        if safe_similar_result is not None:
+            message, checks = safe_similar_result
+            checks["variation_rewrite_fallback_used"] = True
+            return message, MessageSource.CONSTRAINED_LLM, checks
         raise ContextualMessageGenerationError(
             f"unable to generate a valid contextual message for {card.strategy_id}"
         ) from last_error
+
+    @staticmethod
+    def _recent_message_similarity(message: str, recent_messages: list[str]) -> float:
+        """Return the highest wording similarity to a recently shown prompt."""
+
+        def normalise(value: str) -> str:
+            return re.sub(r"[\W_]+", "", value.lower(), flags=re.UNICODE)
+
+        current = normalise(message)
+        if not current:
+            return 0.0
+        scores = [
+            SequenceMatcher(None, current, prior).ratio()
+            for item in recent_messages[-3:]
+            if (prior := normalise(item))
+        ]
+        return max(scores, default=0.0)
 
     def _validate_llm_result(
         self,
@@ -689,6 +742,7 @@ class MessageGenerator:
         task_context: dict[str, Any] | None = None,
         previous_state: str | None = None,
         recovery_status: str | None = None,
+        recent_messages: list[str] | None = None,
         previous_result: LLMMessageResult | None = None,
         failed_checks: list[str] | None = None,
     ) -> LLMMessageResult:
@@ -709,6 +763,7 @@ class MessageGenerator:
             task_context=task_context,
             previous_state=previous_state,
             recovery_status=recovery_status,
+            recent_messages=recent_messages,
             previous_draft=(
                 None if previous_result is None else self._normalise_draft(previous_result)
             ),

@@ -430,7 +430,7 @@ def test_browser_enrollment_uses_cloud_service_without_exposing_ids(
         assert [response.status_code for response in responses] == [200, 200]
         final_payload = responses[-1].json()
         assert final_payload["complete"] is True
-        assert final_payload["provider"] == "tencent_voiceprint_1n"
+        assert final_payload["provider"] == "tencent_voiceprint_pairwise_1to1"
         assert final_payload["cloud_voiceprint_registered"] is True
         assert "voiceprint_id" not in json.dumps(final_payload)
 
