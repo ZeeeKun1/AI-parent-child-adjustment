@@ -268,6 +268,16 @@ class BoundarySignals(BaseModel):
     regulation_balance: RegulationBalance = RegulationBalance.UNCLEAR
 
 
+class HighRiskSignals(BaseModel):
+    """Current-window observations that can accumulate into a high-risk pattern."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    parent_task_takeover_observed: bool | None = None
+    child_passive_dependence_observed: bool | None = None
+    strong_resistance_or_withdrawal_observed: bool | None = None
+
+
 class StateAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -289,6 +299,7 @@ class StateAssessment(BaseModel):
     support_target: Actor
     interruptibility: Interruptibility
     boundary_signals: BoundarySignals = Field(default_factory=BoundarySignals)
+    high_risk_signals: HighRiskSignals = Field(default_factory=HighRiskSignals)
 
     modality_evidence: EvidenceByModality
     reason: str = Field(min_length=1)

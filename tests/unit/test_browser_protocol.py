@@ -100,3 +100,59 @@ def test_browser_recorder_rejects_wrong_audio_chunk_size(tmp_path: Path) -> None
         )
 
     recorder.finish(status="failed", error="invalid audio")
+
+
+def test_browser_recorder_saves_and_finalizes_consented_session_recording(
+    tmp_path: Path,
+) -> None:
+    recorder = BrowserCaptureRecorder(
+        output_dir=tmp_path / "output",
+        session_id="recording_test",
+        media_format=MediaFormat(),
+        max_image_bytes=750_000,
+        recording_enabled=True,
+    )
+    recorder.start()
+
+    first = recorder.accept_recording_chunk(
+        sequence=0,
+        start_ms=0,
+        end_ms=10_000,
+        content_type="video/webm;codecs=vp8,opus",
+        payload=b"first-fragment",
+    )
+    duplicate = recorder.accept_recording_chunk(
+        sequence=0,
+        start_ms=0,
+        end_ms=10_000,
+        content_type="video/webm;codecs=vp8,opus",
+        payload=b"first-fragment",
+    )
+    recorder.accept_recording_chunk(
+        sequence=1,
+        start_ms=10_000,
+        end_ms=20_000,
+        content_type="video/webm;codecs=vp8,opus",
+        payload=b"second-fragment",
+    )
+    summary = recorder.finish(
+        status="completed",
+        client_metrics={
+            "recording_chunk_count": 2,
+            "recording_bytes_uploaded": 29,
+            "recording_upload_failures": 0,
+        },
+    )
+
+    media_path = summary.run_dir / "media" / "session_recording.webm"
+    recording_manifest = json.loads(
+        (summary.run_dir / "recording_manifest.json").read_text(encoding="utf-8")
+    )
+    assert first["duplicate"] is False
+    assert duplicate["duplicate"] is True
+    assert media_path.read_bytes() == b"first-fragmentsecond-fragment"
+    assert summary.raw_media_saved is True
+    assert summary.recording_filename == "session_recording.webm"
+    assert recording_manifest["complete"] is True
+    assert recording_manifest["chunk_count"] == 2
+    assert recording_manifest["missing_sequences"] == []

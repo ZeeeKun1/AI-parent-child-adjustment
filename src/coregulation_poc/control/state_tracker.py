@@ -42,6 +42,7 @@ class StateTrajectoryController:
         self._pending_intervention_state: CoregulationState | None = None
         self._post_intervention_wait_count: int = 0
         self._reinforced_positive_performances: set[str] = set()
+        self._last_positive_reinforcement_at_ms: int | None = None
         self._episode_active = False
         self._episode_interventions: list[
             tuple[int, CoregulationState, SupportNeed | None, Actor, frozenset[str]]
@@ -81,6 +82,13 @@ class StateTrajectoryController:
             CoregulationState.HIGH_RISK,
         }:
             raise ValueError("delivered intervention state is not actionable")
+        if state is CoregulationState.NORMAL:
+            if delivered_at_ms is None:
+                delivered_at_ms = self._points[-1].assessed_at_ms if self._points else 0
+            if isinstance(delivered_at_ms, bool) or delivered_at_ms < 0:
+                raise ValueError("delivered_at_ms must be a non-negative integer")
+            self._last_positive_reinforcement_at_ms = delivered_at_ms
+            return
         if self._pending_intervention_state is None:
             self._pending_intervention_state = state
         elif self._pending_intervention_state is not state:
@@ -232,10 +240,15 @@ class StateTrajectoryController:
                 reason=InterventionDecisionReason.HISTORY_REQUIRED,
                 recovery_status=recovery_status,
             )
-        if assessment.state in {
-            CoregulationState.DYSREGULATION,
-            CoregulationState.HIGH_RISK,
-        }:
+        severity_escalated_to_high_risk = bool(
+            assessment.state is CoregulationState.HIGH_RISK
+            and previous_state is not CoregulationState.HIGH_RISK
+        )
+        if (
+            assessment.state
+            in {CoregulationState.DYSREGULATION, CoregulationState.HIGH_RISK}
+            and not severity_escalated_to_high_risk
+        ):
             episode_guard = self._same_episode_guard(assessment)
             if episode_guard is not None:
                 return self._record_guard_decision(
@@ -265,6 +278,13 @@ class StateTrajectoryController:
         observed = set(assessment.interaction_performance)
         explicit = observed.intersection(rule.explicit_trigger_performances)
         self._reinforced_positive_performances.intersection_update(explicit)
+        if self._last_positive_reinforcement_at_ms is not None:
+            elapsed_ms = max(
+                0,
+                assessment.assessed_at_ms - self._last_positive_reinforcement_at_ms,
+            )
+            if elapsed_ms < rule.minimum_interval_ms:
+                return set()
 
         candidates = set()
 
@@ -382,7 +402,6 @@ class StateTrajectoryController:
             recovery_status=recovery_status,
         )
         if decision.action in {
-            InterventionAction.REINFORCE,
             InterventionAction.INTERVENE,
             InterventionAction.PROGRESSIVE_SUPPORT,
         }:

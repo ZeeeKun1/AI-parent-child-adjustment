@@ -45,6 +45,8 @@ MAX_PENDING_ADMISSIONS = 500
 MAX_ACTIVE_SESSIONS = 4
 MAX_JSON_BODY_BYTES = 64_000
 MAX_SPEAKER_AUDIO_BYTES = 1_000_000
+MAX_RECORDING_CHUNK_BYTES = 16_000_000
+RECORDING_RECONNECT_GRACE_SECONDS = 120
 REALTIME_ONLY_CONTROLS = {
     "pause_interventions",
     "resume_interventions",
@@ -101,6 +103,9 @@ class BrowserServerConfig:
     max_active_sessions: int = MAX_ACTIVE_SESSIONS
     max_json_body_bytes: int = MAX_JSON_BODY_BYTES
     max_speaker_audio_bytes: int = MAX_SPEAKER_AUDIO_BYTES
+    retain_session_media: bool = True
+    max_recording_chunk_bytes: int = MAX_RECORDING_CHUNK_BYTES
+    recording_reconnect_grace_seconds: int = RECORDING_RECONNECT_GRACE_SECONDS
     access_token: str | None = field(default=None, repr=False)
     research_access_token: str | None = field(default=None, repr=False)
 
@@ -125,6 +130,10 @@ class BrowserServerConfig:
             raise ValueError("max_active_sessions must be positive")
         if self.max_json_body_bytes < 1 or self.max_speaker_audio_bytes < 1:
             raise ValueError("request body limits must be positive")
+        if self.max_recording_chunk_bytes < 100_000:
+            raise ValueError("max_recording_chunk_bytes is too small")
+        if self.recording_reconnect_grace_seconds < 10:
+            raise ValueError("recording_reconnect_grace_seconds must be at least 10")
 
 def _parse_control(raw: str) -> dict[str, Any]:
     try:
@@ -303,6 +312,11 @@ def create_browser_capture_app(
     app.state.session_admissions = session_admissions
     active_session_ids: set[str] = set()
     app.state.active_session_ids = active_session_ids
+    active_recorders: dict[str, BrowserCaptureRecorder] = {}
+    app.state.active_recorders = active_recorders
+    recording_locks: dict[str, asyncio.Lock] = {}
+    recording_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+    app.state.recording_cleanup_tasks = recording_cleanup_tasks
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     async def cleanup_remote_enrollment(
@@ -342,7 +356,59 @@ def create_browser_capture_app(
         cleanup_tasks.add(task)
         task.add_done_callback(cleanup_tasks.discard)
 
+    async def finalize_abandoned_recording(
+        session_id: str,
+        recorder: BrowserCaptureRecorder,
+    ) -> None:
+        try:
+            await asyncio.sleep(server_config.recording_reconnect_grace_seconds)
+            if (
+                active_recorders.get(session_id) is not recorder
+                or session_id in active_session_ids
+            ):
+                return
+            if not recorder.finished:
+                recorder.finish(
+                    status="disconnected",
+                    error="browser did not reconnect before the recording grace period ended",
+                )
+            active_recorders.pop(session_id, None)
+            recording_locks.pop(session_id, None)
+            session_admissions.pop(session_id, None)
+            enrollment_locks.pop(session_id, None)
+            schedule_remote_cleanup(session_enrollments.pop(session_id, None))
+        except asyncio.CancelledError:
+            return
+        finally:
+            current = recording_cleanup_tasks.get(session_id)
+            if current is asyncio.current_task():
+                recording_cleanup_tasks.pop(session_id, None)
+
+    def schedule_recording_cleanup(
+        session_id: str,
+        recorder: BrowserCaptureRecorder,
+    ) -> None:
+        previous = recording_cleanup_tasks.pop(session_id, None)
+        if previous is not None:
+            previous.cancel()
+        recording_cleanup_tasks[session_id] = asyncio.create_task(
+            finalize_abandoned_recording(session_id, recorder)
+        )
+
     async def shutdown_voiceprint_cleanup() -> None:
+        for task in tuple(recording_cleanup_tasks.values()):
+            task.cancel()
+        if recording_cleanup_tasks:
+            await asyncio.gather(
+                *tuple(recording_cleanup_tasks.values()),
+                return_exceptions=True,
+            )
+        for recorder in tuple(active_recorders.values()):
+            if not recorder.finished:
+                recorder.finish(
+                    status="disconnected",
+                    error="browser server stopped before a normal session stop",
+                )
         if cleanup_tasks:
             await asyncio.gather(*tuple(cleanup_tasks), return_exceptions=True)
         remaining: list[TencentSpeakerEnrollment] = list(failed_cleanup_enrollments)
@@ -418,7 +484,8 @@ def create_browser_capture_app(
             ),
             "active_session_count": len(active_session_ids),
             "pending_admission_count": len(session_admissions),
-            "raw_media_saved": False,
+            "raw_media_saved": server_config.retain_session_media,
+            "session_media_retention_enabled": server_config.retain_session_media,
             "api_called": False,
             "api_calls_enabled": session_factory is not None,
             "downstream_chunk_handler_configured": chunk_handler is not None,
@@ -612,6 +679,56 @@ def create_browser_capture_app(
             "duration_ms": speaker.duration_ms,
         }
 
+    @app.post("/api/session-recording/{session_id}/{sequence}")
+    async def upload_session_recording_chunk(
+        session_id: str,
+        sequence: int,
+        request: Request,
+    ) -> dict[str, Any]:
+        """Append one ordered browser MediaRecorder fragment to the active run."""
+
+        if not server_config.retain_session_media:
+            raise HTTPException(status_code=404, detail="本次实验未启用录音录像保存")
+        if not _request_origin_matches_host(request):
+            raise HTTPException(status_code=403, detail="请求来源不受信任")
+        if SESSION_ID.fullmatch(session_id) is None:
+            raise HTTPException(status_code=400, detail="本次实验编号无效")
+        supplied_token = request.headers.get("x-study-access-token")
+        if not _valid_session_access_token(
+            supplied_token,
+            server_config.access_token,
+            session_admission_token(session_id),
+        ):
+            raise HTTPException(status_code=403, detail="本次会话已失效，请刷新页面后重试")
+        recorder = active_recorders.get(session_id)
+        if recorder is None:
+            raise HTTPException(status_code=409, detail="本次实验尚未开始或已经结束")
+
+        content_type = request.headers.get("content-type", "")
+        try:
+            start_ms = int(request.headers.get("x-media-start-ms", ""))
+            end_ms = int(request.headers.get("x-media-end-ms", ""))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="录制片段时间信息不正确") from exc
+        payload = await _read_request_body(
+            request,
+            max_bytes=server_config.max_recording_chunk_bytes,
+        )
+        lock = recording_locks.setdefault(session_id, asyncio.Lock())
+        try:
+            async with lock:
+                result = await asyncio.to_thread(
+                    recorder.accept_recording_chunk,
+                    sequence=sequence,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    content_type=content_type,
+                    payload=payload,
+                )
+        except BrowserProtocolError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"session_id": session_id, **result}
+
     @app.websocket("/ws/research")
     async def research_supervision(websocket: WebSocket) -> None:
         if not _origin_matches_host(websocket):
@@ -776,14 +893,30 @@ def create_browser_capture_app(
             active_session_ids.add(session_id)
 
             session_authorized = True
-            recorder = BrowserCaptureRecorder(
-                output_dir=server_config.output_dir,
-                session_id=session_id,
-                media_format=server_config.media_format,
-                max_image_bytes=server_config.max_image_bytes,
-                client_capabilities=capabilities,
-                study_context=study_context,
-            )
+            reconnect_cleanup = recording_cleanup_tasks.pop(session_id, None)
+            if reconnect_cleanup is not None:
+                reconnect_cleanup.cancel()
+            recorder = active_recorders.get(session_id)
+            if recorder is None or recorder.finished:
+                recorder = BrowserCaptureRecorder(
+                    output_dir=server_config.output_dir,
+                    session_id=session_id,
+                    media_format=server_config.media_format,
+                    max_image_bytes=server_config.max_image_bytes,
+                    client_capabilities=capabilities,
+                    study_context=study_context,
+                    recording_enabled=server_config.retain_session_media,
+                    max_recording_chunk_bytes=server_config.max_recording_chunk_bytes,
+                )
+            else:
+                recorder.store.append_event(
+                    {
+                        "type": "browser_reconnected",
+                        "reconnect_index": study_context.get("reconnect_index"),
+                        "recording_continues": True,
+                    }
+                )
+            active_recorders[session_id] = recorder
             enrollment_event: dict[str, Any] | None = None
             if enrollment is not None and enrollment.is_complete:
                 enrollment_event = {
@@ -830,7 +963,9 @@ def create_browser_capture_app(
                     },
                     "max_image_bytes": server_config.max_image_bytes,
                     "max_session_seconds": server_config.max_session_seconds,
-                    "raw_media_saved": False,
+                    "raw_media_saved": server_config.retain_session_media,
+                    "session_media_retention_enabled": server_config.retain_session_media,
+                    "max_recording_chunk_bytes": server_config.max_recording_chunk_bytes,
                     "realtime_loop_enabled": runtime_session is not None,
                     "speaker_enrollment_complete": enrollment_event is not None,
                     "runtime_controls_enabled": runtime_session is not None,
@@ -870,7 +1005,8 @@ def create_browser_capture_app(
                     continue
                 if control["type"] == "start":
                     try:
-                        recorder.start()
+                        if not recorder.started:
+                            recorder.start()
                         await registry.mark_status(session_id, "active")
                         await send_json({"type": "started"})
                         if runtime_session is not None:
@@ -1007,6 +1143,8 @@ def create_browser_capture_app(
             if session_id is not None and session_authorized:
                 active_session_ids.discard(session_id)
                 if completion_status == "disconnected":
+                    if recorder is not None and not recorder.finished:
+                        schedule_recording_cleanup(session_id, recorder)
                     admission = session_admissions.get(session_id)
                     if admission is not None:
                         session_admissions[session_id] = SessionAdmission(
@@ -1016,6 +1154,8 @@ def create_browser_capture_app(
                             ),
                         )
                 else:
+                    active_recorders.pop(session_id, None)
+                    recording_locks.pop(session_id, None)
                     enrollment = session_enrollments.pop(session_id, None)
                     enrollment_locks.pop(session_id, None)
                     cleanup_succeeded = await cleanup_remote_enrollment(enrollment)
@@ -1032,7 +1172,11 @@ def create_browser_capture_app(
                         await registry.observe(session_id, cleanup_event)
                     session_admissions.pop(session_id, None)
                 await registry.mark_status(session_id, completion_status)
-            if recorder is not None and not recorder.finished:
+            if (
+                recorder is not None
+                and not recorder.finished
+                and completion_status != "disconnected"
+            ):
                 recorder.finish(
                     status=completion_status,
                     error=(

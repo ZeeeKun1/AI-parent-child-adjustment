@@ -282,7 +282,7 @@ def test_both_actor_evidence_uses_closest_dyadic_card() -> None:
     assert result.plan.strategy_id == "DYAD_RELATIONSHIP_RESET"
 
 
-def test_positive_event_remains_non_intervention_under_simple_policy() -> None:
+def test_positive_event_selects_role_specific_reinforcement() -> None:
     observation = _observation(
         state="normal",
         performance="active child participation",
@@ -297,9 +297,10 @@ def test_positive_event_remains_non_intervention_under_simple_policy() -> None:
         decision=decision,
     )
 
-    assert decision.action.value == "no_intervention"
-    assert result.plan is None
-    assert result.hold_reason == "module_two_did_not_authorize"
+    assert decision.action.value == "reinforce"
+    assert result.plan is not None
+    assert result.plan.strategy_id == "CHILD_POSITIVE_AFFIRM"
+    assert result.plan.target_actor is Actor.CHILD
 
 
 def test_child_escalation_selects_child_support_without_guessing_parent() -> None:

@@ -164,7 +164,7 @@ def test_normal_and_fluctuation_do_not_intervene(
     assert decision.intervention_permitted is False
 
 
-def test_normal_state_never_triggers_positive_maintenance() -> None:
+def test_positive_maintenance_requires_event_pause_and_is_not_a_recovery_guard() -> None:
     controller = _controller()
 
     waiting = controller.ingest(
@@ -183,6 +183,10 @@ def test_normal_state_never_triggers_positive_maintenance() -> None:
             performance="task completion",
         )
     )
+    controller.mark_intervention_delivered(
+        CoregulationState.NORMAL,
+        delivered_at_ms=2000,
+    )
     repeated = controller.ingest(
         _observation(
             "normal",
@@ -192,10 +196,63 @@ def test_normal_state_never_triggers_positive_maintenance() -> None:
             performance="task completion",
         )
     )
+    controller.ingest(
+        _observation(
+            "normal",
+            60_000,
+            boundary=True,
+            performance="steady coordination",
+        )
+    )
+    later_event = controller.ingest(
+        _observation(
+            "normal",
+            122_000,
+            boundary=True,
+            performance="task completion",
+        )
+    )
 
-    assert waiting.action is InterventionAction.NO_INTERVENTION
-    assert reinforced.action is InterventionAction.NO_INTERVENTION
+    assert waiting.action is InterventionAction.HOLD
+    assert waiting.reason_code is InterventionDecisionReason.WAITING_FOR_NATURAL_TURN_BOUNDARY
+    assert reinforced.action is InterventionAction.REINFORCE
+    assert reinforced.reason_code is InterventionDecisionReason.POSITIVE_MAINTENANCE_OPPORTUNITY
+    assert controller.awaiting_post_intervention_response is False
     assert repeated.action is InterventionAction.NO_INTERVENTION
+    assert later_event.action is InterventionAction.REINFORCE
+
+
+def test_positive_maintenance_has_independent_cooldown_and_never_blocks_dysregulation() -> None:
+    controller = _controller()
+    reinforced = controller.ingest(
+        _observation(
+            "normal",
+            1000,
+            boundary=True,
+            performance="task completion",
+        )
+    )
+    assert reinforced.action is InterventionAction.REINFORCE
+    controller.mark_intervention_delivered(
+        CoregulationState.NORMAL,
+        delivered_at_ms=2000,
+    )
+
+    within_cooldown = controller.ingest(
+        _observation(
+            "normal",
+            60_000,
+            boundary=True,
+            performance="positive dyadic exchange",
+        )
+    )
+    dysregulation = controller.ingest(
+        _observation("dysregulation", 61_000, boundary=False)
+    )
+
+    assert within_cooldown.action is InterventionAction.NO_INTERVENTION
+    assert dysregulation.action is InterventionAction.INTERVENE
+    assert dysregulation.reason_code is InterventionDecisionReason.DYAD_CANNOT_SELF_RECOVER
 
 
 def test_self_recovery_from_fluctuation_remains_non_intervention() -> None:
@@ -248,6 +305,31 @@ def test_high_risk_requires_history_before_progressive_support() -> None:
         _observation("high_risk", 2000, boundary=True, history_available=True)
     )
     assert allowed.action is InterventionAction.PROGRESSIVE_SUPPORT
+
+
+def test_high_risk_escalation_bypasses_dysregulation_episode_interval() -> None:
+    controller = _controller()
+    first = controller.ingest(_observation("dysregulation", 0, boundary=True))
+    assert first.action is InterventionAction.INTERVENE
+    controller.mark_intervention_delivered(
+        CoregulationState.DYSREGULATION,
+        delivered_at_ms=0,
+    )
+
+    escalated = controller.ingest(
+        _observation(
+            "high_risk",
+            10_000,
+            boundary=False,
+            response_observed=True,
+            history_available=True,
+            previous_state="dysregulation",
+        )
+    )
+
+    assert escalated.action is InterventionAction.PROGRESSIVE_SUPPORT
+    assert escalated.reason_code is InterventionDecisionReason.PERSISTENT_HIGH_RISK_PATTERN
+    assert escalated.recovery_status is RecoveryStatus.DETERIORATED
 
 
 def test_insufficient_or_low_confidence_evidence_holds() -> None:

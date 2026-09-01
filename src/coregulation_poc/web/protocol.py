@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import struct
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from coregulation_poc.capture.media import (
     MediaKind,
     StrictTimestampNormalizer,
 )
-from coregulation_poc.storage.run_artifacts import RunArtifactStore
+from coregulation_poc.storage.run_artifacts import RunArtifactStore, sha256_file
 
 PROTOCOL_VERSION = 1
 AUDIO_PACKET = 1
@@ -43,6 +44,9 @@ class BrowserCaptureSummary:
     last_timestamp_ms: int | None
     normalized_timestamp_count: int
     api_call_count: int
+    raw_media_saved: bool
+    recording_filename: str | None
+    recording_bytes_saved: int
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
@@ -56,7 +60,9 @@ class BrowserCaptureSummary:
                 if self.first_timestamp_ms is None or self.last_timestamp_ms is None
                 else self.last_timestamp_ms - self.first_timestamp_ms
             ),
-            "raw_media_saved": False,
+            "raw_media_saved": self.raw_media_saved,
+            "recording_filename": self.recording_filename,
+            "recording_bytes_saved": self.recording_bytes_saved,
             "api_called": self.api_call_count > 0,
             "api_call_count": self.api_call_count,
         }
@@ -87,7 +93,7 @@ def decode_binary_packet(message: bytes, *, max_payload_bytes: int) -> tuple[Med
 
 
 class BrowserCaptureRecorder:
-    """Validate browser media and retain metadata only, never replayable payloads."""
+    """Validate live inference media and optionally retain one consented recording."""
 
     def __init__(
         self,
@@ -98,6 +104,8 @@ class BrowserCaptureRecorder:
         max_image_bytes: int,
         client_capabilities: dict[str, Any] | None = None,
         study_context: dict[str, Any] | None = None,
+        recording_enabled: bool = False,
+        max_recording_chunk_bytes: int = 16_000_000,
     ) -> None:
         if max_image_bytes < 1:
             raise ValueError("max_image_bytes must be positive")
@@ -107,6 +115,10 @@ class BrowserCaptureRecorder:
         self.store = RunArtifactStore(output_dir, session_id, run_name=run_name)
         self.media_format = media_format
         self.max_image_bytes = max_image_bytes
+        if max_recording_chunk_bytes < 100_000:
+            raise ValueError("max_recording_chunk_bytes is too small")
+        self.recording_enabled = recording_enabled
+        self.max_recording_chunk_bytes = max_recording_chunk_bytes
         self.normalizer = StrictTimestampNormalizer()
         self.started = False
         self.finished = False
@@ -118,6 +130,17 @@ class BrowserCaptureRecorder:
         self.last_timestamp_ms: int | None = None
         self.normalized_timestamp_count = 0
         self.api_call_count = 0
+        self.recording_content_type: str | None = None
+        self.recording_filename: str | None = None
+        self.recording_chunk_count = 0
+        self.recording_bytes_saved = 0
+        self.recording_first_timestamp_ms: int | None = None
+        self.recording_last_timestamp_ms: int | None = None
+        self._recording_chunks: dict[int, dict[str, Any]] = {}
+        self._recording_highest_sequence = -1
+        self._recording_missing_sequences: set[int] = set()
+        self._recording_part_path: Path | None = None
+        self._recording_finalized = False
         self._write_manifest(client_capabilities or {})
 
     def _study_run_name(self) -> str:
@@ -159,14 +182,170 @@ class BrowserCaptureRecorder:
                 "media_format": asdict(self.media_format),
                 "client_capabilities": allowed_capabilities,
                 "privacy": {
-                    "raw_media_saved": False,
-                    "payload_bytes_saved": False,
+                    "raw_media_saved": self.recording_enabled,
+                    "payload_bytes_saved": self.recording_enabled,
+                    "session_media_retention_enabled": self.recording_enabled,
+                    "inference_pcm_and_jpeg_saved_separately": False,
                     "device_ids_saved": False,
                     "device_labels_saved": False,
                     "remote_ip_saved": False,
                     "api_credentials_exposed_to_browser": False,
                 },
                 "engineering_parameters_are_research_findings": False,
+            },
+        )
+
+    @staticmethod
+    def _recording_extension(content_type: str) -> str:
+        base_type = content_type.split(";", 1)[0].strip().lower()
+        extensions = {
+            "video/webm": "webm",
+            "video/mp4": "mp4",
+        }
+        try:
+            return extensions[base_type]
+        except KeyError as exc:
+            raise BrowserProtocolError("recording content type is not supported") from exc
+
+    def accept_recording_chunk(
+        self,
+        *,
+        sequence: int,
+        start_ms: int,
+        end_ms: int,
+        content_type: str,
+        payload: bytes,
+    ) -> dict[str, Any]:
+        """Append one ordered MediaRecorder fragment with retry-safe deduplication."""
+
+        if not self.recording_enabled:
+            raise BrowserProtocolError("session media retention is disabled")
+        if not self.started or self.finished:
+            raise BrowserProtocolError("recording chunks require an active capture session")
+        if isinstance(sequence, bool) or sequence < 0:
+            raise BrowserProtocolError("recording sequence must be a non-negative integer")
+        if (
+            isinstance(start_ms, bool)
+            or isinstance(end_ms, bool)
+            or start_ms < 0
+            or end_ms < start_ms
+            or end_ms > MAX_SESSION_TIMESTAMP_MS
+        ):
+            raise BrowserProtocolError("recording timestamps are invalid")
+        if not payload:
+            raise BrowserProtocolError("recording chunk is empty")
+        if len(payload) > self.max_recording_chunk_bytes:
+            raise BrowserProtocolError("recording chunk exceeds the configured size limit")
+
+        extension = self._recording_extension(content_type)
+        normalized_content_type = content_type.strip().lower()
+        digest = hashlib.sha256(payload).hexdigest()
+        existing = self._recording_chunks.get(sequence)
+        if existing is not None:
+            if existing["sha256"] != digest or existing["payload_bytes"] != len(payload):
+                raise BrowserProtocolError("recording retry does not match the accepted chunk")
+            return {
+                "sequence": sequence,
+                "duplicate": True,
+                "recording_bytes_saved": self.recording_bytes_saved,
+            }
+        if sequence < self._recording_highest_sequence:
+            raise BrowserProtocolError("recording chunk arrived after a newer fragment")
+        if sequence > self._recording_highest_sequence + 1:
+            missing = range(self._recording_highest_sequence + 1, sequence)
+            self._recording_missing_sequences.update(missing)
+
+        if self.recording_content_type is None:
+            self.recording_content_type = normalized_content_type
+            self.recording_filename = f"session_recording.{extension}"
+            media_dir = (self.run_dir / "media").resolve()
+            media_dir.mkdir(parents=True, exist_ok=True)
+            self._recording_part_path = (
+                media_dir / f"{self.recording_filename}.part"
+            ).resolve()
+        elif normalized_content_type != self.recording_content_type:
+            raise BrowserProtocolError("recording content type changed during the session")
+
+        if self._recording_part_path is None:
+            raise BrowserProtocolError("recording destination was not initialized")
+        with self._recording_part_path.open("ab") as handle:
+            handle.write(payload)
+
+        metadata = {
+            "sequence": sequence,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "payload_bytes": len(payload),
+            "sha256": digest,
+        }
+        self._recording_chunks[sequence] = metadata
+        self._recording_highest_sequence = sequence
+        self.recording_chunk_count = len(self._recording_chunks)
+        self.recording_bytes_saved += len(payload)
+        if self.recording_first_timestamp_ms is None:
+            self.recording_first_timestamp_ms = start_ms
+        self.recording_last_timestamp_ms = end_ms
+        self.store.append_event(
+            {
+                "type": "session_recording_chunk",
+                **metadata,
+                "content_type": self.recording_content_type,
+                "payload_saved": True,
+            }
+        )
+        return {
+            "sequence": sequence,
+            "duplicate": False,
+            "recording_bytes_saved": self.recording_bytes_saved,
+        }
+
+    def _finalize_recording(
+        self,
+        *,
+        status: str,
+        upload_failure_count: int,
+    ) -> None:
+        if self._recording_finalized:
+            return
+        self._recording_finalized = True
+        final_path: Path | None = None
+        if (
+            self.recording_enabled
+            and self._recording_part_path is not None
+            and self._recording_part_path.exists()
+            and self.recording_filename is not None
+        ):
+            final_path = (self._recording_part_path.parent / self.recording_filename).resolve()
+            self._recording_part_path.replace(final_path)
+
+        self.store.write_json(
+            "recording_manifest.json",
+            {
+                "retention_enabled": self.recording_enabled,
+                "recording_saved": final_path is not None,
+                "complete": bool(
+                    status == "completed"
+                    and final_path is not None
+                    and upload_failure_count == 0
+                    and not self._recording_missing_sequences
+                ),
+                "filename": (
+                    None
+                    if final_path is None
+                    else str(final_path.relative_to(self.run_dir))
+                ),
+                "content_type": self.recording_content_type,
+                "chunk_count": self.recording_chunk_count,
+                "bytes_saved": self.recording_bytes_saved,
+                "first_timestamp_ms": self.recording_first_timestamp_ms,
+                "last_timestamp_ms": self.recording_last_timestamp_ms,
+                "upload_failure_count": upload_failure_count,
+                "missing_sequences": sorted(self._recording_missing_sequences),
+                "sha256": None if final_path is None else sha256_file(final_path),
+                "chunks": [
+                    self._recording_chunks[key]
+                    for key in sorted(self._recording_chunks)
+                ],
             },
         )
 
@@ -270,6 +449,9 @@ class BrowserCaptureRecorder:
                 "camera_health_failures",
                 "microphone_health_failures",
                 "capture_duration_ms",
+                "recording_chunk_count",
+                "recording_bytes_uploaded",
+                "recording_upload_failures",
             }
             and isinstance(value, (int, float))
         }
@@ -296,6 +478,12 @@ class BrowserCaptureRecorder:
             if isinstance(api_call_count, int) and not isinstance(api_call_count, bool)
             else 0
         )
+        upload_failure_count = int(public_client_metrics.get("recording_upload_failures", 0))
+        self._finalize_recording(
+            status=status,
+            upload_failure_count=max(0, upload_failure_count),
+        )
+        raw_media_saved = bool(self.recording_filename and self.recording_bytes_saved > 0)
         metrics = {
             "audio_chunk_count": self.audio_chunk_count,
             "image_chunk_count": self.image_chunk_count,
@@ -307,7 +495,10 @@ class BrowserCaptureRecorder:
             "normalized_timestamp_count": self.normalized_timestamp_count,
             "client_metrics": public_client_metrics,
             "realtime_loop": public_runtime_metrics,
-            "raw_media_saved": False,
+            "raw_media_saved": raw_media_saved,
+            "recording_filename": self.recording_filename,
+            "recording_chunk_count": self.recording_chunk_count,
+            "recording_bytes_saved": self.recording_bytes_saved,
         }
         self.store.write_json("metrics.json", metrics)
         self.store.write_json(
@@ -318,7 +509,9 @@ class BrowserCaptureRecorder:
                 "error": error,
                 "api_called": self.api_call_count > 0,
                 "api_call_count": self.api_call_count,
-                "raw_media_saved": False,
+                "raw_media_saved": raw_media_saved,
+                "recording_filename": self.recording_filename,
+                "recording_bytes_saved": self.recording_bytes_saved,
                 "finished_at": datetime.now(UTC).isoformat(),
             },
         )
@@ -346,4 +539,7 @@ class BrowserCaptureRecorder:
             last_timestamp_ms=self.last_timestamp_ms,
             normalized_timestamp_count=self.normalized_timestamp_count,
             api_call_count=self.api_call_count,
+            raw_media_saved=bool(self.recording_filename and self.recording_bytes_saved > 0),
+            recording_filename=self.recording_filename,
+            recording_bytes_saved=self.recording_bytes_saved,
         )

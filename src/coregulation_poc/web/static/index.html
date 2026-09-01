@@ -219,7 +219,7 @@
           <!-- Step 3: Device check + Consent + Start -->
           <div class="wizard-panel" data-step="3" role="tabpanel" hidden>
             <h3 class="wizard-col-title">确认画面和声音</h3>
-            <p class="wizard-col-hint">检查通过后，确认采集说明即可开始。</p>
+            <p class="wizard-col-hint">检查通过后，确认本次活动的音视频记录说明即可开始。</p>
             <div class="device-check-layout">
               <div class="device-preview" id="device-preview" data-active="false">
                 <video id="preview" muted playsinline aria-label="摄像头检查画面"></video>
@@ -240,7 +240,7 @@
                 <button id="device-check-button" class="secondary-action" type="button" disabled>录完声音后可检查</button>
                 <label class="consent">
                   <input id="consent" type="checkbox">
-                  <span>我们已了解采集说明，并同意开始本次活动。</span>
+                  <span>我们已了解活动期间将录制并保存音视频，用于本次研究分析，并同意开始。</span>
                 </label>
               </div>
             </div>
@@ -329,6 +329,6 @@
       <div class="camera-empty" id="camera-empty" hidden>摄像头预览</div>
     </details>
 
-    <script src="/static/app.js?v=14" defer></script>
+    <script src="/static/app.js?v=15" defer></script>
   </body>
 </html>

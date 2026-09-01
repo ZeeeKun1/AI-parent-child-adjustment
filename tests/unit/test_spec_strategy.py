@@ -263,8 +263,8 @@ def test_multiple_performances_use_all_matching_rules() -> None:
     assert "sustained task stall" in result.plan.selected_from_interaction_performance
 
 
-# Test 21: normal state stays silent even when a positive event is observed
-def test_normal_positive_event_does_not_create_strategy_plan() -> None:
+# Test 21: a clear positive event authorizes one targeted maintenance plan
+def test_normal_positive_event_creates_targeted_strategy_plan() -> None:
     observation = _observation(
         state="normal",
         performance="task completion",
@@ -280,5 +280,7 @@ def test_normal_positive_event_does_not_create_strategy_plan() -> None:
         decision=decision,
     )
 
-    assert result.plan is None
-    assert result.hold_reason == "module_two_did_not_authorize"
+    assert decision.action.value == "reinforce"
+    assert result.plan is not None
+    assert result.plan.strategy_id == "PARENT_POSITIVE_AFFIRM"
+    assert result.plan.decision_action.value == "reinforce"

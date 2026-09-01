@@ -231,6 +231,8 @@ class RealtimeSession:
         self.assessment_count = 0
         self._last_scheduled_at_ms: int | None = None
         self._post_response_not_before_ms: int | None = None
+        self._positive_maintenance_pending: dict[str, Any] | None = None
+        self._positive_maintenance_not_before_ms: int | None = None
         self._scheduled_assessment_count = 0
         self._analysis_queue: asyncio.Queue[_AnalysisJob | None] = asyncio.Queue()
         self._analysis_worker_task: asyncio.Task[None] | None = None
@@ -323,6 +325,9 @@ class RealtimeSession:
             "spontaneous_recovery_count": self._spontaneous_recovery_count,
             "awaiting_post_intervention_response": (
                 self.controller.awaiting_post_intervention_response
+            ),
+            "awaiting_positive_maintenance_observation": (
+                self._positive_maintenance_pending is not None
             ),
             "intervention_queued": False,
             "interventions_paused": self._interventions_paused,
@@ -794,6 +799,10 @@ class RealtimeSession:
             self._post_response_not_before_ms is not None
             and snapshot.end_ms >= self._post_response_not_before_ms
         )
+        positive_maintenance_observed = (
+            self._positive_maintenance_not_before_ms is not None
+            and snapshot.end_ms >= self._positive_maintenance_not_before_ms
+        )
         try:
             boundary_resolution = self.boundary_tracker.resolve(
                 model_assessment,
@@ -835,11 +844,22 @@ class RealtimeSession:
                     )
                 if outcome is not None:
                     self.intervention_outcomes.append(outcome)
+                    self.boundary_tracker.record_intervention_outcome(
+                        outcome["recovery_status"],
+                        observed_at_ms=assessment.assessed_at_ms,
+                    )
                     await self.send_event({"type": "intervention_outcome", **outcome})
                 self._post_response_not_before_ms = None
                 self.pending_delivery = None
                 self._pending_plan = None
                 self._expert_pending = None
+            if positive_maintenance_observed:
+                outcome = self._build_positive_maintenance_outcome(assessment)
+                if outcome is not None:
+                    self.intervention_outcomes.append(outcome)
+                    await self.send_event({"type": "intervention_outcome", **outcome})
+                self._positive_maintenance_pending = None
+                self._positive_maintenance_not_before_ms = None
             await self.send_event(
                 {
                     "type": "state_update",
@@ -871,6 +891,9 @@ class RealtimeSession:
                     "support_target": assessment.support_target.value,
                     "interruptibility": assessment.interruptibility.value,
                     "interaction_performance": list(assessment.interaction_performance),
+                    "high_risk_signals": assessment.high_risk_signals.model_dump(
+                        mode="json"
+                    ),
                     "assessment": assessment.model_dump(mode="json"),
                     "perception_report": (
                         perception.model_dump(mode="json")
@@ -1232,7 +1255,8 @@ class RealtimeSession:
             )
             pending_plan = self._pending_plan
             if pending_plan is None:
-                self.controller.mark_intervention_not_delivered()
+                if self.controller.awaiting_post_intervention_response:
+                    self.controller.mark_intervention_not_delivered()
                 self.pending_delivery = None
                 await self.send_event(
                     {
@@ -1257,14 +1281,32 @@ class RealtimeSession:
                         self._recent_intervention_messages[-3:]
                     )
                 self._recorded_message_delivery_ids.add(package.delivery_id)
-            self._post_response_not_before_ms = (
-                delivery_timeline_ms + self.config.post_intervention_observation_ms
+            positive_maintenance = (
+                pending_plan.decision_action is InterventionAction.REINFORCE
             )
+            if positive_maintenance:
+                self._positive_maintenance_pending = {
+                    "delivery_id": package.delivery_id,
+                    "strategy_id": pending_plan.strategy_id,
+                    "target_actor": pending_plan.target_actor.value,
+                    "repair_target": pending_plan.repair_target.value,
+                    "expected_recovery": list(pending_plan.expected_recovery),
+                }
+                self._positive_maintenance_not_before_ms = (
+                    delivery_timeline_ms + self.config.post_intervention_observation_ms
+                )
+                self.pending_delivery = None
+                self._pending_plan = None
+            else:
+                self._post_response_not_before_ms = (
+                    delivery_timeline_ms + self.config.post_intervention_observation_ms
+                )
             # The next model window must contain only behavior observed after delivery.
             self.window.clear()
             self._last_scheduled_at_ms = delivery_timeline_ms
         else:
-            self.controller.mark_intervention_not_delivered()
+            if self.controller.awaiting_post_intervention_response:
+                self.controller.mark_intervention_not_delivered()
             self.pending_delivery = None
             self._pending_plan = None
         report_record = report.model_dump(mode="json")
@@ -1278,7 +1320,14 @@ class RealtimeSession:
                 "recorded_at_ms": report.recorded_at_ms,
                 "visual_status": report.visual.status.value,
                 "voice_status": report.voice.status.value,
-                "post_intervention_observation_armed": delivered,
+                "post_intervention_observation_armed": (
+                    delivered
+                    and self._post_response_not_before_ms is not None
+                ),
+                "positive_maintenance_observation_armed": (
+                    delivered
+                    and self._positive_maintenance_pending is not None
+                ),
                 "delivery_timeline_ms": delivery_timeline_ms,
             }
         )
@@ -1569,6 +1618,47 @@ class RealtimeSession:
             "interpretation_limit": (
                 "The record links the strategy to the next observable window; "
                 "it does not by itself establish that the intervention caused the change."
+            ),
+        }
+
+    def _build_positive_maintenance_outcome(
+        self,
+        assessment: StateAssessment,
+    ) -> dict[str, Any] | None:
+        pending = self._positive_maintenance_pending
+        if pending is None:
+            return None
+        observed_state = None if assessment.state is None else assessment.state.value
+        maintenance_status, effect_category = {
+            "normal": ("positive_coordination_maintained", "positive"),
+            "fluctuation": ("coordination_temporarily_unsteady", "limited"),
+            "dysregulation": ("positive_coordination_not_maintained", "negative"),
+            "high_risk": ("positive_coordination_not_maintained", "negative"),
+        }.get(observed_state, ("indeterminate", "indeterminate"))
+        return {
+            "source": "ai",
+            "outcome_type": "positive_maintenance",
+            **pending,
+            "observed_at_ms": assessment.assessed_at_ms,
+            "recovery_status": maintenance_status,
+            "effect_category": effect_category,
+            "observed_state": observed_state,
+            "observed_interaction_performance": list(
+                assessment.interaction_performance
+            ),
+            "observed_evidence": [
+                {
+                    "modality": item.modality.value,
+                    "actor": item.actor.value,
+                    "start_ms": item.start_ms,
+                    "end_ms": item.end_ms,
+                    "code": item.code,
+                }
+                for item in assessment.modality_evidence.all_items
+            ],
+            "interpretation_limit": (
+                "The record describes coordination in the next observable window; "
+                "it does not by itself establish that the reinforcement caused it."
             ),
         }
 

@@ -332,6 +332,7 @@ class QwenWindowRecognizer:
                 ),
                 "trajectory": item.trajectory.value,
                 "boundary_signals": item.boundary_signals.model_dump(mode="json"),
+                "high_risk_signals": item.high_risk_signals.model_dump(mode="json"),
             }
             for item in history
         ]

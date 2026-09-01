@@ -46,7 +46,7 @@ principles:
   post_intervention_full_window_required: true
   fluctuation_is_non_intervention: true
   fluctuation_no_reinforcement: true
-  positive_maintenance_enabled: false
+  positive_maintenance_enabled: true
 
 guard_actions:
   insufficient_evidence:
@@ -108,13 +108,13 @@ guard_actions:
 positive_maintenance:
   action: reinforce
   reason_code: positive_maintenance_opportunity
+  minimum_interval_ms: 120000
   allowed_states: [normal]
   explicit_trigger_performances:
     - "task completion"
     - "positive dyadic exchange"
     - "active child participation"
     - "supportive parental guidance"
-    - "normal task progression"
   recovery_transition_states: [fluctuation]
   requires_natural_turn_boundary: true
   research_basis: [protect_natural_rhythm, reinforce_positive_coordination]

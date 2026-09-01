@@ -13,6 +13,7 @@ from coregulation_poc.models import (
     CoregulationState,
     EvidenceSufficiency,
     InteractionTrajectory,
+    RecoveryStatus,
     RegulationBalance,
     StateAssessment,
     SupportNeed,
@@ -40,6 +41,12 @@ class BoundaryRuleConfig(BaseModel):
     required_disruption_window_count: int = Field(ge=2)
     required_consecutive_disruption_window_count: int = Field(ge=2)
     required_corroborating_signal_count: int = Field(ge=1)
+    high_risk_pattern_window_ms: int = Field(gt=0)
+    high_risk_parent_takeover_minimum_windows: int = Field(ge=2)
+    high_risk_passive_dependence_minimum_windows: int = Field(ge=2)
+    high_risk_resistance_minimum_windows: int = Field(ge=2)
+    high_risk_refractory_dysregulation_ms: int = Field(ge=60_000)
+    high_risk_refractory_task_processes: list[TaskProcess] = Field(min_length=1)
     model_dysregulation_requires_operational_confirmation: bool
     allow_immediate_dysregulation_for_marked_current_evidence: bool
     marked_current_evidence_requires_independent_corroboration: bool
@@ -75,6 +82,17 @@ class BoundaryRuleConfig(BaseModel):
             > self.required_disruption_window_count
         ):
             raise ValueError("consecutive disruption count cannot exceed total count")
+        if self.high_risk_pattern_window_ms < self.trajectory_window_ms:
+            raise ValueError("high-risk pattern window must cover the trajectory window")
+        available_high_risk_windows = (
+            self.high_risk_pattern_window_ms // self.expected_window_ms
+        )
+        if max(
+            self.high_risk_parent_takeover_minimum_windows,
+            self.high_risk_passive_dependence_minimum_windows,
+            self.high_risk_resistance_minimum_windows,
+        ) > available_high_risk_windows:
+            raise ValueError("high-risk signal threshold does not fit its pattern window")
         return self
 
 
@@ -104,6 +122,10 @@ class BoundaryResolution:
     consecutive_disruption_window_count: int
     rolling_parental_prompt_rate_per_minute: float | None
     corroborating_signals: tuple[str, ...]
+    rolling_parent_task_takeover_count: int
+    rolling_child_passive_dependence_count: int
+    rolling_strong_resistance_or_withdrawal_count: int
+    unsuccessful_support_observed: bool
     spontaneous_recovery: bool
 
     def as_event_fields(self) -> dict[str, Any]:
@@ -119,8 +141,21 @@ class BoundaryResolution:
                 self.rolling_parental_prompt_rate_per_minute
             ),
             "corroborating_signals": list(self.corroborating_signals),
+            "rolling_parent_task_takeover_count": (
+                self.rolling_parent_task_takeover_count
+            ),
+            "rolling_child_passive_dependence_count": (
+                self.rolling_child_passive_dependence_count
+            ),
+            "rolling_strong_resistance_or_withdrawal_count": (
+                self.rolling_strong_resistance_or_withdrawal_count
+            ),
+            "unsuccessful_support_observed": self.unsuccessful_support_observed,
             "spontaneous_recovery": self.spontaneous_recovery,
             "boundary_signals": self.assessment.boundary_signals.model_dump(mode="json"),
+            "high_risk_signals": self.assessment.high_risk_signals.model_dump(
+                mode="json"
+            ),
         }
 
 
@@ -145,12 +180,33 @@ class BoundaryStateTracker:
         self._uncertainty_started_at_ms: int | None = None
         self._corroborating_windows: deque[tuple[int, tuple[str, ...]]] = deque()
         self._prompt_windows: deque[tuple[int, int, int]] = deque()
+        self._high_risk_signal_windows: deque[
+            tuple[int, bool, bool, bool]
+        ] = deque()
         self._dysregulation_active = False
+        self._dysregulation_started_at_ms: int | None = None
+        self._unsuccessful_support_at_ms: int | None = None
 
     @classmethod
     def from_codebook(cls) -> BoundaryStateTracker:
         config, performances = load_boundary_rule_config()
         return cls(config, performances)
+
+    def record_intervention_outcome(
+        self,
+        recovery_status: RecoveryStatus | str,
+        *,
+        observed_at_ms: int,
+    ) -> None:
+        """Record whether corrective support failed without coupling classification to delivery."""
+
+        status = RecoveryStatus(recovery_status)
+        if isinstance(observed_at_ms, bool) or observed_at_ms < 0:
+            raise ValueError("observed_at_ms must be a non-negative integer")
+        if status in {RecoveryStatus.NOT_RECOVERED, RecoveryStatus.DETERIORATED}:
+            self._unsuccessful_support_at_ms = observed_at_ms
+        elif status in {RecoveryStatus.RECOVERED, RecoveryStatus.PARTIAL_RECOVERY}:
+            self._unsuccessful_support_at_ms = None
 
     def resolve(
         self,
@@ -184,6 +240,7 @@ class BoundaryStateTracker:
             window_end_ms=window_end_ms,
             prompt_count=signals.parental_prompt_count,
         )
+        self._record_high_risk_signal_window(window_end_ms, assessment)
         prompt_rate = self._rolling_prompt_rate(window_end_ms)
         current_corroborating = self._corroborating_signals(assessment, prompt_rate)
         disruption_observed = self._coordination_disruption_observed(assessment)
@@ -267,6 +324,8 @@ class BoundaryStateTracker:
 
         if model_state is CoregulationState.HIGH_RISK:
             self._dysregulation_active = True
+            if self._dysregulation_started_at_ms is None:
+                self._dysregulation_started_at_ms = window_start_ms
             return self._resolution(
                 assessment=assessment,
                 model_state=model_state,
@@ -321,8 +380,28 @@ class BoundaryStateTracker:
             target_state = CoregulationState.FLUCTUATION
             reason_code = "dysregulation_candidate_waiting_for_duration"
 
-        if target_state is CoregulationState.DYSREGULATION:
+        high_risk_reason = self._high_risk_pattern_reason(assessment)
+        if high_risk_reason is not None:
+            target_state = CoregulationState.HIGH_RISK
+            reason_code = high_risk_reason
+        elif target_state is CoregulationState.DYSREGULATION:
+            if self._dysregulation_started_at_ms is None:
+                self._dysregulation_started_at_ms = window_start_ms
+            high_risk_reason = self._refractory_high_risk_reason(
+                assessment,
+                window_end_ms=window_end_ms,
+            )
+            if high_risk_reason is not None:
+                target_state = CoregulationState.HIGH_RISK
+                reason_code = high_risk_reason
+
+        if target_state in {
+            CoregulationState.DYSREGULATION,
+            CoregulationState.HIGH_RISK,
+        }:
             self._dysregulation_active = True
+            if self._dysregulation_started_at_ms is None:
+                self._dysregulation_started_at_ms = window_start_ms
 
         resolved = self._replace_state(assessment, target_state, reason_code)
         return self._resolution(
@@ -394,7 +473,108 @@ class BoundaryStateTracker:
         if signals:
             self._corroborating_windows.append((window_end_ms, signals))
 
+    def _record_high_risk_signal_window(
+        self,
+        window_end_ms: int,
+        assessment: StateAssessment,
+    ) -> None:
+        signals = assessment.high_risk_signals
+        self._high_risk_signal_windows.append(
+            (
+                window_end_ms,
+                signals.parent_task_takeover_observed is True,
+                signals.child_passive_dependence_observed is True,
+                signals.strong_resistance_or_withdrawal_observed is True,
+            )
+        )
+        self._prune_high_risk_signals(window_end_ms)
+
+    def _prune_high_risk_signals(self, window_end_ms: int) -> None:
+        cutoff = window_end_ms - self.config.high_risk_pattern_window_ms
+        while (
+            self._high_risk_signal_windows
+            and self._high_risk_signal_windows[0][0] <= cutoff
+        ):
+            self._high_risk_signal_windows.popleft()
+
+    def _high_risk_signal_counts(self) -> tuple[int, int, int]:
+        return (
+            sum(item[1] for item in self._high_risk_signal_windows),
+            sum(item[2] for item in self._high_risk_signal_windows),
+            sum(item[3] for item in self._high_risk_signal_windows),
+        )
+
+    def _high_risk_pattern_reason(
+        self,
+        assessment: StateAssessment,
+    ) -> str | None:
+        signals = assessment.high_risk_signals
+        current_signal = any(
+            item is True
+            for item in (
+                signals.parent_task_takeover_observed,
+                signals.child_passive_dependence_observed,
+                signals.strong_resistance_or_withdrawal_observed,
+            )
+        )
+        if not current_signal:
+            return None
+        takeover_count, passive_count, resistance_count = (
+            self._high_risk_signal_counts()
+        )
+        if (
+            takeover_count
+            >= self.config.high_risk_parent_takeover_minimum_windows
+            and passive_count
+            >= self.config.high_risk_passive_dependence_minimum_windows
+        ):
+            return "high_risk_repeated_control_dependence_pattern"
+        if resistance_count >= self.config.high_risk_resistance_minimum_windows:
+            return "high_risk_sustained_resistance_or_withdrawal"
+        return None
+
+    def _refractory_high_risk_reason(
+        self,
+        assessment: StateAssessment,
+        *,
+        window_end_ms: int,
+    ) -> str | None:
+        if self._dysregulation_started_at_ms is None:
+            return None
+        dysregulation_duration_ms = max(
+            0,
+            window_end_ms - self._dysregulation_started_at_ms,
+        )
+        support_failed_in_episode = bool(
+            self._unsuccessful_support_at_ms is not None
+            and self._unsuccessful_support_at_ms >= self._dysregulation_started_at_ms
+        )
+        signals = assessment.high_risk_signals
+        current_high_risk_evidence = bool(
+            any(
+                item is True
+                for item in (
+                    signals.parent_task_takeover_observed,
+                    signals.child_passive_dependence_observed,
+                    signals.strong_resistance_or_withdrawal_observed,
+                )
+            )
+            or assessment.task_process
+            in set(self.config.high_risk_refractory_task_processes)
+        )
+        if all(
+            (
+                dysregulation_duration_ms
+                >= self.config.high_risk_refractory_dysregulation_ms,
+                support_failed_in_episode,
+                current_high_risk_evidence,
+            )
+        ):
+            return "high_risk_persistent_dysregulation_after_ineffective_support"
+        return None
+
     def _prune_trajectory(self, window_end_ms: int) -> None:
+        self._prune_high_risk_signals(window_end_ms)
         cutoff = window_end_ms - self.config.trajectory_window_ms
         while self._disruption_windows and self._disruption_windows[0][1] <= cutoff:
             self._disruption_windows.popleft()
@@ -404,6 +584,8 @@ class BoundaryStateTracker:
             self._recovery_windows.clear()
             self._uncertainty_started_at_ms = None
             self._dysregulation_active = False
+            self._dysregulation_started_at_ms = None
+            self._unsuccessful_support_at_ms = None
 
     def _consecutive_disruption_window_count(self) -> int:
         """Count the most recent approximately consecutive disrupted windows."""
@@ -497,8 +679,11 @@ class BoundaryStateTracker:
         self._disruption_windows.clear()
         self._recovery_windows.clear()
         self._corroborating_windows.clear()
+        self._high_risk_signal_windows.clear()
         self._uncertainty_started_at_ms = None
         self._dysregulation_active = False
+        self._dysregulation_started_at_ms = None
+        self._unsuccessful_support_at_ms = None
 
     def _marked_current_disruption(
         self,
@@ -587,11 +772,23 @@ class BoundaryStateTracker:
         allowed = self.allowed_performances[target_state]
         performances = [item for item in assessment.interaction_performance if item in allowed]
         if not performances:
-            performances = [
-                "brief task stall"
-                if target_state is CoregulationState.FLUCTUATION
-                else "sustained task stall"
-            ]
+            if target_state is CoregulationState.FLUCTUATION:
+                performances = ["brief task stall"]
+            elif target_state is CoregulationState.HIGH_RISK:
+                high_risk_signals = assessment.high_risk_signals
+                if high_risk_signals.parent_task_takeover_observed is True:
+                    performances = ["parental over-helping or task takeover"]
+                elif high_risk_signals.child_passive_dependence_observed is True:
+                    performances = ["child passive dependence"]
+                elif (
+                    high_risk_signals.strong_resistance_or_withdrawal_observed
+                    is True
+                ):
+                    performances = ["sustained strong resistance or withdrawal"]
+                else:
+                    performances = ["persistent interaction imbalance"]
+            else:
+                performances = ["sustained task stall"]
 
         support_need = assessment.support_need
         if support_need is SupportNeed.POSITIVE_REINFORCEMENT:
@@ -625,6 +822,9 @@ class BoundaryStateTracker:
         corroborating: tuple[str, ...] = (),
         spontaneous_recovery: bool = False,
     ) -> BoundaryResolution:
+        takeover_count, passive_count, resistance_count = (
+            self._high_risk_signal_counts()
+        )
         return BoundaryResolution(
             assessment=assessment,
             model_state=model_state,
@@ -635,5 +835,11 @@ class BoundaryStateTracker:
             consecutive_disruption_window_count=self._consecutive_disruption_window_count(),
             rolling_parental_prompt_rate_per_minute=prompt_rate,
             corroborating_signals=corroborating,
+            rolling_parent_task_takeover_count=takeover_count,
+            rolling_child_passive_dependence_count=passive_count,
+            rolling_strong_resistance_or_withdrawal_count=resistance_count,
+            unsuccessful_support_observed=(
+                self._unsuccessful_support_at_ms is not None
+            ),
             spontaneous_recovery=spontaneous_recovery,
         )

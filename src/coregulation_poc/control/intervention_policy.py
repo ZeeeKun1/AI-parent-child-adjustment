@@ -51,6 +51,7 @@ class PositiveMaintenanceRule(DecisionRule):
     explicit_trigger_performances: list[str] = Field(min_length=1)
     recovery_transition_states: list[CoregulationState] = Field(min_length=1)
     requires_natural_turn_boundary: bool
+    minimum_interval_ms: int = Field(ge=120_000)
 
 
 class InterventionPolicy(BaseModel):

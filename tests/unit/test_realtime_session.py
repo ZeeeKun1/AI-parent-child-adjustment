@@ -4,7 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 from coregulation_poc.capture.media import MediaChunk, MediaKind
-from coregulation_poc.models import CoregulationState, StateAssessment
+from coregulation_poc.models import CoregulationState, StateAssessment, SupportNeed
 from coregulation_poc.runtime import RealtimeLoopConfig, RealtimeSession, RollingMediaWindow
 from coregulation_poc.runtime.session import VoiceAudio
 from coregulation_poc.runtime.window import MediaWindow
@@ -149,6 +149,33 @@ class _BothActorRecognizer:
             performance="pace conflict",
             actor="both",
             previous_state=previous_state,
+        )
+
+
+class _PositiveRecognizer:
+    api_call_count = 0
+
+    async def assess(
+        self,
+        *,
+        session_id: str,
+        window: MediaWindow,
+        previous_state: CoregulationState | None,
+        history: tuple[StateAssessment, ...],
+        history_available: bool,
+    ) -> StateAssessment:
+        del history, history_available
+        self.api_call_count += 1
+        assessment = _assessment(
+            session_id=session_id,
+            assessed_at_ms=window.end_ms,
+            state="normal",
+            performance="task completion",
+            actor="both",
+            previous_state=previous_state,
+        )
+        return assessment.model_copy(
+            update={"support_need": SupportNeed.POSITIVE_REINFORCEMENT}
         )
 
 
@@ -631,6 +658,70 @@ async def _exercise_bounded_shutdown() -> None:
 
 def test_session_runs_four_modules_and_observes_post_intervention_response() -> None:
     asyncio.run(_exercise_four_module_loop())
+
+
+def test_positive_maintenance_is_observed_without_blocking_corrective_control() -> None:
+    asyncio.run(_exercise_positive_maintenance_loop())
+
+
+async def _exercise_positive_maintenance_loop() -> None:
+    events: list[dict[str, object]] = []
+
+    async def send_event(event: dict[str, object]) -> None:
+        events.append(event)
+
+    session = RealtimeSession(
+        session_id="positive_maintenance_test",
+        recognizer=_PositiveRecognizer(),
+        send_event=send_event,
+        config=RealtimeLoopConfig(
+            assessment_interval_ms=100_000,
+            post_intervention_observation_ms=1_000,
+            voice_enabled=False,
+        ),
+        turn_boundary_detector=lambda _: True,
+    )
+    await session.start()
+    await session.accept_chunk(_audio(0))
+    await session.accept_chunk(_image(10_000))
+    await session.analyze_now()
+
+    intervention = next(event for event in events if event["type"] == "intervention")
+    assert intervention["strategy_id"] == "DYAD_POSITIVE_AFFIRM"
+    await session.handle_control(
+        {
+            "type": "delivery_execution",
+            "delivery_id": intervention["delivery_id"],
+            "recorded_at_ms": 10_200,
+            "visual": {
+                "status": "delivered",
+                "started_at_ms": 10_180,
+                "completed_at_ms": 10_181,
+                "provider": "browser_overlay",
+            },
+            "voice": {"status": "not_attempted"},
+        }
+    )
+
+    assert session.controller.awaiting_post_intervention_response is False
+    assert session.pending_delivery is None
+    assert session.runtime_metrics["awaiting_positive_maintenance_observation"] is True
+    receipt = [
+        event for event in events if event["type"] == "delivery_execution_received"
+    ][-1]
+    assert receipt["post_intervention_observation_armed"] is False
+    assert receipt["positive_maintenance_observation_armed"] is True
+
+    await session.accept_chunk(_audio(11_300))
+    await session.accept_chunk(_image(21_300))
+    await session.analyze_now()
+
+    assert session.runtime_metrics["awaiting_positive_maintenance_observation"] is False
+    outcome = session.intervention_outcomes[-1]
+    assert outcome["outcome_type"] == "positive_maintenance"
+    assert outcome["recovery_status"] == "positive_coordination_maintained"
+    assert outcome["observed_state"] == "normal"
+    assert len([event for event in events if event["type"] == "intervention"]) == 1
 
 
 async def _exercise_four_module_loop() -> None:

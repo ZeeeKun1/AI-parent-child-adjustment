@@ -262,6 +262,28 @@ def build_judgment_system_prompt(
                 "both participants show observable loss of coordination."
             ),
             (
+                "HIGH-RISK SIGNALS:\n"
+                "Return high_risk_signals for every window, independently of the "
+                "state you select. The deterministic tracker accumulates these "
+                "signals, so do not hide a high-risk candidate only in the reason.\n"
+                "1. parent_task_takeover_observed: true when the parent supplies the "
+                "full procedure or answer, directly completes or changes the child's "
+                "work, or repeatedly dictates each next action so that little "
+                "independent task space remains. Ordinary scaffolding or one hint is "
+                "false. Use null when the parent or task cannot be observed.\n"
+                "2. child_passive_dependence_observed: true when the child repeatedly "
+                "waits for instructions, acts only after exact directives, or shows no "
+                "independent attempt or explanation despite having an opportunity. One "
+                "brief acknowledgement or thinking pause is not enough. Use null when "
+                "the child's participation cannot be observed.\n"
+                "3. strong_resistance_or_withdrawal_observed: true for explicit repeated "
+                "refusal, leaving or pushing away the task, or sustained non-participation. "
+                "Ordinary silence while thinking is false. Use null when participation "
+                "cannot be determined.\n"
+                "These are current-window observations. History and intervention outcomes "
+                "are evaluated by the runtime; never invent them."
+            ),
+            (
                 "STREAMING EXECUTION RULE:\n"
                 "Consecutive windows may be judged concurrently. The supplied history "
                 "is an immutable scheduling-time snapshot and may not contain a window "
@@ -325,6 +347,9 @@ def build_judgment_system_prompt(
             - boundary_signals: task_stall_observed=false,
               parental_prompt_count=0, conflict_action_observed=false,
               child_disengaged_observed=false, regulation_balance=both_stable
+            - high_risk_signals: parent_task_takeover_observed=false,
+              child_passive_dependence_observed=false,
+              strong_resistance_or_withdrawal_observed=false
 
             Reason:
             The child participates actively, the parent responds supportively, and
@@ -349,6 +374,9 @@ def build_judgment_system_prompt(
             - boundary_signals: task_stall_observed=true,
               parental_prompt_count=0, conflict_action_observed=false,
               child_disengaged_observed=false, regulation_balance=one_stable
+            - high_risk_signals: parent_task_takeover_observed=false,
+              child_passive_dependence_observed=false,
+              strong_resistance_or_withdrawal_observed=false
 
             Reason:
             Coordination is temporarily uneven, but task engagement and the capacity
@@ -377,6 +405,9 @@ def build_judgment_system_prompt(
             - boundary_signals: task_stall_observed=true,
               parental_prompt_count=2, conflict_action_observed=false,
               child_disengaged_observed=true, regulation_balance=one_stable
+            - high_risk_signals: parent_task_takeover_observed=false,
+              child_passive_dependence_observed=false,
+              strong_resistance_or_withdrawal_observed=true
 
             Reason:
             The recent trajectory shows a repeated pace conflict and increasingly
@@ -407,6 +438,9 @@ def build_judgment_system_prompt(
             - boundary_signals: task_stall_observed=true,
               parental_prompt_count=null, conflict_action_observed=false,
               child_disengaged_observed=false, regulation_balance=one_stable
+            - high_risk_signals: parent_task_takeover_observed=true,
+              child_passive_dependence_observed=true,
+              strong_resistance_or_withdrawal_observed=false
 
             Reason:
             Current evidence and interaction history jointly demonstrate a persistent
@@ -481,7 +515,7 @@ def build_judgment_user_prompt(
                 "window as provisional recovery rather than proof that a recurring "
                 "pattern ended. Each entry includes state, "
                 "confidence, interaction_performance, task_process, "
-                "support_need, trajectory, and boundary_signals: "
+                "support_need, trajectory, boundary_signals, and high_risk_signals: "
                 + json.dumps(history_summary, ensure_ascii=False)
             ),
             (

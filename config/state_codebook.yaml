@@ -27,6 +27,15 @@ operational_boundary:
   required_disruption_window_count: 3
   required_consecutive_disruption_window_count: 2
   required_corroborating_signal_count: 1
+  high_risk_pattern_window_ms: 60000
+  high_risk_parent_takeover_minimum_windows: 2
+  high_risk_passive_dependence_minimum_windows: 2
+  high_risk_resistance_minimum_windows: 2
+  high_risk_refractory_dysregulation_ms: 120000
+  high_risk_refractory_task_processes:
+    - "over_assistance"
+    - "disengaged"
+    - "sustained_stall"
   model_dysregulation_requires_operational_confirmation: true
   allow_immediate_dysregulation_for_marked_current_evidence: true
   marked_current_evidence_requires_independent_corroboration: true
@@ -34,12 +43,17 @@ operational_boundary:
     - "sustained_stall"
     - "pace_mismatch"
     - "explanation_mismatch"
+    - "over_assistance"
     - "disengaged"
   coordination_disruption_performances:
     - "sustained task stall"
     - "pace conflict"
     - "misaligned understanding"
     - "escalating negative interaction"
+    - "persistent interaction imbalance"
+    - "parental over-helping or task takeover"
+    - "child passive dependence"
+    - "sustained strong resistance or withdrawal"
   explicit_recovery_task_processes:
     - "smooth_progress"
     - "completion"
@@ -66,6 +80,11 @@ operational_boundary:
     sound-pressure, numeric
     pose-angle, and numeric gaze thresholds are deferred until the live measurement
     pipeline uses the same calibrated measurement protocol as the source data.
+    High risk is promoted deterministically when repeated parent task takeover and
+    child passive dependence are both present in the recent 60-second history, or
+    when dysregulation has persisted for at least 120 seconds, a delivered support
+    attempt was not effective, and a current high-risk signal or refractory task
+    process remains observable. High-risk escalation is never based on duration alone.
 
 decision_dimensions:
   coordination_disruption:

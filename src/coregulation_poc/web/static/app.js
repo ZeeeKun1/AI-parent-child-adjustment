@@ -5,6 +5,10 @@ const AUDIO_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 const IMAGE_BACKPRESSURE_BYTES = 1024 * 1024;
 const RECONNECT_DELAY_MS = 2000;
 const VOICE_DELIVERY_TIMEOUT_MS = 12000;
+const RECORDING_TIMESLICE_MS = 10000;
+const RECORDING_UPLOAD_TIMEOUT_MS = 15000;
+const RECORDING_STOP_WAIT_MS = 60000;
+const RECORDING_RETRY_DELAYS_MS = [0, 1500, 4500];
 
 const elements = {
   consent: document.querySelector("#consent"),
@@ -125,6 +129,15 @@ let reconnectCount = 0;
 let activeStudyContext = null;
 let activeAdmissionToken = null;
 let pendingDeliveryExecution = null;
+let sessionMediaRecorder = null;
+let recordingMimeType = "";
+let recordingSequence = 0;
+let recordingLastChunkEndMs = 0;
+let recordingUploadChain = Promise.resolve();
+let recordingPendingUploads = 0;
+let recordingChunkCount = 0;
+let recordingBytesUploaded = 0;
+let recordingUploadFailures = 0;
 
 const PHASE_ART = {
   setup: "/static/img/companion-observing.png",
@@ -596,8 +609,9 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
     capabilities: {
       audio_worklet: Boolean(window.AudioWorkletNode),
       media_devices: Boolean(navigator.mediaDevices),
+      media_recorder: Boolean(window.MediaRecorder),
       secure_context: window.isSecureContext,
-      page_version: "0.6.0",
+      page_version: "0.7.0",
     },
   }));
   const ready = await waitForMessage(ws, ["ready", "error"]);
@@ -1397,7 +1411,178 @@ async function captureImage() {
   }
 }
 
-function releaseMedia() {
+function resetSessionRecordingState() {
+  sessionMediaRecorder = null;
+  recordingMimeType = "";
+  recordingSequence = 0;
+  recordingLastChunkEndMs = 0;
+  recordingUploadChain = Promise.resolve();
+  recordingPendingUploads = 0;
+  recordingChunkCount = 0;
+  recordingBytesUploaded = 0;
+  recordingUploadFailures = 0;
+}
+
+function chooseRecordingMimeType() {
+  if (!window.MediaRecorder) return "";
+  const candidates = [
+    "video/webm;codecs=vp8,opus",
+    "video/webm",
+    "video/mp4",
+  ];
+  return candidates.find((value) => MediaRecorder.isTypeSupported(value)) || "";
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function uploadRecordingChunk({ sequence, startMs, endMs, blob, sessionId, token }) {
+  let lastError = null;
+  for (const retryDelay of RECORDING_RETRY_DELAYS_MS) {
+    if (retryDelay) await wait(retryDelay);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      RECORDING_UPLOAD_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(
+        `/api/session-recording/${encodeURIComponent(sessionId)}/${sequence}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": blob.type || recordingMimeType,
+            "X-Study-Access-Token": token,
+            "X-Media-Start-Ms": String(startMs),
+            "X-Media-End-Ms": String(endMs),
+          },
+          body: blob,
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        let detail = `录制片段上传失败（${response.status}）`;
+        try {
+          const payload = await response.json();
+          if (payload?.detail) detail = payload.detail;
+        } catch {
+          // The status code still provides a useful failure record.
+        }
+        throw new Error(detail);
+      }
+      recordingChunkCount += 1;
+      recordingBytesUploaded += blob.size;
+      return;
+    } catch (error) {
+      lastError = error;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+  throw lastError || new Error("录制片段上传失败");
+}
+
+function queueRecordingChunk(blob, startMs, endMs) {
+  const sequence = recordingSequence;
+  recordingSequence += 1;
+  const sessionId = elements.session.textContent;
+  const token = activeAdmissionToken || sessionAccessToken;
+  recordingPendingUploads += 1;
+  recordingUploadChain = recordingUploadChain
+    .then(() => uploadRecordingChunk({
+      sequence,
+      startMs,
+      endMs,
+      blob,
+      sessionId,
+      token,
+    }))
+    .catch((error) => {
+      recordingUploadFailures += 1;
+      console.error("[sessionRecording] chunk upload failed:", error);
+      if (captureActive && !stopping) {
+        setStatus("实验记录的一个片段暂时未保存，实时分析仍在继续。", "warning");
+      }
+    })
+    .finally(() => {
+      recordingPendingUploads = Math.max(0, recordingPendingUploads - 1);
+    });
+}
+
+function startSessionRecording() {
+  resetSessionRecordingState();
+  if (!negotiated?.session_media_retention_enabled) return;
+  if (!window.MediaRecorder || !mediaStream) {
+    throw new Error("当前浏览器不支持实验音视频记录，请使用最新版 Chrome 或 Edge。");
+  }
+
+  const preferredMimeType = chooseRecordingMimeType();
+  const options = {
+    videoBitsPerSecond: 1200000,
+    audioBitsPerSecond: 64000,
+  };
+  if (preferredMimeType) options.mimeType = preferredMimeType;
+  try {
+    sessionMediaRecorder = new MediaRecorder(mediaStream, options);
+  } catch {
+    sessionMediaRecorder = new MediaRecorder(mediaStream);
+  }
+  recordingMimeType = sessionMediaRecorder.mimeType || preferredMimeType;
+  const baseType = recordingMimeType.split(";", 1)[0].toLowerCase();
+  if (!new Set(["video/webm", "video/mp4"]).has(baseType)) {
+    sessionMediaRecorder = null;
+    throw new Error("当前浏览器无法生成服务器支持的实验录像格式。");
+  }
+
+  recordingLastChunkEndMs = sessionTimestampMs();
+  sessionMediaRecorder.addEventListener("dataavailable", (event) => {
+    if (!event.data || event.data.size === 0) return;
+    const endMs = Math.max(recordingLastChunkEndMs, sessionTimestampMs());
+    queueRecordingChunk(event.data, recordingLastChunkEndMs, endMs);
+    recordingLastChunkEndMs = endMs;
+  });
+  sessionMediaRecorder.addEventListener("error", (event) => {
+    recordingUploadFailures += 1;
+    console.error("[sessionRecording] recorder error:", event.error || event);
+    if (captureActive && !stopping) {
+      setStatus("实验音视频记录出现异常，实时分析仍在继续，请告知研究人员。", "warning");
+    }
+  });
+  sessionMediaRecorder.start(RECORDING_TIMESLICE_MS);
+}
+
+async function stopSessionRecording() {
+  const recorder = sessionMediaRecorder;
+  if (recorder && recorder.state !== "inactive") {
+    await Promise.race([
+      new Promise((resolve) => {
+        recorder.addEventListener("stop", resolve, { once: true });
+        recorder.addEventListener("error", resolve, { once: true });
+        try {
+          recorder.stop();
+        } catch {
+          resolve();
+        }
+      }),
+      wait(5000),
+    ]);
+  }
+  sessionMediaRecorder = null;
+  try {
+    await Promise.race([
+      recordingUploadChain,
+      wait(RECORDING_STOP_WAIT_MS).then(() => {
+        throw new Error("等待录像片段保存超时");
+      }),
+    ]);
+  } catch (error) {
+    recordingUploadFailures += 1;
+    console.error("[sessionRecording] final upload wait failed:", error);
+  }
+}
+
+function haltCaptureLoops() {
   captureActive = false;
   if (imageTimer !== null) window.clearInterval(imageTimer);
   if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
@@ -1405,6 +1590,10 @@ function releaseMedia() {
   imageTimer = null;
   elapsedTimer = null;
   captureHealthTimer = null;
+}
+
+function releaseMedia() {
+  haltCaptureLoops();
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
   reconnecting = false;
@@ -1486,6 +1675,7 @@ async function startCapture() {
     microphoneHealthFailureCount = 0;
     lastAudioChunkAt = 0;
     lastImageFrameAt = 0;
+    startSessionRecording();
     captureActive = true;
     interventionsPaused = false;
     stopping = false;
@@ -1519,6 +1709,8 @@ async function startCapture() {
     captureHealthTimer = window.setInterval(monitorCaptureHealth, 3000);
   } catch (error) {
     console.error("[startCapture] error:", error);
+    haltCaptureLoops();
+    await stopSessionRecording();
     releaseMedia();
     setDeviceHealth("camera", "error");
     setDeviceHealth("microphone", "error");
@@ -1636,6 +1828,7 @@ function resetPreparation() {
   elements.homeNav.setAttribute("aria-current", "page");
   updateFamilyDisplay();
   setPhase("setup");
+  resetSessionRecordingState();
   goToStep(1);
 }
 
@@ -1650,7 +1843,7 @@ async function stopCapture(normal = true, reason = null) {
     duration_ms: localDurationMs,
     run_id: elements.session.textContent,
   };
-  releaseMedia();
+  haltCaptureLoops();
   elements.stop.disabled = true;
   elements.pauseInterventions.disabled = true;
   elements.toggleVoice.disabled = true;
@@ -1658,6 +1851,8 @@ async function stopCapture(normal = true, reason = null) {
   setStatus(normal ? "正在安全结束…" : reason, normal ? "working" : "error");
 
   try {
+    await stopSessionRecording();
+    releaseMedia();
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({
         type: normal ? "stop" : "abort",
@@ -1668,6 +1863,9 @@ async function stopCapture(normal = true, reason = null) {
           camera_health_failures: cameraHealthFailureCount,
           microphone_health_failures: microphoneHealthFailureCount,
           capture_duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+          recording_chunk_count: recordingChunkCount,
+          recording_bytes_uploaded: recordingBytesUploaded,
+          recording_upload_failures: recordingUploadFailures,
         },
       }));
       finalSummary = await waitForMessage(socket, ["summary", "error"], 180000);
@@ -1675,6 +1873,7 @@ async function stopCapture(normal = true, reason = null) {
       socket.close();
     }
   } catch (error) {
+    releaseMedia();
     finalSummary = {
       valid: false,
       duration_ms: localDurationMs,

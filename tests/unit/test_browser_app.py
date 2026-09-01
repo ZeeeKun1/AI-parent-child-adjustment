@@ -77,6 +77,7 @@ def test_browser_page_and_health_are_served(tmp_path: Path) -> None:
     assert page.headers["referrer-policy"] == "no-referrer"
     assert page.headers["cache-control"] == "no-store"
     assert "开始前" in page.text
+    assert "将录制并保存音视频" in page.text
     assert "/static/app.js" in page.text
     assert 'id="pause-interventions-button"' in page.text
     assert 'id="parent-age"' in page.text
@@ -88,7 +89,8 @@ def test_browser_page_and_health_are_served(tmp_path: Path) -> None:
     assert 'id="participant-id"' not in page.text
     assert 'id="session-round"' not in page.text
     assert 'id="access-code"' not in page.text
-    assert health.json()["raw_media_saved"] is False
+    assert health.json()["raw_media_saved"] is True
+    assert health.json()["session_media_retention_enabled"] is True
     assert health.json()["research_console_enabled"] is True
 
     research_page = client.get("/research")
@@ -217,14 +219,61 @@ def test_browser_websocket_receives_media_as_common_chunks(tmp_path: Path) -> No
     assert '"status": "abnormal"' in events
 
 
+def test_browser_session_recording_chunks_are_saved_with_the_active_run(
+    tmp_path: Path,
+) -> None:
+    app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/live") as websocket:
+            websocket.send_json(_hello("saved_recording"))
+            ready = websocket.receive_json()
+            assert ready["session_media_retention_enabled"] is True
+            websocket.send_json({"type": "start"})
+            assert websocket.receive_json()["type"] == "started"
+
+            upload = client.post(
+                "/api/session-recording/saved_recording/0",
+                headers={
+                    "Content-Type": "video/webm;codecs=vp8,opus",
+                    "X-Media-Start-Ms": "0",
+                    "X-Media-End-Ms": "10000",
+                },
+                content=b"webm-fragment",
+            )
+            assert upload.status_code == 200
+            assert upload.json()["duplicate"] is False
+
+            websocket.send_json(
+                {
+                    "type": "stop",
+                    "client_metrics": {
+                        "recording_chunk_count": 1,
+                        "recording_bytes_uploaded": 13,
+                        "recording_upload_failures": 0,
+                    },
+                }
+            )
+            summary = websocket.receive_json()
+
+    assert summary["raw_media_saved"] is True
+    run_dir = next((tmp_path / "output" / "runs").iterdir())
+    assert (run_dir / "media" / "session_recording.webm").read_bytes() == b"webm-fragment"
+    recording_manifest = json.loads(
+        (run_dir / "recording_manifest.json").read_text(encoding="utf-8")
+    )
+    assert recording_manifest["complete"] is True
+
+
 def test_browser_disconnect_is_recorded_as_failure(tmp_path: Path) -> None:
     app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
 
-    with TestClient(app).websocket_connect("/ws/live") as websocket:
-        websocket.send_json(_hello("disconnect_test"))
-        assert websocket.receive_json()["type"] == "ready"
-        websocket.send_json({"type": "start"})
-        assert websocket.receive_json()["type"] == "started"
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/live") as websocket:
+            websocket.send_json(_hello("disconnect_test"))
+            assert websocket.receive_json()["type"] == "ready"
+            websocket.send_json({"type": "start"})
+            assert websocket.receive_json()["type"] == "started"
 
     run_dir = next((tmp_path / "output" / "runs").iterdir())
     result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
@@ -257,7 +306,10 @@ def test_browser_can_reconnect_same_session_after_transient_disconnect(
         json.loads(path.read_text(encoding="utf-8"))
         for path in (tmp_path / "output" / "runs").glob("*/result.json")
     ]
-    assert sorted(item["status"] for item in results) == ["completed", "disconnected"]
+    assert [item["status"] for item in results] == ["completed"]
+    run_dir = next((tmp_path / "output" / "runs").iterdir())
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert '"type": "browser_reconnected"' in events
 
 
 def test_invalid_control_is_skipped_without_ending_capture(tmp_path: Path) -> None:

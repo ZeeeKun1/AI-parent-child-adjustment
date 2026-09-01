@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from coregulation_poc.control import BoundaryStateTracker, load_boundary_rule_config
-from coregulation_poc.models import CoregulationState, StateAssessment
+from coregulation_poc.models import CoregulationState, RecoveryStatus, StateAssessment
 from coregulation_poc.runtime import RealtimeLoopConfig
 
 
@@ -17,6 +17,9 @@ def _assessment(
     task_process_override: str | None = None,
     performance_override: str | None = None,
     independent_corroboration: bool = False,
+    parent_takeover: bool | None = False,
+    child_passive_dependence: bool | None = False,
+    strong_resistance: bool | None = False,
 ) -> StateAssessment:
     if state == "normal":
         performance = "normal task progression"
@@ -54,6 +57,11 @@ def _assessment(
             "conflict_action_observed": conflict,
             "child_disengaged_observed": disengaged,
             "regulation_balance": balance,
+        },
+        high_risk_signals={
+            "parent_task_takeover_observed": parent_takeover,
+            "child_passive_dependence_observed": child_passive_dependence,
+            "strong_resistance_or_withdrawal_observed": strong_resistance,
         },
         modality_evidence={
             "audio": {
@@ -125,6 +133,11 @@ def test_boundary_config_uses_data_derived_cutoffs() -> None:
     assert config.required_disruption_window_count == 3
     assert config.required_consecutive_disruption_window_count == 2
     assert config.required_corroborating_signal_count == 1
+    assert config.high_risk_pattern_window_ms == 60_000
+    assert config.high_risk_parent_takeover_minimum_windows == 2
+    assert config.high_risk_passive_dependence_minimum_windows == 2
+    assert config.high_risk_resistance_minimum_windows == 2
+    assert config.high_risk_refractory_dysregulation_ms == 120_000
     assert config.model_dysregulation_requires_operational_confirmation is True
 
 
@@ -402,6 +415,88 @@ def test_high_risk_history_classification_is_not_overridden() -> None:
     assert result.assessment.state is CoregulationState.HIGH_RISK
     assert result.rule_applied is False
     assert result.reason_code == "high_risk_history_rule_preserved"
+
+
+def test_repeated_control_and_dependence_promote_high_risk() -> None:
+    tracker = BoundaryStateTracker.from_codebook()
+
+    first = tracker.resolve(
+        _assessment(
+            state="dysregulation",
+            task_process_override="over_assistance",
+            parent_takeover=True,
+            child_passive_dependence=True,
+        ),
+        window_start_ms=0,
+        window_end_ms=10_000,
+    )
+    second = tracker.resolve(
+        _assessment(
+            state="dysregulation",
+            task_process_override="over_assistance",
+            parent_takeover=True,
+            child_passive_dependence=True,
+        ),
+        window_start_ms=10_000,
+        window_end_ms=20_000,
+    )
+
+    assert first.assessment.state is CoregulationState.FLUCTUATION
+    assert second.assessment.state is CoregulationState.HIGH_RISK
+    assert second.reason_code == "high_risk_repeated_control_dependence_pattern"
+    assert second.rolling_parent_task_takeover_count == 2
+    assert second.rolling_child_passive_dependence_count == 2
+
+
+def test_persistent_dysregulation_after_failed_support_promotes_high_risk() -> None:
+    tracker = BoundaryStateTracker.from_codebook()
+    result = None
+    for index in range(14):
+        result = tracker.resolve(
+            _assessment(
+                state="dysregulation",
+                prompt_count=1,
+                task_process_override="sustained_stall",
+            ),
+            window_start_ms=index * 10_000,
+            window_end_ms=(index + 1) * 10_000,
+        )
+        if index == 7:
+            tracker.record_intervention_outcome(
+                RecoveryStatus.NOT_RECOVERED,
+                observed_at_ms=80_000,
+            )
+
+    assert result is not None
+    assert result.assessment.state is CoregulationState.HIGH_RISK
+    assert result.reason_code == (
+        "high_risk_persistent_dysregulation_after_ineffective_support"
+    )
+    assert result.unsuccessful_support_observed is True
+
+
+def test_duration_alone_does_not_promote_high_risk() -> None:
+    tracker = BoundaryStateTracker.from_codebook()
+    result = None
+    for index in range(14):
+        result = tracker.resolve(
+            _assessment(
+                state="dysregulation",
+                prompt_count=1,
+                task_process_override="pace_mismatch",
+                performance_override="pace conflict",
+            ),
+            window_start_ms=index * 10_000,
+            window_end_ms=(index + 1) * 10_000,
+        )
+        if index == 7:
+            tracker.record_intervention_outcome(
+                RecoveryStatus.NOT_RECOVERED,
+                observed_at_ms=80_000,
+            )
+
+    assert result is not None
+    assert result.assessment.state is CoregulationState.DYSREGULATION
 
 
 def test_uncertain_window_pauses_candidate_without_erasing_valid_duration() -> None:

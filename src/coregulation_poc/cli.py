@@ -72,7 +72,7 @@ def doctor() -> int:
         "live_capture_api_called": False,
         "live_capture_raw_media_saved": False,
         "browser_capture_command": "web-live --host 127.0.0.1 --port 8000",
-        "browser_capture_raw_media_saved": False,
+        "browser_capture_raw_media_saved": True,
         "browser_capture_api_called": False,
         "browser_capture_access_token_configured": (
             settings.browser_capture_access_token is not None
@@ -375,7 +375,7 @@ def main() -> None:
                     "status": "starting",
                     "open": f"http://{args.host}:{args.port}",
                     "https_required_outside_localhost": True,
-                    "raw_media_saved": False,
+                    "raw_media_saved": True,
                     "api_calls_enabled": args.enable_closed_loop,
                     "voice_api_enabled": args.enable_voice,
                     "max_assessments_per_session": (
