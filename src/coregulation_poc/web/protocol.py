@@ -139,7 +139,7 @@ class BrowserCaptureRecorder:
         self._recording_chunks: dict[int, dict[str, Any]] = {}
         self._recording_highest_sequence = -1
         self._recording_missing_sequences: set[int] = set()
-        self._recording_part_path: Path | None = None
+        self._recording_chunk_dir: Path | None = None
         self._recording_finalized = False
         self._write_manifest(client_capabilities or {})
 
@@ -216,7 +216,7 @@ class BrowserCaptureRecorder:
         content_type: str,
         payload: bytes,
     ) -> dict[str, Any]:
-        """Append one ordered MediaRecorder fragment with retry-safe deduplication."""
+        """Store one MediaRecorder fragment with retry-safe, out-of-order delivery."""
 
         if not self.recording_enabled:
             raise BrowserProtocolError("session media retention is disabled")
@@ -249,27 +249,22 @@ class BrowserCaptureRecorder:
                 "duplicate": True,
                 "recording_bytes_saved": self.recording_bytes_saved,
             }
-        if sequence < self._recording_highest_sequence:
-            raise BrowserProtocolError("recording chunk arrived after a newer fragment")
-        if sequence > self._recording_highest_sequence + 1:
-            missing = range(self._recording_highest_sequence + 1, sequence)
-            self._recording_missing_sequences.update(missing)
-
         if self.recording_content_type is None:
             self.recording_content_type = normalized_content_type
             self.recording_filename = f"session_recording.{extension}"
             media_dir = (self.run_dir / "media").resolve()
             media_dir.mkdir(parents=True, exist_ok=True)
-            self._recording_part_path = (
-                media_dir / f"{self.recording_filename}.part"
+            self._recording_chunk_dir = (
+                media_dir / f".{self.recording_filename}.chunks"
             ).resolve()
+            self._recording_chunk_dir.mkdir(parents=True, exist_ok=True)
         elif normalized_content_type != self.recording_content_type:
             raise BrowserProtocolError("recording content type changed during the session")
 
-        if self._recording_part_path is None:
+        if self._recording_chunk_dir is None:
             raise BrowserProtocolError("recording destination was not initialized")
-        with self._recording_part_path.open("ab") as handle:
-            handle.write(payload)
+        chunk_path = (self._recording_chunk_dir / f"{sequence:08d}.part").resolve()
+        chunk_path.write_bytes(payload)
 
         metadata = {
             "sequence": sequence,
@@ -279,12 +274,25 @@ class BrowserCaptureRecorder:
             "sha256": digest,
         }
         self._recording_chunks[sequence] = metadata
-        self._recording_highest_sequence = sequence
+        self._recording_highest_sequence = max(
+            self._recording_highest_sequence,
+            sequence,
+        )
+        self._recording_missing_sequences = set(
+            range(self._recording_highest_sequence + 1)
+        ).difference(self._recording_chunks)
         self.recording_chunk_count = len(self._recording_chunks)
         self.recording_bytes_saved += len(payload)
-        if self.recording_first_timestamp_ms is None:
-            self.recording_first_timestamp_ms = start_ms
-        self.recording_last_timestamp_ms = end_ms
+        self.recording_first_timestamp_ms = (
+            start_ms
+            if self.recording_first_timestamp_ms is None
+            else min(self.recording_first_timestamp_ms, start_ms)
+        )
+        self.recording_last_timestamp_ms = (
+            end_ms
+            if self.recording_last_timestamp_ms is None
+            else max(self.recording_last_timestamp_ms, end_ms)
+        )
         self.store.append_event(
             {
                 "type": "session_recording_chunk",
@@ -311,12 +319,26 @@ class BrowserCaptureRecorder:
         final_path: Path | None = None
         if (
             self.recording_enabled
-            and self._recording_part_path is not None
-            and self._recording_part_path.exists()
+            and self._recording_chunk_dir is not None
+            and self._recording_chunk_dir.exists()
             and self.recording_filename is not None
+            and self._recording_chunks
         ):
-            final_path = (self._recording_part_path.parent / self.recording_filename).resolve()
-            self._recording_part_path.replace(final_path)
+            final_path = (
+                self._recording_chunk_dir.parent / self.recording_filename
+            ).resolve()
+            with final_path.open("wb") as output:
+                for sequence in sorted(self._recording_chunks):
+                    chunk_path = (
+                        self._recording_chunk_dir / f"{sequence:08d}.part"
+                    ).resolve()
+                    with chunk_path.open("rb") as source:
+                        while block := source.read(1024 * 1024):
+                            output.write(block)
+            for chunk_path in self._recording_chunk_dir.iterdir():
+                if chunk_path.is_file():
+                    chunk_path.unlink()
+            self._recording_chunk_dir.rmdir()
 
         self.store.write_json(
             "recording_manifest.json",
@@ -452,6 +474,9 @@ class BrowserCaptureRecorder:
                 "recording_chunk_count",
                 "recording_bytes_uploaded",
                 "recording_upload_failures",
+                "reconnect_count",
+                "offline_media_drops",
+                "replayed_media_packets",
             }
             and isinstance(value, (int, float))
         }

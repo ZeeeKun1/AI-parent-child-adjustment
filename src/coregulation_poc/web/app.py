@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
@@ -135,6 +136,83 @@ class BrowserServerConfig:
         if self.recording_reconnect_grace_seconds < 10:
             raise ValueError("recording_reconnect_grace_seconds must be at least 10")
 
+
+RuntimeSocketSender = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class _RuntimeEventRelay:
+    """Keep one runtime attached to whichever browser socket is currently alive."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        recorder: BrowserCaptureRecorder,
+        registry: ResearchSessionRegistry,
+    ) -> None:
+        self.session_id = session_id
+        self.recorder = recorder
+        self.registry = registry
+        self._sender: RuntimeSocketSender | None = None
+        self._pending: deque[dict[str, Any]] = deque(maxlen=32)
+        self._lock = asyncio.Lock()
+
+    def _audit(self, payload: dict[str, Any]) -> None:
+        if payload.get("type") not in AUDITED_RUNTIME_EVENTS:
+            return
+        audited = dict(payload)
+        audio_attached = isinstance(audited.pop("audio_base64", None), str)
+        self.recorder.store.append_event(
+            {
+                "type": "realtime_loop_event",
+                "event": audited,
+                "audio_attached_to_browser_message": audio_attached,
+                "payload_saved": False,
+            }
+        )
+
+    async def send(self, payload: dict[str, Any]) -> None:
+        """Audit every runtime event and deliver it now or after reconnection."""
+
+        self._audit(payload)
+        await self.registry.observe(self.session_id, payload)
+        async with self._lock:
+            sender = self._sender
+            if sender is None:
+                self._pending.append(dict(payload))
+                return
+            try:
+                await sender(payload)
+            except (ConnectionError, OSError, RuntimeError, WebSocketDisconnect):
+                if self._sender is sender:
+                    self._sender = None
+                self._pending.append(dict(payload))
+
+    async def attach(self, sender: RuntimeSocketSender) -> bool:
+        """Attach a replacement socket and replay events completed while offline."""
+
+        async with self._lock:
+            self._sender = sender
+            while self._pending:
+                try:
+                    await sender(self._pending[0])
+                except (ConnectionError, OSError, RuntimeError, WebSocketDisconnect):
+                    if self._sender is sender:
+                        self._sender = None
+                    return False
+                self._pending.popleft()
+        return True
+
+    async def detach(self, sender: RuntimeSocketSender) -> None:
+        async with self._lock:
+            if self._sender is sender:
+                self._sender = None
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._sender = None
+            self._pending.clear()
+
 def _parse_control(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(raw)
@@ -195,8 +273,15 @@ def _parse_hello(
         raise BrowserProtocolError("必须填写儿童年级")
     family_roles = study_context.get("family_roles")
     task_context = study_context.get("task_context")
+    reconnect_index = study_context.get("reconnect_index", 0)
     if not isinstance(family_roles, dict) or not isinstance(task_context, dict):
         raise BrowserProtocolError("角色和作业信息不完整")
+    if (
+        not isinstance(reconnect_index, int)
+        or isinstance(reconnect_index, bool)
+        or reconnect_index < 0
+    ):
+        raise BrowserProtocolError("实时连接续接编号无效")
     return (
         session_id,
         capabilities if isinstance(capabilities, dict) else {},
@@ -219,6 +304,7 @@ def _parse_hello(
                 "task_difficulty": task_context.get("task_difficulty", ""),
                 "child_grade": child_grade.strip(),
             },
+            "reconnect_index": reconnect_index,
         },
     )
 
@@ -314,6 +400,11 @@ def create_browser_capture_app(
     app.state.active_session_ids = active_session_ids
     active_recorders: dict[str, BrowserCaptureRecorder] = {}
     app.state.active_recorders = active_recorders
+    active_runtime_sessions: dict[str, RealtimeBrowserSession] = {}
+    app.state.active_runtime_sessions = active_runtime_sessions
+    runtime_event_relays: dict[str, _RuntimeEventRelay] = {}
+    app.state.runtime_event_relays = runtime_event_relays
+    started_runtime_session_ids: set[str] = set()
     recording_locks: dict[str, asyncio.Lock] = {}
     recording_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
     app.state.recording_cleanup_tasks = recording_cleanup_tasks
@@ -367,16 +458,42 @@ def create_browser_capture_app(
                 or session_id in active_session_ids
             ):
                 return
+            runtime = active_runtime_sessions.pop(session_id, None)
+            runtime_metrics: dict[str, Any] = {}
+            if runtime is not None:
+                try:
+                    await runtime.stop("disconnected")
+                except Exception as exc:
+                    recorder.store.append_event(
+                        {
+                            "type": "runtime_stop_warning",
+                            "message": str(exc)[:500],
+                            "session_result_continues": True,
+                            "payload_saved": False,
+                        }
+                    )
+                metrics = getattr(runtime, "runtime_metrics", None)
+                runtime_metrics = (
+                    metrics
+                    if isinstance(metrics, dict)
+                    else {"api_call_count": runtime.api_call_count}
+                )
+            started_runtime_session_ids.discard(session_id)
+            relay = runtime_event_relays.pop(session_id, None)
+            if relay is not None:
+                await relay.close()
             if not recorder.finished:
                 recorder.finish(
                     status="disconnected",
                     error="browser did not reconnect before the recording grace period ended",
+                    runtime_metrics=runtime_metrics,
                 )
             active_recorders.pop(session_id, None)
             recording_locks.pop(session_id, None)
             session_admissions.pop(session_id, None)
             enrollment_locks.pop(session_id, None)
             schedule_remote_cleanup(session_enrollments.pop(session_id, None))
+            await registry.mark_status(session_id, "disconnected")
         except asyncio.CancelledError:
             return
         finally:
@@ -403,12 +520,29 @@ def create_browser_capture_app(
                 *tuple(recording_cleanup_tasks.values()),
                 return_exceptions=True,
             )
-        for recorder in tuple(active_recorders.values()):
+        runtimes = dict(active_runtime_sessions)
+        if runtimes:
+            await asyncio.gather(
+                *(runtime.stop("disconnected") for runtime in runtimes.values()),
+                return_exceptions=True,
+            )
+        for session_id, recorder in tuple(active_recorders.items()):
             if not recorder.finished:
+                runtime = runtimes.get(session_id)
+                metrics = None if runtime is None else getattr(runtime, "runtime_metrics", None)
                 recorder.finish(
                     status="disconnected",
                     error="browser server stopped before a normal session stop",
+                    runtime_metrics=metrics if isinstance(metrics, dict) else None,
                 )
+        if runtime_event_relays:
+            await asyncio.gather(
+                *(relay.close() for relay in runtime_event_relays.values()),
+                return_exceptions=True,
+            )
+        active_runtime_sessions.clear()
+        runtime_event_relays.clear()
+        started_runtime_session_ids.clear()
         if cleanup_tasks:
             await asyncio.gather(*tuple(cleanup_tasks), return_exceptions=True)
         remaining: list[TencentSpeakerEnrollment] = list(failed_cleanup_enrollments)
@@ -810,6 +944,7 @@ def create_browser_capture_app(
         await websocket.accept()
         recorder: BrowserCaptureRecorder | None = None
         runtime_session: RealtimeBrowserSession | None = None
+        runtime_relay: _RuntimeEventRelay | None = None
         runtime_stopped = False
         completion_status = "disconnected"
         session_id: str | None = None
@@ -819,17 +954,21 @@ def create_browser_capture_app(
         async def send_json(payload: dict[str, Any]) -> None:
             async with send_lock:
                 await websocket.send_json(payload)
-                if recorder is not None and payload.get("type") in AUDITED_RUNTIME_EVENTS:
-                    audited = dict(payload)
-                    audio_attached = isinstance(audited.pop("audio_base64", None), str)
-                    recorder.store.append_event(
-                        {
-                            "type": "realtime_loop_event",
-                            "event": audited,
-                            "audio_attached_to_browser_message": audio_attached,
-                            "payload_saved": False,
-                        }
-                    )
+            if (
+                runtime_relay is None
+                and recorder is not None
+                and payload.get("type") in AUDITED_RUNTIME_EVENTS
+            ):
+                audited = dict(payload)
+                audio_attached = isinstance(audited.pop("audio_base64", None), str)
+                recorder.store.append_event(
+                    {
+                        "type": "realtime_loop_event",
+                        "event": audited,
+                        "audio_attached_to_browser_message": audio_attached,
+                        "payload_saved": False,
+                    }
+                )
                 if session_id is not None:
                     await registry.observe(session_id, payload)
 
@@ -838,7 +977,18 @@ def create_browser_capture_app(
             if runtime_session is None or runtime_stopped:
                 return
             runtime_stopped = True
-            await runtime_session.stop(status)
+            try:
+                await runtime_session.stop(status)
+            except Exception as exc:
+                if recorder is not None:
+                    recorder.store.append_event(
+                        {
+                            "type": "runtime_stop_warning",
+                            "message": str(exc)[:500],
+                            "session_result_continues": True,
+                            "payload_saved": False,
+                        }
+                    )
 
         def runtime_metrics() -> dict[str, Any]:
             if runtime_session is None:
@@ -859,7 +1009,7 @@ def create_browser_capture_app(
                 recorder.store.append_event(event)
             if session_id is not None:
                 await registry.observe(session_id, event)
-            with suppress(RuntimeError, WebSocketDisconnect):
+            with suppress(OSError, RuntimeError, WebSocketDisconnect):
                 await send_json(event)
 
         try:
@@ -938,8 +1088,27 @@ def create_browser_capture_app(
                     ),
                 }
                 recorder.store.append_event(enrollment_event)
+            runtime_reused = False
             if session_factory is not None:
-                runtime_session = session_factory(session_id, send_json, enrollment)
+                runtime_session = active_runtime_sessions.get(session_id)
+                runtime_relay = runtime_event_relays.get(session_id)
+                if runtime_session is None:
+                    runtime_relay = _RuntimeEventRelay(
+                        session_id=session_id,
+                        recorder=recorder,
+                        registry=registry,
+                    )
+                    runtime_session = session_factory(
+                        session_id,
+                        runtime_relay.send,
+                        enrollment,
+                    )
+                    active_runtime_sessions[session_id] = runtime_session
+                    runtime_event_relays[session_id] = runtime_relay
+                else:
+                    runtime_reused = True
+                    if runtime_relay is None:
+                        raise BrowserProtocolError("实时会话续接状态不完整，请重新开始实验")
                 task_context_raw = hello_message.get("study_context", {}).get("task_context")
                 if isinstance(task_context_raw, dict):
                     try:
@@ -967,6 +1136,7 @@ def create_browser_capture_app(
                     "session_media_retention_enabled": server_config.retain_session_media,
                     "max_recording_chunk_bytes": server_config.max_recording_chunk_bytes,
                     "realtime_loop_enabled": runtime_session is not None,
+                    "runtime_session_resumed": runtime_reused,
                     "speaker_enrollment_complete": enrollment_event is not None,
                     "runtime_controls_enabled": runtime_session is not None,
                 }
@@ -992,7 +1162,7 @@ def create_browser_capture_app(
                             await chunk_handler(chunk)
                         if runtime_session is not None:
                             await runtime_session.accept_chunk(chunk)
-                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                    except (BrowserProtocolError, ValueError, OSError, RuntimeError) as exc:
                         await report_nonfatal_input_error("media_packet", exc)
                     continue
                 raw_text = event.get("text")
@@ -1009,9 +1179,17 @@ def create_browser_capture_app(
                             recorder.start()
                         await registry.mark_status(session_id, "active")
                         await send_json({"type": "started"})
-                        if runtime_session is not None:
+                        if (
+                            runtime_session is not None
+                            and session_id not in started_runtime_session_ids
+                        ):
                             await runtime_session.start()
-                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                            started_runtime_session_ids.add(session_id)
+                        if runtime_relay is not None:
+                            attached = await runtime_relay.attach(send_json)
+                            if not attached:
+                                raise WebSocketDisconnect(code=1006)
+                    except (BrowserProtocolError, ValueError, OSError, RuntimeError) as exc:
                         await report_nonfatal_input_error("start_control", exc)
                 elif control["type"] == "stop":
                     completion_status = "completed"
@@ -1094,7 +1272,7 @@ def create_browser_capture_app(
                     try:
                         if await runtime_session.handle_control(control):
                             continue
-                    except (BrowserProtocolError, ValueError, OSError) as exc:
+                    except (BrowserProtocolError, ValueError, OSError, RuntimeError) as exc:
                         await report_nonfatal_input_error("runtime_control", exc)
                         continue
                     await report_nonfatal_input_error(
@@ -1123,8 +1301,18 @@ def create_browser_capture_app(
                         ),
                     )
                     continue
-        except WebSocketDisconnect:
+        except WebSocketDisconnect as exc:
             completion_status = "disconnected"
+            if recorder is not None:
+                recorder.store.append_event(
+                    {
+                        "type": "browser_disconnected",
+                        "close_code": exc.code,
+                        "reason": str(getattr(exc, "reason", ""))[:200] or None,
+                        "runtime_preserved_for_reconnect": runtime_session is not None,
+                        "payload_saved": False,
+                    }
+                )
         except (BrowserProtocolError, ValueError, OSError) as exc:
             completion_status = "failed"
             if recorder is not None:
@@ -1139,7 +1327,10 @@ def create_browser_capture_app(
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
-            await stop_runtime(completion_status)
+            if runtime_relay is not None:
+                await runtime_relay.detach(send_json)
+            if completion_status != "disconnected":
+                await stop_runtime(completion_status)
             if session_id is not None and session_authorized:
                 active_session_ids.discard(session_id)
                 if completion_status == "disconnected":
@@ -1153,7 +1344,13 @@ def create_browser_capture_app(
                                 time.monotonic() + server_config.admission_ttl_seconds
                             ),
                         )
+                    await registry.mark_status(session_id, "reconnecting")
                 else:
+                    active_runtime_sessions.pop(session_id, None)
+                    started_runtime_session_ids.discard(session_id)
+                    relay = runtime_event_relays.pop(session_id, None)
+                    if relay is not None:
+                        await relay.close()
                     active_recorders.pop(session_id, None)
                     recording_locks.pop(session_id, None)
                     enrollment = session_enrollments.pop(session_id, None)
@@ -1218,4 +1415,7 @@ def run_browser_capture_server(
         port=port,
         log_level=log_level,
         access_log=False,
+        workers=1,
+        ws_ping_interval=15.0,
+        ws_ping_timeout=60.0,
     )

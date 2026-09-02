@@ -753,6 +753,10 @@ class RealtimeSession:
                     "parent_cosine": segment.parent_cosine,
                     "child_cosine": segment.child_cosine,
                     "provider_score": segment.provider_score,
+                    "parent_provider_score": segment.parent_provider_score,
+                    "child_provider_score": segment.child_provider_score,
+                    "parent_provider_decision": segment.parent_provider_decision,
+                    "child_provider_decision": segment.child_provider_decision,
                     "confidence": segment.confidence,
                     "forced_assignment": segment.forced_assignment,
                     "mean_f0_hz": (segment.mean_f0_hz if segment.mean_f0_hz > 0 else None),
@@ -774,6 +778,9 @@ class RealtimeSession:
             "child_mean_cosine": binding.child_mean_cosine,
             "provider_request_count": binding.provider_request_count,
             "low_confidence_segment_count": binding.low_confidence_segment_count,
+            "continuity_assisted_segment_count": (
+                binding.continuity_assisted_segment_count
+            ),
             "segment_count": len(binding.segments),
             "segments_truncated": len(binding.segments) > len(segments),
             "segments": segments,

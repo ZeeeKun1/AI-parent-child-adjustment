@@ -4,6 +4,9 @@ const IMAGE_PACKET = 2;
 const AUDIO_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 const IMAGE_BACKPRESSURE_BYTES = 1024 * 1024;
 const RECONNECT_DELAY_MS = 2000;
+const SOCKET_HEARTBEAT_MS = 15000;
+const OFFLINE_MEDIA_BUFFER_MS = 12000;
+const OFFLINE_MEDIA_BUFFER_BYTES = 8 * 1024 * 1024;
 const VOICE_DELIVERY_TIMEOUT_MS = 12000;
 const RECORDING_TIMESLICE_MS = 10000;
 const RECORDING_UPLOAD_TIMEOUT_MS = 15000;
@@ -126,6 +129,7 @@ let currentStep = 1;
 let reconnectTimer = null;
 let reconnecting = false;
 let reconnectCount = 0;
+let socketHeartbeatTimer = null;
 let activeStudyContext = null;
 let activeAdmissionToken = null;
 let pendingDeliveryExecution = null;
@@ -138,6 +142,12 @@ let recordingPendingUploads = 0;
 let recordingChunkCount = 0;
 let recordingBytesUploaded = 0;
 let recordingUploadFailures = 0;
+let failedRecordingChunks = new Map();
+let pendingMediaPackets = [];
+let pendingMediaBytes = 0;
+let mediaFlushTimer = null;
+let offlineMediaDrops = 0;
+let replayedMediaPackets = 0;
 
 const PHASE_ART = {
   setup: "/static/img/companion-observing.png",
@@ -584,14 +594,39 @@ function attachSocketLifecycle(ws) {
       setStatus("实时连接不稳定，正在自动恢复。采集设备仍保持开启。", "warning");
     }
   });
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     if (ws !== socket) return;
+    stopSocketHeartbeat();
+    console.warn("[liveSocket] connection closed", {
+      code: event.code,
+      reason: event.reason,
+      clean: event.wasClean,
+    });
     socket = null;
     if (captureActive && !stopping) {
       setStatus("实时连接已中断，正在自动续接。采集设备仍保持开启。", "warning");
       scheduleReconnect();
     }
   });
+}
+
+function stopSocketHeartbeat() {
+  if (socketHeartbeatTimer !== null) window.clearInterval(socketHeartbeatTimer);
+  socketHeartbeatTimer = null;
+}
+
+function startSocketHeartbeat(ws) {
+  stopSocketHeartbeat();
+  socketHeartbeatTimer = window.setInterval(() => {
+    if (
+      captureActive
+      && !stopping
+      && ws === socket
+      && ws.readyState === WebSocket.OPEN
+    ) {
+      ws.send(JSON.stringify({ type: "ping", recorded_at_ms: sessionTimestampMs() }));
+    }
+  }, SOCKET_HEARTBEAT_MS);
 }
 
 async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 0) {
@@ -617,6 +652,8 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
   const ready = await waitForMessage(ws, ["ready", "error"]);
   ws.send(JSON.stringify({ type: "start" }));
   await waitForMessage(ws, ["started", "error"]);
+  startSocketHeartbeat(ws);
+  flushBufferedMedia();
   return ready;
 }
 
@@ -1249,6 +1286,133 @@ function encodePacket(packetType, timestampMs, payload) {
   return packet;
 }
 
+function resetMediaPacketBuffer() {
+  if (mediaFlushTimer !== null) window.clearTimeout(mediaFlushTimer);
+  mediaFlushTimer = null;
+  pendingMediaPackets = [];
+  pendingMediaBytes = 0;
+  offlineMediaDrops = 0;
+  replayedMediaPackets = 0;
+}
+
+function mediaBackpressureLimit(kind) {
+  return kind === "audio" ? AUDIO_BACKPRESSURE_BYTES : IMAGE_BACKPRESSURE_BYTES;
+}
+
+function countSentMedia(kind) {
+  if (kind === "audio") audioCount += 1;
+  else imageCount += 1;
+}
+
+function bufferMediaPacket(kind, timestampMs, packet) {
+  pendingMediaPackets.push({ kind, timestampMs, packet });
+  pendingMediaBytes += packet.byteLength;
+  const newestTimestampMs = timestampMs;
+  while (
+    pendingMediaPackets.length
+    && (
+      pendingMediaBytes > OFFLINE_MEDIA_BUFFER_BYTES
+      || newestTimestampMs - pendingMediaPackets[0].timestampMs > OFFLINE_MEDIA_BUFFER_MS
+    )
+  ) {
+    const dropped = pendingMediaPackets.shift();
+    pendingMediaBytes = Math.max(0, pendingMediaBytes - dropped.packet.byteLength);
+    offlineMediaDrops += 1;
+    if (dropped.kind === "image") droppedImages += 1;
+  }
+}
+
+async function recoverSocketForStop() {
+  if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  const currentReconnectDeadline = performance.now() + 12000;
+  while (reconnecting && performance.now() < currentReconnectDeadline) {
+    await wait(100);
+  }
+  if (socket?.readyState === WebSocket.OPEN) return true;
+  if (!activeStudyContext || !activeAdmissionToken) return false;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    reconnectCount += 1;
+    try {
+      negotiated = await openCaptureSocket(
+        activeStudyContext,
+        activeAdmissionToken,
+        reconnectCount,
+      );
+      return true;
+    } catch (error) {
+      console.error("[liveSocket] reconnect before stop failed:", error);
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+      socket = null;
+      if (attempt < 2) await wait(1000);
+    }
+  }
+  return false;
+}
+
+function scheduleMediaFlush() {
+  if (mediaFlushTimer !== null || !pendingMediaPackets.length) return;
+  mediaFlushTimer = window.setTimeout(() => {
+    mediaFlushTimer = null;
+    flushBufferedMedia();
+  }, 100);
+}
+
+function flushBufferedMedia() {
+  const activeSocket = socket;
+  if (!captureActive || !activeSocket || activeSocket.readyState !== WebSocket.OPEN) return;
+  while (pendingMediaPackets.length) {
+    const next = pendingMediaPackets[0];
+    if (activeSocket.bufferedAmount > mediaBackpressureLimit(next.kind)) break;
+    pendingMediaPackets.shift();
+    pendingMediaBytes = Math.max(0, pendingMediaBytes - next.packet.byteLength);
+    activeSocket.send(next.packet);
+    countSentMedia(next.kind);
+    replayedMediaPackets += 1;
+  }
+  updateCounters();
+  if (pendingMediaPackets.length) scheduleMediaFlush();
+}
+
+function sendOrBufferMedia(kind, timestampMs, packet) {
+  if (!captureActive) return;
+  const activeSocket = socket;
+  if (
+    pendingMediaPackets.length
+    || !activeSocket
+    || activeSocket.readyState !== WebSocket.OPEN
+    || activeSocket.bufferedAmount > mediaBackpressureLimit(kind)
+  ) {
+    if (
+      activeSocket
+      && activeSocket.readyState === WebSocket.OPEN
+      && activeSocket.bufferedAmount > mediaBackpressureLimit(kind)
+      && kind === "audio"
+    ) {
+      audioBackpressureStops += 1;
+    }
+    bufferMediaPacket(kind, timestampMs, packet);
+    if (activeSocket?.readyState === WebSocket.OPEN) scheduleMediaFlush();
+    return;
+  }
+  activeSocket.send(packet);
+  countSentMedia(kind);
+  updateCounters();
+}
+
+async function drainBufferedMedia(timeoutMs = 5000) {
+  const deadline = performance.now() + timeoutMs;
+  while (
+    pendingMediaPackets.length
+    && socket?.readyState === WebSocket.OPEN
+    && performance.now() < deadline
+  ) {
+    flushBufferedMedia();
+    if (pendingMediaPackets.length) await wait(50);
+  }
+}
+
 function waitForFirstAudioChunk(timeoutMs = 4000) {
   if (audioCount > 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -1357,24 +1521,17 @@ async function prepareMedia() {
     lastAudioChunkAt = performance.now();
     const timestampMs = nextAudioTimestampMs;
     nextAudioTimestampMs += negotiated.media_format.audio_chunk_ms;
-    if (!captureActive || !socket || socket.readyState !== WebSocket.OPEN) return;
-    if (socket.bufferedAmount > AUDIO_BACKPRESSURE_BYTES) {
-      audioBackpressureStops += 1;
-      setStatus("网络暂时拥堵，系统已跳过少量声音数据，活动继续。", "warning");
-      return;
-    }
-    socket.send(encodePacket(AUDIO_PACKET, timestampMs, event.data));
-    audioCount += 1;
-    updateCounters();
+    if (!captureActive) return;
+    sendOrBufferMedia(
+      "audio",
+      timestampMs,
+      encodePacket(AUDIO_PACKET, timestampMs, event.data),
+    );
   };
 }
 
 async function captureImage() {
-  if (!captureActive || imageCaptureBusy || !socket || socket.readyState !== WebSocket.OPEN) return false;
-  if (socket.bufferedAmount > IMAGE_BACKPRESSURE_BYTES) {
-    droppedImages += 1;
-    return false;
-  }
+  if (!captureActive || imageCaptureBusy) return false;
   const sourceWidth = elements.video.videoWidth;
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return false;
@@ -1401,10 +1558,12 @@ async function captureImage() {
       droppedImages += 1;
       return false;
     }
-    socket.send(encodePacket(IMAGE_PACKET, timestampMs, await blob.arrayBuffer()));
-    imageCount += 1;
+    sendOrBufferMedia(
+      "image",
+      timestampMs,
+      encodePacket(IMAGE_PACKET, timestampMs, await blob.arrayBuffer()),
+    );
     lastImageFrameAt = performance.now();
-    updateCounters();
     return true;
   } finally {
     imageCaptureBusy = false;
@@ -1421,6 +1580,7 @@ function resetSessionRecordingState() {
   recordingChunkCount = 0;
   recordingBytesUploaded = 0;
   recordingUploadFailures = 0;
+  failedRecordingChunks = new Map();
 }
 
 function chooseRecordingMimeType() {
@@ -1488,18 +1648,15 @@ function queueRecordingChunk(blob, startMs, endMs) {
   recordingSequence += 1;
   const sessionId = elements.session.textContent;
   const token = activeAdmissionToken || sessionAccessToken;
+  const pendingChunk = { sequence, startMs, endMs, blob, sessionId, token };
   recordingPendingUploads += 1;
   recordingUploadChain = recordingUploadChain
-    .then(() => uploadRecordingChunk({
-      sequence,
-      startMs,
-      endMs,
-      blob,
-      sessionId,
-      token,
-    }))
+    .then(() => uploadRecordingChunk(pendingChunk))
     .catch((error) => {
-      recordingUploadFailures += 1;
+      if (!failedRecordingChunks.has(sequence)) {
+        failedRecordingChunks.set(sequence, pendingChunk);
+        recordingUploadFailures += 1;
+      }
       console.error("[sessionRecording] chunk upload failed:", error);
       if (captureActive && !stopping) {
         setStatus("实验记录的一个片段暂时未保存，实时分析仍在继续。", "warning");
@@ -1508,6 +1665,21 @@ function queueRecordingChunk(blob, startMs, endMs) {
     .finally(() => {
       recordingPendingUploads = Math.max(0, recordingPendingUploads - 1);
     });
+}
+
+async function retryFailedRecordingChunks() {
+  const failed = Array.from(failedRecordingChunks.values())
+    .sort((left, right) => left.sequence - right.sequence);
+  for (const pendingChunk of failed) {
+    try {
+      await uploadRecordingChunk(pendingChunk);
+      if (failedRecordingChunks.delete(pendingChunk.sequence)) {
+        recordingUploadFailures = Math.max(0, recordingUploadFailures - 1);
+      }
+    } catch (error) {
+      console.error("[sessionRecording] final chunk retry failed:", error);
+    }
+  }
 }
 
 function startSessionRecording() {
@@ -1571,7 +1743,7 @@ async function stopSessionRecording() {
   sessionMediaRecorder = null;
   try {
     await Promise.race([
-      recordingUploadChain,
+      recordingUploadChain.then(() => retryFailedRecordingChunks()),
       wait(RECORDING_STOP_WAIT_MS).then(() => {
         throw new Error("等待录像片段保存超时");
       }),
@@ -1584,6 +1756,9 @@ async function stopSessionRecording() {
 
 function haltCaptureLoops() {
   captureActive = false;
+  stopSocketHeartbeat();
+  if (mediaFlushTimer !== null) window.clearTimeout(mediaFlushTimer);
+  mediaFlushTimer = null;
   if (imageTimer !== null) window.clearInterval(imageTimer);
   if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
   if (captureHealthTimer !== null) window.clearInterval(captureHealthTimer);
@@ -1659,6 +1834,7 @@ async function startCapture() {
   elements.homeNav.setAttribute("aria-current", "page");
   elements.stageTarget.hidden = true;
   try {
+    resetMediaPacketBuffer();
     reconnectCount = 0;
     activeStudyContext = studyContext;
     activeAdmissionToken = admissionToken;
@@ -1835,7 +2011,11 @@ function resetPreparation() {
 async function stopCapture(normal = true, reason = null) {
   if (stopping) return;
   stopping = true;
-  const hasLiveSocket = Boolean(socket && socket.readyState === WebSocket.OPEN);
+  let hasLiveSocket = Boolean(socket && socket.readyState === WebSocket.OPEN);
+  if (normal && !hasLiveSocket) {
+    setStatus("正在恢复连接并安全结束…", "working");
+    hasLiveSocket = await recoverSocketForStop();
+  }
   const localDurationMs = Math.max(0, Math.round(performance.now() - startedAt));
   let finalSummary = {
     valid: hasLiveSocket && normal,
@@ -1843,6 +2023,7 @@ async function stopCapture(normal = true, reason = null) {
     duration_ms: localDurationMs,
     run_id: elements.session.textContent,
   };
+  if (hasLiveSocket) await drainBufferedMedia();
   haltCaptureLoops();
   elements.stop.disabled = true;
   elements.pauseInterventions.disabled = true;
@@ -1866,6 +2047,9 @@ async function stopCapture(normal = true, reason = null) {
           recording_chunk_count: recordingChunkCount,
           recording_bytes_uploaded: recordingBytesUploaded,
           recording_upload_failures: recordingUploadFailures,
+          reconnect_count: reconnectCount,
+          offline_media_drops: offlineMediaDrops,
+          replayed_media_packets: replayedMediaPackets,
         },
       }));
       finalSummary = await waitForMessage(socket, ["summary", "error"], 180000);

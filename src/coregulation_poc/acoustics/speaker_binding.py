@@ -46,6 +46,8 @@ class SpeakerSegment:
     provider_score: float | None = None
     parent_provider_score: float | None = None
     child_provider_score: float | None = None
+    parent_provider_decision: int | None = None
+    child_provider_decision: int | None = None
     confidence: str | None = None
     forced_assignment: bool = False
 
@@ -76,6 +78,7 @@ class SpeakerBinding:
     provider_request_count: int = 0
     provider_failure_count: int = 0
     low_confidence_segment_count: int = 0
+    continuity_assisted_segment_count: int = 0
 
     def to_prompt_description(self) -> str:
         """Render a compact natural-language description for the model prompt."""
@@ -100,10 +103,14 @@ class SpeakerBinding:
                     "  Low-confidence forced assignments: "
                     f"{self.low_confidence_segment_count}."
                 ),
+                (
+                    "  Assignments stabilised from an overlapping prior window: "
+                    f"{self.continuity_assisted_segment_count}."
+                ),
                 f"  Provider request failures: {self.provider_failure_count}.",
                 (
                     "Voiced segments (start_ms-end_ms, speaker, parent score, "
-                    "child score, confidence):"
+                    "child score, provider decisions, confidence):"
                 ),
             ]
             for seg in self.segments:
@@ -118,11 +125,15 @@ class SpeakerBinding:
                     else f"{seg.child_provider_score:.1f}"
                 )
                 confidence = seg.confidence or "unavailable"
+                decisions = (
+                    f"decisions {seg.parent_provider_decision}/"
+                    f"{seg.child_provider_decision}"
+                )
                 suffix = ", forced assignment" if seg.forced_assignment else ""
                 lines.append(
                     f"  {seg.start_ms}-{seg.end_ms} ms: {seg.speaker.value} "
                     f"(parent {parent_score}, child {child_score}, "
-                    f"{confidence}{suffix})"
+                    f"{decisions}, {confidence}{suffix})"
                 )
         elif is_embedding:
             parent_cos_str = (

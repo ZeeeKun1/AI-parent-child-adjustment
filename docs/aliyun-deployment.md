@@ -73,7 +73,7 @@ coregulation-poc web-live \
 在 HTTPS 站点的 `server` 中加入：
 
 ```nginx
-client_max_body_size 2m;
+client_max_body_size 20m;
 
 location / {
     proxy_pass http://127.0.0.1:8766;

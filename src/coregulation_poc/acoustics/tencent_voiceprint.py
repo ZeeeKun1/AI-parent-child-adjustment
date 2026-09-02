@@ -15,7 +15,7 @@ import secrets
 import string
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from tencentcloud.asr.v20190614 import asr_client, models
@@ -219,6 +219,7 @@ class TencentVoiceprintService:
         *,
         sample_rate: int = 16_000,
         min_segment_ms: int = 800,
+        previous_binding: SpeakerBinding | None = None,
     ) -> SpeakerBinding:
         """Assign every voiced segment by comparing both enrolled family roles."""
 
@@ -240,9 +241,6 @@ class TencentVoiceprintService:
             )
 
         segments: list[SpeakerSegment] = []
-        parent_count = 0
-        child_count = 0
-        low_confidence_count = 0
         request_count = 0
         provider_failure_count = 0
 
@@ -298,11 +296,20 @@ class TencentVoiceprintService:
             parent_result = role_results.get("parent")
             child_result = role_results.get("child")
             complete_comparison = parent_result is not None and child_result is not None
+            accepted_roles: list[str] = []
 
             if complete_comparison:
                 parent_score = parent_result[0]
                 child_score = child_result[0]
-                label = "parent" if parent_score >= child_score else "child"
+                accepted_roles = [
+                    role
+                    for role, (_role_score, decision) in role_results.items()
+                    if decision == 1
+                ]
+                if len(accepted_roles) == 1:
+                    label = accepted_roles[0]
+                else:
+                    label = "parent" if parent_score >= child_score else "child"
                 score = parent_score if label == "parent" else child_score
                 speaker = (
                     SpeakerLabel.PARENT if label == "parent" else SpeakerLabel.CHILD
@@ -336,20 +343,20 @@ class TencentVoiceprintService:
                 and child_score is not None
                 and abs(parent_score - child_score) < self.minimum_score_margin
             )
-            forced_assignment = (
-                is_short
-                or not complete_comparison
-                or score is None
-                or score < self.minimum_score
-                or ambiguous_scores
-            )
-            if forced_assignment:
-                low_confidence_count += 1
-            confidence = "low" if forced_assignment else "high"
-            if speaker is SpeakerLabel.PARENT:
-                parent_count += 1
+            uniquely_accepted = complete_comparison and len(accepted_roles) == 1
+            meaningful_relative_margin = complete_comparison and not ambiguous_scores
+            if is_short or score is None or not complete_comparison:
+                confidence = "low"
+            elif score >= self.minimum_score and meaningful_relative_margin:
+                confidence = "high"
+            elif uniquely_accepted or meaningful_relative_margin:
+                # In a closed parent/child set, a decisive provider result or a
+                # meaningful pairwise margin still carries identity evidence
+                # even when recording conditions depress the absolute score.
+                confidence = "medium"
             else:
-                child_count += 1
+                confidence = "low"
+            forced_assignment = confidence == "low"
 
             segments.append(
                 SpeakerSegment(
@@ -370,12 +377,74 @@ class TencentVoiceprintService:
                     child_provider_score=(
                         None if child_score is None else round(child_score, 1)
                     ),
+                    parent_provider_decision=(
+                        None if parent_result is None else parent_result[1]
+                    ),
+                    child_provider_decision=(
+                        None if child_result is None else child_result[1]
+                    ),
                     confidence=confidence,
                     forced_assignment=forced_assignment,
                 )
             )
 
         segments.sort(key=lambda item: (item.start_ms, item.end_ms))
+
+        continuity_assisted_count = 0
+        if previous_binding is not None and previous_binding.bound:
+            stable_previous = [
+                item
+                for item in previous_binding.segments
+                if item.confidence in {"high", "medium"}
+                and item.speaker is not SpeakerLabel.UNKNOWN
+            ]
+            stabilised: list[SpeakerSegment] = []
+            for segment in segments:
+                if segment.confidence != "low":
+                    stabilised.append(segment)
+                    continue
+                duration_ms = max(1, segment.end_ms - segment.start_ms)
+                best_overlap = 0.0
+                best_previous: SpeakerSegment | None = None
+                for previous in stable_previous:
+                    overlap_ms = max(
+                        0,
+                        min(segment.end_ms, previous.end_ms)
+                        - max(segment.start_ms, previous.start_ms),
+                    )
+                    overlap_ratio = overlap_ms / duration_ms
+                    if overlap_ratio > best_overlap:
+                        best_overlap = overlap_ratio
+                        best_previous = previous
+                if best_previous is None or best_overlap < 0.6:
+                    stabilised.append(segment)
+                    continue
+                provider_score = (
+                    segment.parent_provider_score
+                    if best_previous.speaker is SpeakerLabel.PARENT
+                    else segment.child_provider_score
+                )
+                stabilised.append(
+                    replace(
+                        segment,
+                        speaker=best_previous.speaker,
+                        provider_score=provider_score,
+                        confidence="medium",
+                        forced_assignment=True,
+                    )
+                )
+                continuity_assisted_count += 1
+            segments = stabilised
+
+        parent_count = sum(
+            segment.speaker is SpeakerLabel.PARENT for segment in segments
+        )
+        child_count = sum(
+            segment.speaker is SpeakerLabel.CHILD for segment in segments
+        )
+        low_confidence_count = sum(
+            segment.confidence == "low" for segment in segments
+        )
 
         return SpeakerBinding(
             bound=bool(segments),
@@ -386,6 +455,7 @@ class TencentVoiceprintService:
             provider_request_count=request_count,
             provider_failure_count=provider_failure_count,
             low_confidence_segment_count=low_confidence_count,
+            continuity_assisted_segment_count=continuity_assisted_count,
         )
 
     def delete_enrollment(self, enrollment: TencentSpeakerEnrollment) -> None:

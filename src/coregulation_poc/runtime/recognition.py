@@ -184,11 +184,14 @@ class QwenWindowRecognizer:
             # perception requests to overlap. Provider-level retries and
             # low-confidence fallback are handled inside identify_speakers.
             async with self._voiceprint_lock:
+                previous_binding = self.last_speaker_binding
                 binding = await asyncio.to_thread(
                     self.voiceprint_service.identify_speakers,
                     audio_chunks,
                     self.enrollment,
+                    previous_binding=previous_binding,
                 )
+                self.last_speaker_binding = binding
             self.voiceprint_api_call_count += binding.provider_request_count
             self.api_call_count += binding.provider_request_count
         else:
@@ -198,7 +201,7 @@ class QwenWindowRecognizer:
                 enrollment=self.enrollment,
                 allow_f0_fallback=False,
             )
-        self.last_speaker_binding = binding
+            self.last_speaker_binding = binding
         speaker_binding_description = binding.to_prompt_description() if binding.bound else None
 
         # --- Stage 1: Perception (multimodal model via WebSocket) ------------

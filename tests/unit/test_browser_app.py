@@ -312,6 +312,117 @@ def test_browser_can_reconnect_same_session_after_transient_disconnect(
     assert '"type": "browser_reconnected"' in events
 
 
+def test_reconnect_preserves_one_runtime_and_its_metrics(tmp_path: Path) -> None:
+    sessions: list[object] = []
+
+    class FakeSession:
+        def __init__(
+            self,
+            send_event: Callable[[dict[str, Any]], Awaitable[None]],
+        ) -> None:
+            self.send_event = send_event
+            self.start_count = 0
+            self.chunks: list[MediaChunk] = []
+            self.stopped_with: list[str] = []
+
+        @property
+        def api_call_count(self) -> int:
+            return 7
+
+        @property
+        def runtime_metrics(self) -> dict[str, Any]:
+            return {"api_call_count": self.api_call_count, "assessment_count": 3}
+
+        async def start(self) -> None:
+            self.start_count += 1
+            await self.send_event({"type": "loop_started"})
+
+        async def accept_chunk(self, chunk: MediaChunk) -> None:
+            self.chunks.append(chunk)
+
+        async def handle_control(self, control: dict[str, object]) -> bool:
+            del control
+            return False
+
+        async def stop(self, status: str) -> None:
+            self.stopped_with.append(status)
+
+    def factory(
+        session_id: str,
+        send_event: Callable[[dict[str, Any]], Awaitable[None]],
+        enrollment: SpeakerEnrollment | None = None,
+    ) -> FakeSession:
+        del session_id, enrollment
+        session = FakeSession(send_event)
+        sessions.append(session)
+        return session
+
+    config = BrowserServerConfig(output_dir=tmp_path / "output")
+    app = create_browser_capture_app(config, session_factory=factory)
+    app.state.session_enrollments["runtime_reconnect_test"] = SpeakerEnrollment(
+        family_id="runtime_reconnect_test",
+        speakers={
+            label: EnrolledSpeaker(
+                label=label,
+                audio_source="test_fixture",
+                duration_ms=3000,
+                embedding=tuple([0.0] * 256),
+            )
+            for label in ("parent", "child")
+        },
+    )
+    media_format = MediaFormat()
+    jpeg = encode_timestamped_jpeg(
+        np.full((120, 160, 3), 80, dtype=np.uint8),
+        timestamp_ms=200,
+        max_bytes=config.max_image_bytes,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/live") as first:
+            first.send_json(_hello("runtime_reconnect_test"))
+            assert first.receive_json()["runtime_session_resumed"] is False
+            first.send_json({"type": "start"})
+            assert first.receive_json()["type"] == "started"
+            assert first.receive_json()["type"] == "loop_started"
+            first.send_bytes(
+                encode_binary_packet(
+                    MediaChunk(
+                        MediaKind.AUDIO,
+                        100,
+                        b"\x00" * media_format.audio_chunk_bytes,
+                    )
+                )
+            )
+
+        with client.websocket_connect("/ws/live") as second:
+            second.send_json(_hello("runtime_reconnect_test"))
+            assert second.receive_json()["runtime_session_resumed"] is True
+            second.send_json({"type": "start"})
+            assert second.receive_json()["type"] == "started"
+            second.send_bytes(
+                encode_binary_packet(MediaChunk(MediaKind.IMAGE, 200, jpeg))
+            )
+            second.send_json({"type": "stop"})
+            summary = second.receive_json()
+
+    assert len(sessions) == 1
+    session = sessions[0]
+    assert isinstance(session, FakeSession)
+    assert session.start_count == 1
+    assert [chunk.kind for chunk in session.chunks] == [MediaKind.AUDIO, MediaKind.IMAGE]
+    assert session.stopped_with == ["completed"]
+    assert summary["api_call_count"] == 7
+    run_dir = next((tmp_path / "output" / "runs").iterdir())
+    result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["status"] == "completed"
+    assert result["api_call_count"] == 7
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert events.count('"type": "loop_started"') == 1
+    assert '"type": "browser_reconnected"' in events
+    assert '"runtime_preserved_for_reconnect": true' in events
+
+
 def test_invalid_control_is_skipped_without_ending_capture(tmp_path: Path) -> None:
     app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
 

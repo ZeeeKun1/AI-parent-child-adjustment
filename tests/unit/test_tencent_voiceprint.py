@@ -6,6 +6,11 @@ from unittest.mock import patch
 
 import numpy as np
 
+from coregulation_poc.acoustics.speaker_binding import (
+    SpeakerBinding,
+    SpeakerLabel,
+    SpeakerSegment,
+)
 from coregulation_poc.acoustics.tencent_voiceprint import (
     TencentEnrolledSpeaker,
     TencentSpeakerEnrollment,
@@ -123,7 +128,7 @@ def test_re_recording_a_role_updates_instead_of_creating_an_orphan() -> None:
 
 @patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
 @patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
-def test_pairwise_verification_assigns_higher_role_and_marks_low_score(
+def test_pairwise_verification_uses_relative_margin_when_absolute_score_is_low(
     prepare_segments: object,
     extract_f0: object,
 ) -> None:
@@ -152,8 +157,9 @@ def test_pairwise_verification_assigns_higher_role_and_marks_low_score(
         "child",
     ]
     assert binding.segments[0].forced_assignment is False
-    assert binding.segments[1].forced_assignment is True
-    assert binding.low_confidence_segment_count == 1
+    assert binding.segments[1].forced_assignment is False
+    assert binding.segments[1].confidence == "medium"
+    assert binding.low_confidence_segment_count == 0
     assert binding.provider_request_count == 4
     assert binding.provider_failure_count == 0
     assert [request.VoicePrintId for request in client.verify_requests] == [
@@ -350,3 +356,48 @@ def test_both_roles_unavailable_fall_back_to_f0_without_losing_the_window(
     assert binding.provider_request_count == 4
     assert binding.provider_failure_count == 4
     assert sleep.call_count == 2
+
+
+@patch("coregulation_poc.acoustics.tencent_voiceprint._extract_segment_f0")
+@patch("coregulation_poc.acoustics.tencent_voiceprint._prepare_audio_segments")
+def test_ambiguous_overlap_uses_stable_role_from_previous_window(
+    prepare_segments: object,
+    extract_f0: object,
+) -> None:
+    client = FakeTencentClient()
+    service = _service(client)
+    prepare_segments.return_value = (
+        np.zeros(16_000, dtype=np.float64),
+        16_000,
+        [(1_000, 2_000, 0, 16_000)],
+    )
+    extract_f0.return_value = (np.array([190.0]), 1)
+    client.verify_responses = [_verify_response(60.0), _verify_response(58.0)]
+    previous = SpeakerBinding(
+        bound=True,
+        segments=[
+            SpeakerSegment(
+                start_ms=900,
+                end_ms=2_100,
+                mean_f0_hz=195.0,
+                median_f0_hz=195.0,
+                voiced_frame_count=10,
+                speaker=SpeakerLabel.CHILD,
+                confidence="medium",
+            )
+        ],
+        child_segment_count=1,
+    )
+
+    binding = service.identify_speakers(
+        (),
+        _complete_enrollment(),
+        previous_binding=previous,
+    )
+
+    segment = binding.segments[0]
+    assert segment.speaker is SpeakerLabel.CHILD
+    assert segment.confidence == "medium"
+    assert segment.forced_assignment is True
+    assert binding.continuity_assisted_segment_count == 1
+    assert binding.low_confidence_segment_count == 0

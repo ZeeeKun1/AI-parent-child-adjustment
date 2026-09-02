@@ -156,3 +156,44 @@ def test_browser_recorder_saves_and_finalizes_consented_session_recording(
     assert recording_manifest["complete"] is True
     assert recording_manifest["chunk_count"] == 2
     assert recording_manifest["missing_sequences"] == []
+
+
+def test_browser_recorder_accepts_late_retry_and_assembles_in_order(
+    tmp_path: Path,
+) -> None:
+    recorder = BrowserCaptureRecorder(
+        output_dir=tmp_path / "output",
+        session_id="out_of_order_recording",
+        media_format=MediaFormat(),
+        max_image_bytes=750_000,
+        recording_enabled=True,
+    )
+    recorder.start()
+
+    recorder.accept_recording_chunk(
+        sequence=1,
+        start_ms=10_000,
+        end_ms=20_000,
+        content_type="video/webm",
+        payload=b"second",
+    )
+    recorder.accept_recording_chunk(
+        sequence=0,
+        start_ms=0,
+        end_ms=10_000,
+        content_type="video/webm",
+        payload=b"first",
+    )
+    summary = recorder.finish(
+        status="completed",
+        client_metrics={"recording_upload_failures": 0},
+    )
+
+    media_path = summary.run_dir / "media" / "session_recording.webm"
+    recording_manifest = json.loads(
+        (summary.run_dir / "recording_manifest.json").read_text(encoding="utf-8")
+    )
+    assert media_path.read_bytes() == b"firstsecond"
+    assert recording_manifest["complete"] is True
+    assert recording_manifest["missing_sequences"] == []
+    assert not (summary.run_dir / "media" / ".session_recording.webm.chunks").exists()

@@ -90,11 +90,20 @@ class ResearchSessionRegistry:
         runtime: RealtimeBrowserSession | None,
     ) -> None:
         async with self._lock:
-            self._sessions[session_id] = MonitoredSession(
-                session_id=session_id,
-                runtime=runtime,
-                closed_loop_was_enabled=runtime is not None,
-            )
+            existing = self._sessions.get(session_id)
+            if existing is None or existing.status in {"completed", "failed"}:
+                self._sessions[session_id] = MonitoredSession(
+                    session_id=session_id,
+                    runtime=runtime,
+                    closed_loop_was_enabled=runtime is not None,
+                )
+            else:
+                existing.runtime = runtime
+                existing.closed_loop_was_enabled = (
+                    existing.closed_loop_was_enabled or runtime is not None
+                )
+                existing.status = "connected"
+                existing.updated_at = _utc_now()
         await self.broadcast_snapshot()
 
     async def mark_status(self, session_id: str, status: str) -> None:
@@ -142,6 +151,9 @@ class ResearchSessionRegistry:
                     "segment_count": safe.get("segment_count", 0),
                     "low_confidence_count": safe.get(
                         "low_confidence_segment_count", 0
+                    ),
+                    "continuity_assisted_count": safe.get(
+                        "continuity_assisted_segment_count", 0
                     ),
                 }
             elif event_type == "expert_takeover_started":
