@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:">
     <title>家庭作业亲子调节助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=18">
+    <link rel="stylesheet" href="/static/styles.css?v=20">
   </head>
   <body data-phase="setup">
     <header class="nav-bar">
@@ -88,6 +88,20 @@
         <div class="wizard-body">
           <!-- Step 1: Basic info + Task info -->
           <div class="wizard-panel active" data-step="1" role="tabpanel">
+            <section class="condition-selector" aria-labelledby="condition-title">
+              <div>
+                <h3 id="condition-title" class="wizard-col-title">选择本轮实验</h3>
+                <p class="wizard-col-hint">请按研究人员告知的顺序选择。</p>
+              </div>
+              <div class="condition-options" role="radiogroup" aria-label="本轮实验">
+                <button class="condition-option" type="button" data-condition="coregulation" role="radio" aria-checked="false">
+                  <span>实验一</span><small>未选择</small>
+                </button>
+                <button class="condition-option" type="button" data-condition="baseline" role="radio" aria-checked="false">
+                  <span>实验二</span><small>未选择</small>
+                </button>
+              </div>
+            </section>
             <div class="wizard-grid">
               <div class="wizard-col">
                 <h3 class="wizard-col-title">基本信息</h3>
@@ -318,6 +332,21 @@
       </div>
     </section>
 
+    <section id="condition-transition" class="condition-transition-overlay" aria-labelledby="transition-title" hidden>
+      <div class="condition-transition-card">
+        <img src="/static/img/companion-positive.png" alt="" class="condition-transition-mascot">
+        <p class="eyebrow">本轮已经完成</p>
+        <h2 id="transition-title"><span id="transition-completed-condition">实验一</span>的记录已保存</h2>
+        <p class="condition-transition-copy">请先完成研究人员提供的本轮问卷。填写完成后，再进入下一轮准备。</p>
+        <div class="condition-transition-next" aria-live="polite">
+          <span>接下来</span>
+          <strong id="transition-next-condition">实验二</strong>
+        </div>
+        <button id="continue-condition-button" class="start-btn" type="button">问卷填写完成，进入下一轮准备</button>
+        <p class="condition-transition-note">家庭信息和声音记录会继续沿用，不需要重新填写。</p>
+      </div>
+    </section>
+
     <details class="technical-details">
       <summary>技术状态</summary>
       <div class="metrics">
@@ -329,6 +358,6 @@
       <div class="camera-empty" id="camera-empty" hidden>摄像头预览</div>
     </details>
 
-    <script src="/static/app.js?v=15" defer></script>
+    <script src="/static/app.js?v=17" defer></script>
   </body>
 </html>

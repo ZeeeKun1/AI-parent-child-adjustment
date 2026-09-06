@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -112,7 +113,17 @@ class BrowserCaptureRecorder:
         self.study_context = dict(study_context or {})
         self.created_at_local = datetime.now(STUDY_TIMEZONE)
         run_name = self._study_run_name() if self.study_context else None
-        self.store = RunArtifactStore(output_dir, session_id, run_name=run_name)
+        group_name = (
+            str(self.study_context.get("participant_id", ""))
+            if self.study_context.get("paired_study") is True
+            else None
+        )
+        self.store = RunArtifactStore(
+            output_dir,
+            session_id,
+            run_name=run_name,
+            group_name=group_name,
+        )
         self.media_format = media_format
         self.max_image_bytes = max_image_bytes
         if max_recording_chunk_bytes < 100_000:
@@ -142,8 +153,14 @@ class BrowserCaptureRecorder:
         self._recording_chunk_dir: Path | None = None
         self._recording_finalized = False
         self._write_manifest(client_capabilities or {})
+        self._update_study_manifest(status="active")
 
     def _study_run_name(self) -> str:
+        if self.study_context.get("paired_study") is True:
+            condition = self.study_context.get("experiment_condition")
+            if condition == "baseline":
+                return "experiment_2_baseline"
+            return "experiment_1_coregulation"
         return "_".join(
             (
                 self.study_context["participant_id"],
@@ -152,6 +169,62 @@ class BrowserCaptureRecorder:
                 self.study_context["session_round"],
             )
         )
+
+    def _update_study_manifest(
+        self,
+        *,
+        status: str,
+        valid: bool | None = None,
+    ) -> None:
+        if self.study_context.get("paired_study") is not True:
+            return
+        manifest_path = (self.run_dir.parent / "study_manifest.json").resolve()
+        existing: dict[str, Any] = {}
+        if manifest_path.is_file():
+            try:
+                candidate = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(candidate, dict):
+                    existing = candidate
+            except (OSError, ValueError):
+                existing = {}
+        runs = existing.get("runs")
+        if not isinstance(runs, list):
+            runs = []
+        run_record = {
+            "run_id": self.run_dir.name,
+            "experiment_condition": self.study_context.get("experiment_condition"),
+            "experiment_label": self.study_context.get("experiment_label"),
+            "experience_order": self.study_context.get("experience_order"),
+            "status": status,
+            "valid": valid,
+            "started_at_local": self.created_at_local.isoformat(),
+        }
+        replaced = False
+        for index, item in enumerate(runs):
+            if isinstance(item, dict) and item.get("run_id") == self.run_dir.name:
+                runs[index] = {**item, **run_record}
+                replaced = True
+                break
+        if not replaced:
+            runs.append(run_record)
+        shared_context = {
+            "basic_info": self.study_context.get("basic_info", {}),
+            "family_roles": self.study_context.get("family_roles", {}),
+        }
+        document = {
+            "study_type": "paired_within_family_comparison",
+            "participant_id": self.study_context.get("participant_id"),
+            "study_timezone": STUDY_TIMEZONE_NAME,
+            "shared_context": shared_context,
+            "runs": runs,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        temporary = manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(manifest_path)
 
     @property
     def run_dir(self) -> Path:
@@ -486,6 +559,8 @@ class BrowserCaptureRecorder:
             if key
             in {
                 "assessment_count",
+                "baseline_decision_count",
+                "baseline_intervention_count",
                 "api_call_count",
                 "voiceprint_api_call_count",
                 "delivery_report_count",
@@ -548,6 +623,7 @@ class BrowserCaptureRecorder:
                 "payload_saved": False,
             }
         )
+        self._update_study_manifest(status=status, valid=valid)
         return self.summary(status=status)
 
     def summary(self, *, status: str) -> BrowserCaptureSummary:

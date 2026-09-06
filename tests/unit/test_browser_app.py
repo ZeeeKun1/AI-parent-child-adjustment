@@ -63,6 +63,24 @@ def _hello(
     }
 
 
+def _paired_hello(session_id: str, condition: str, order: int) -> dict[str, object]:
+    message = _hello(
+        session_id,
+        experiment_label="实验一" if condition == "coregulation" else "实验二",
+        session_round="E1" if condition == "coregulation" else "E2",
+    )
+    study_context = message["study_context"]
+    assert isinstance(study_context, dict)
+    study_context.update(
+        {
+            "experiment_condition": condition,
+            "experience_order": order,
+            "paired_study": True,
+        }
+    )
+    return message
+
+
 def test_browser_page_and_health_are_served(tmp_path: Path) -> None:
     app = create_browser_capture_app(BrowserServerConfig(output_dir=tmp_path / "output"))
     client = TestClient(app)
@@ -86,6 +104,8 @@ def test_browser_page_and_health_are_served(tmp_path: Path) -> None:
     assert 'id="device-check-button"' in page.text
     assert 'data-device-status="camera"' in page.text
     assert 'data-device-status="microphone"' in page.text
+    assert 'id="condition-transition"' in page.text
+    assert "问卷填写完成，进入下一轮准备" in page.text
     assert 'id="participant-id"' not in page.text
     assert 'id="session-round"' not in page.text
     assert 'id="access-code"' not in page.text
@@ -783,3 +803,100 @@ def test_preview_mode_returns_control_unavailable_without_failing_session(
     run_dir = next((tmp_path / "output" / "runs").iterdir())
     events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
     assert '"type": "control_unavailable"' in events
+
+
+def test_paired_conditions_share_family_folder_and_reuse_binding(tmp_path: Path) -> None:
+    class FakeSession:
+        api_call_count = 0
+        runtime_metrics: dict[str, object] = {"api_call_count": 0}
+
+        def __init__(self) -> None:
+            self.condition: str | None = None
+
+        def set_experiment_condition(self, condition: str) -> None:
+            self.condition = condition
+
+        def set_task_context(self, _: dict[str, object]) -> None:
+            return
+
+        async def start(self) -> None:
+            return
+
+        async def accept_chunk(self, _: MediaChunk) -> None:
+            return
+
+        async def handle_control(self, _: dict[str, object]) -> bool:
+            return False
+
+        async def stop(self, _: str) -> None:
+            return
+
+    sessions: list[FakeSession] = []
+
+    def factory(
+        _: str,
+        __: Callable[[dict[str, Any]], Awaitable[None]],
+        ___: SpeakerEnrollment | None = None,
+    ) -> FakeSession:
+        session = FakeSession()
+        sessions.append(session)
+        return session
+
+    config = BrowserServerConfig(output_dir=tmp_path / "output")
+    app = create_browser_capture_app(config, session_factory=factory)
+    session_id = "paired_family_001"
+    app.state.session_enrollments[session_id] = SpeakerEnrollment(
+        family_id=session_id,
+        speakers={
+            label: EnrolledSpeaker(
+                label=label,
+                audio_source="test_fixture",
+                duration_ms=3000,
+                embedding=tuple([0.0] * 256),
+            )
+            for label in ("parent", "child")
+        },
+    )
+    media_format = MediaFormat()
+    jpeg = encode_timestamped_jpeg(
+        np.full((120, 160, 3), 80, dtype=np.uint8),
+        timestamp_ms=101,
+        max_bytes=config.max_image_bytes,
+    )
+
+    with TestClient(app) as client:
+        for order, condition in enumerate(("coregulation", "baseline"), start=1):
+            with client.websocket_connect("/ws/live") as websocket:
+                websocket.send_json(_paired_hello(session_id, condition, order))
+                assert websocket.receive_json()["type"] == "ready"
+                websocket.send_json({"type": "start"})
+                assert websocket.receive_json()["type"] == "started"
+                websocket.send_bytes(
+                    encode_binary_packet(
+                        MediaChunk(
+                            MediaKind.AUDIO,
+                            100,
+                            b"\x00" * media_format.audio_chunk_bytes,
+                        )
+                    )
+                )
+                websocket.send_bytes(
+                    encode_binary_packet(MediaChunk(MediaKind.IMAGE, 101, jpeg))
+                )
+                websocket.send_json({"type": "stop"})
+                assert websocket.receive_json()["valid"] is True
+            if order == 1:
+                assert session_id in app.state.session_enrollments
+                assert app.state.completed_conditions[session_id] == {"coregulation"}
+
+        family_dir = tmp_path / "output" / "studies" / "P001"
+        assert (family_dir / "experiment_1_coregulation" / "events.jsonl").is_file()
+        assert (family_dir / "experiment_2_baseline" / "events.jsonl").is_file()
+        manifest = json.loads((family_dir / "study_manifest.json").read_text("utf-8"))
+        assert [item["experiment_condition"] for item in manifest["runs"]] == [
+            "coregulation",
+            "baseline",
+        ]
+        assert session_id not in app.state.session_enrollments
+
+    assert [session.condition for session in sessions] == ["coregulation", "baseline"]

@@ -57,6 +57,7 @@ REALTIME_ONLY_CONTROLS = {
 PARTICIPANT_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 SESSION_ROUND = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 EXPERIMENT_LABEL = re.compile(r"^[\w\u4e00-\u9fff-]{1,40}$")
+EXPERIMENT_CONDITIONS = {"coregulation", "baseline"}
 STATIC_DIR = (PACKAGE_DIR / "web" / "static").resolve()
 ChunkHandler = Callable[[MediaChunk], Awaitable[None]]
 AUDITED_RUNTIME_EVENTS = {
@@ -66,6 +67,8 @@ AUDITED_RUNTIME_EVENTS = {
     "late_analysis_result",
     "late_analysis_failure",
     "state_update",
+    "baseline_decision",
+    "late_baseline_decision",
     "speaker_binding",
     "voiceprint_cleanup",
     "intervention",
@@ -242,6 +245,11 @@ def _parse_hello(
     participant_id = study_context.get("participant_id")
     experiment_label = study_context.get("experiment_label")
     session_round = study_context.get("session_round")
+    experiment_condition = study_context.get(
+        "experiment_condition", "coregulation"
+    )
+    experience_order = study_context.get("experience_order", 1)
+    paired_study = study_context.get("paired_study", False)
     if not isinstance(participant_id, str) or PARTICIPANT_ID.fullmatch(participant_id) is None:
         raise BrowserProtocolError("参与者编号只能包含字母、数字、下划线或连字符")
     if (
@@ -251,6 +259,16 @@ def _parse_hello(
         raise BrowserProtocolError("实验类型只能包含文字、数字、下划线或连字符")
     if not isinstance(session_round, str) or SESSION_ROUND.fullmatch(session_round) is None:
         raise BrowserProtocolError("实验轮次只能包含字母、数字、下划线或连字符")
+    if experiment_condition not in EXPERIMENT_CONDITIONS:
+        raise BrowserProtocolError("实验条件无效")
+    if (
+        not isinstance(experience_order, int)
+        or isinstance(experience_order, bool)
+        or experience_order not in {1, 2}
+    ):
+        raise BrowserProtocolError("体验顺序无效")
+    if not isinstance(paired_study, bool):
+        raise BrowserProtocolError("配对实验标记无效")
     basic_info = study_context.get("basic_info")
     if not isinstance(basic_info, dict):
         raise BrowserProtocolError("开始实验前必须填写基本信息")
@@ -289,6 +307,9 @@ def _parse_hello(
             "participant_id": participant_id,
             "experiment_label": experiment_label,
             "session_round": session_round,
+            "experiment_condition": experiment_condition,
+            "experience_order": experience_order,
+            "paired_study": paired_study,
             "basic_info": {
                 "parent_age": parent_age,
                 "child_age": child_age,
@@ -396,6 +417,8 @@ def create_browser_capture_app(
     failed_cleanup_enrollments: list[TencentSpeakerEnrollment] = []
     session_admissions: dict[str, SessionAdmission] = {}
     app.state.session_admissions = session_admissions
+    completed_conditions: dict[str, set[str]] = {}
+    app.state.completed_conditions = completed_conditions
     active_session_ids: set[str] = set()
     app.state.active_session_ids = active_session_ids
     active_recorders: dict[str, BrowserCaptureRecorder] = {}
@@ -569,6 +592,7 @@ def create_browser_capture_app(
             session_admissions.pop(expired_session_id, None)
             enrollment = session_enrollments.pop(expired_session_id, None)
             enrollment_locks.pop(expired_session_id, None)
+            completed_conditions.pop(expired_session_id, None)
             schedule_remote_cleanup(enrollment)
 
     def session_admission_token(session_id: str) -> str | None:
@@ -689,12 +713,21 @@ def create_browser_capture_app(
             raise HTTPException(status_code=409, detail="本次会话已经开始")
         existing_admission = session_admissions.get(session_id)
         if existing_admission is not None:
+            existing_enrollment = session_enrollments.get(session_id)
             return {
                 "session_id": session_id,
                 "session_token": existing_admission.token,
                 "expires_in_seconds": max(
                     1,
                     round(existing_admission.expires_at_monotonic - time.monotonic()),
+                ),
+                "bound_speakers": (
+                    sorted(existing_enrollment.speakers)
+                    if existing_enrollment is not None
+                    else []
+                ),
+                "completed_conditions": sorted(
+                    completed_conditions.get(session_id, set())
                 ),
             }
         if (
@@ -718,6 +751,8 @@ def create_browser_capture_app(
             "session_id": session_id,
             "session_token": session_token,
             "expires_in_seconds": server_config.admission_ttl_seconds,
+            "bound_speakers": [],
+            "completed_conditions": [],
         }
 
     @app.post("/api/speaker-binding/{session_id}/{speaker_label}")
@@ -948,6 +983,7 @@ def create_browser_capture_app(
         runtime_stopped = False
         completion_status = "disconnected"
         session_id: str | None = None
+        study_context: dict[str, Any] = {}
         session_authorized = False
         send_lock = asyncio.Lock()
 
@@ -1109,6 +1145,15 @@ def create_browser_capture_app(
                     runtime_reused = True
                     if runtime_relay is None:
                         raise BrowserProtocolError("实时会话续接状态不完整，请重新开始实验")
+                if hasattr(runtime_session, "set_experiment_condition"):
+                    try:
+                        runtime_session.set_experiment_condition(
+                            study_context["experiment_condition"]
+                        )
+                    except ValueError as exc:
+                        raise BrowserProtocolError(
+                            f"实验条件设置失败: {exc}"
+                        ) from exc
                 task_context_raw = hello_message.get("study_context", {}).get("task_context")
                 if isinstance(task_context_raw, dict):
                     try:
@@ -1346,6 +1391,21 @@ def create_browser_capture_app(
                         )
                     await registry.mark_status(session_id, "reconnecting")
                 else:
+                    if (
+                        completion_status == "completed"
+                        and recorder is not None
+                        and recorder.summary(status="completed").valid
+                        and study_context.get("paired_study") is True
+                        and study_context.get("experiment_condition")
+                        in EXPERIMENT_CONDITIONS
+                    ):
+                        completed_conditions.setdefault(session_id, set()).add(
+                            str(study_context["experiment_condition"])
+                        )
+                    paired_study_incomplete = (
+                        study_context.get("paired_study") is True
+                        and len(completed_conditions.get(session_id, set())) < 2
+                    )
                     active_runtime_sessions.pop(session_id, None)
                     started_runtime_session_ids.discard(session_id)
                     relay = runtime_event_relays.pop(session_id, None)
@@ -1353,21 +1413,33 @@ def create_browser_capture_app(
                         await relay.close()
                     active_recorders.pop(session_id, None)
                     recording_locks.pop(session_id, None)
-                    enrollment = session_enrollments.pop(session_id, None)
-                    enrollment_locks.pop(session_id, None)
-                    cleanup_succeeded = await cleanup_remote_enrollment(enrollment)
-                    if recorder is not None and isinstance(
-                        enrollment, TencentSpeakerEnrollment
-                    ):
-                        cleanup_event = {
-                            "type": "voiceprint_cleanup",
-                            "provider": enrollment.model_name,
-                            "remote_records_deleted": cleanup_succeeded,
-                            "retry_queued": not cleanup_succeeded,
-                        }
-                        recorder.store.append_event(cleanup_event)
-                        await registry.observe(session_id, cleanup_event)
-                    session_admissions.pop(session_id, None)
+                    if paired_study_incomplete:
+                        admission = session_admissions.get(session_id)
+                        if admission is not None:
+                            session_admissions[session_id] = SessionAdmission(
+                                token=admission.token,
+                                expires_at_monotonic=(
+                                    time.monotonic()
+                                    + server_config.admission_ttl_seconds
+                                ),
+                            )
+                    else:
+                        enrollment = session_enrollments.pop(session_id, None)
+                        enrollment_locks.pop(session_id, None)
+                        cleanup_succeeded = await cleanup_remote_enrollment(enrollment)
+                        if recorder is not None and isinstance(
+                            enrollment, TencentSpeakerEnrollment
+                        ):
+                            cleanup_event = {
+                                "type": "voiceprint_cleanup",
+                                "provider": enrollment.model_name,
+                                "remote_records_deleted": cleanup_succeeded,
+                                "retry_queued": not cleanup_succeeded,
+                            }
+                            recorder.store.append_event(cleanup_event)
+                            await registry.observe(session_id, cleanup_event)
+                        session_admissions.pop(session_id, None)
+                        completed_conditions.pop(session_id, None)
                 await registry.mark_status(session_id, completion_status)
             if (
                 recorder is not None

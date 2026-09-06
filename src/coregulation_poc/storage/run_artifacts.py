@@ -40,6 +40,7 @@ class RunArtifactStore:
         session_id: str,
         *,
         run_name: str | None = None,
+        group_name: str | None = None,
     ) -> None:
         safe_session = SAFE_ID.sub("_", session_id).strip("_") or "session"
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -48,7 +49,12 @@ class RunArtifactStore:
             if run_name is not None
             else f"{timestamp}_{safe_session}_{uuid4().hex[:8]}"
         )
-        runs_dir = (resolve_project_path(output_dir) / "runs").resolve()
+        output_root = resolve_project_path(output_dir)
+        runs_dir = (
+            output_root / "runs"
+            if group_name is None
+            else output_root / "studies" / safe_folder_name(group_name)
+        ).resolve()
         candidate = (runs_dir / run_id).resolve()
         suffix = 2
         while candidate.exists():

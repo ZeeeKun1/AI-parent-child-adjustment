@@ -15,7 +15,8 @@ from coregulation_poc.delivery.models import (
     VisualPrompt,
     VoicePrompt,
 )
-from coregulation_poc.intervention.models import InterventionPlan
+from coregulation_poc.intervention.models import InterventionPlan, MessageSource
+from coregulation_poc.models import Actor
 
 
 class DeliveryCoordinator:
@@ -91,6 +92,80 @@ class DeliveryCoordinator:
             core_content_identical=True,
             fallback_reason=fallback_reason,
             research_basis=self.policy.source,
+        )
+        return DeliveryPreparationResult(status=status, package=package)
+
+    def prepare_direct(
+        self,
+        *,
+        session_id: str,
+        sequence: int,
+        planned_at_ms: int,
+        target_actor: Actor,
+        message: str,
+        runtime: DeliveryRuntimeContext,
+    ) -> DeliveryPreparationResult:
+        """Prepare a baseline prompt through the same visual and voice channels."""
+
+        if runtime.interventions_paused:
+            return DeliveryPreparationResult(
+                status=DeliveryPreparationStatus.HELD,
+                hold_reason=DeliveryHoldReason.INTERVENTIONS_PAUSED,
+            )
+        voice_enabled = runtime.voice_enabled and runtime.voice_available
+        status = (
+            DeliveryPreparationStatus.READY
+            if voice_enabled
+            else DeliveryPreparationStatus.DEGRADED
+        )
+        fallback_reason = None
+        if not voice_enabled:
+            fallback_reason = (
+                "voice_disabled_by_runtime"
+                if not runtime.voice_enabled
+                else "voice_output_unavailable"
+            )
+        package = DeliveryPackage(
+            delivery_id=f"{session_id}:{sequence}:baseline",
+            session_id=session_id,
+            sequence=sequence,
+            planned_at_ms=planned_at_ms,
+            prepared_at_ms=runtime.prepared_at_ms,
+            delivery_policy_version=self.policy.version,
+            strategy_id=None,
+            target_actor=target_actor,
+            repair_target=None,
+            message_source=MessageSource.BASELINE_DIRECT_MODEL,
+            visual_prompt=VisualPrompt(
+                target_actor=target_actor,
+                heading=self.policy.visual.headings_by_target[target_actor],
+                message=message,
+                prominence=self.policy.visual.prominence,
+                placement=self.policy.visual.placement,
+                blocks_primary_task=self.policy.visual.blocks_primary_task,
+                dismissible=self.policy.visual.dismissible,
+            ),
+            voice_prompt=VoicePrompt(
+                target_actor=target_actor,
+                message=message,
+                provider=self.policy.voice.provider,
+                model=self.policy.voice.model,
+                voice=self.policy.voice.voice,
+                language=self.policy.voice.language,
+                language_type=self.policy.voice.language_type,
+                response_format=self.policy.voice.response_format,
+                sample_rate_hz=self.policy.voice.sample_rate_hz,
+                mode=self.policy.voice.mode,
+                instructions=self.policy.voice.instructions,
+                optimize_instructions=self.policy.voice.optimize_instructions,
+                style=self.policy.voice.style,
+                autoplay=self.policy.voice.autoplay,
+                enabled=voice_enabled,
+            ),
+            status=status,
+            core_content_identical=True,
+            fallback_reason=fallback_reason,
+            research_basis=["generic_baseline_facilitation_prompt"],
         )
         return DeliveryPreparationResult(status=status, package=package)
 

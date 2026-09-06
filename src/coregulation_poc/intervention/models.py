@@ -34,6 +34,7 @@ class MessageSource(StrEnum):
     APPROVED_TEMPLATE = "approved_template"
     CONSTRAINED_LLM = "constrained_llm"
     APPROVED_TEMPLATE_FALLBACK = "approved_template_fallback"
+    BASELINE_DIRECT_MODEL = "baseline_direct_model"
 
 
 class StrategySelectionStatus(StrEnum):

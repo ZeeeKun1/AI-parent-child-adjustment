@@ -82,6 +82,11 @@ const elements = {
   summaryImprovements: document.querySelector("#summary-improvements"),
   summarySupports: document.querySelector("#summary-supports"),
   newSession: document.querySelector("#new-session-button"),
+  transitionPanel: document.querySelector("#condition-transition"),
+  transitionCompletedCondition: document.querySelector("#transition-completed-condition"),
+  transitionNextCondition: document.querySelector("#transition-next-condition"),
+  continueCondition: document.querySelector("#continue-condition-button"),
+  conditionOptions: Array.from(document.querySelectorAll(".condition-option")),
   wizardTabs: Array.from(document.querySelectorAll(".wizard-tab")),
   wizardPanels: Array.from(document.querySelectorAll(".wizard-panel")),
   wizardPrev: document.querySelector("#wizard-prev"),
@@ -123,6 +128,10 @@ let cameraHealthFailureCount = 0;
 let microphoneHealthFailureCount = 0;
 let sessionAccessToken = null;
 const selectedRoles = { parent: null, child: null };
+let selectedCondition = null;
+const completedConditions = new Set();
+const PAIRED_STUDY_STORAGE_KEY = "coregulation_paired_study_v1";
+let betweenConditionsPending = false;
 let latestSessionSummary = null;
 let sessionInsights = createSessionInsights();
 let currentStep = 1;
@@ -185,6 +194,118 @@ function makeSessionCode() {
     : Array.from(crypto.getRandomValues(new Uint8Array(6)), (value) =>
       value.toString(16).padStart(2, "0")).join("");
   return `web_${randomPart}`;
+}
+
+function loadPairedStudy() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PAIRED_STUDY_STORAGE_KEY) || "null");
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistPairedStudy() {
+  const payload = {
+    session_id: elements.session.textContent,
+    parent_age: elements.parentAge.value,
+    child_age: elements.childAge.value,
+    child_grade: elements.childGrade.value,
+    consent: elements.consent.checked,
+    parent_role: selectedRoles.parent?.value || null,
+    child_role: selectedRoles.child?.value || null,
+    selected_condition: selectedCondition,
+    completed_conditions: Array.from(completedConditions),
+    between_conditions_pending: betweenConditionsPending,
+  };
+  try {
+    window.localStorage.setItem(PAIRED_STUDY_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Browser storage is a convenience only; the live experiment can continue without it.
+  }
+}
+
+function updateConditionOptions() {
+  elements.conditionOptions.forEach((button) => {
+    const condition = button.dataset.condition;
+    const complete = completedConditions.has(condition);
+    const selected = selectedCondition === condition;
+    button.disabled = captureActive || complete;
+    button.setAttribute("aria-checked", String(selected));
+    const status = button.querySelector("small");
+    if (status) status.textContent = complete ? "已完成" : selected ? "本轮" : "未选择";
+  });
+}
+
+function selectCondition(condition, { save = true } = {}) {
+  if (!['coregulation', 'baseline'].includes(condition)) return;
+  if (completedConditions.has(condition) || captureActive) return;
+  selectedCondition = condition;
+  updateConditionOptions();
+  updateStartButton();
+  if (save) persistPairedStudy();
+}
+
+function setBoundSpeakers(speakers) {
+  const bound = new Set(Array.isArray(speakers) ? speakers : []);
+  ["parent", "child"].forEach((speaker) => {
+    if (!bound.has(speaker)) return;
+    bindingState[speaker] = true;
+    const person = elements.bindingPeople.find((item) => item.dataset.speaker === speaker);
+    if (person) {
+      person.dataset.bound = "true";
+      const status = person.querySelector("span[id$='binding-status']");
+      if (status) status.textContent = "已录好";
+    }
+    const button = elements.bindingButtons.find((item) => item.dataset.speaker === speaker);
+    if (button) button.textContent = "重新录制";
+  });
+  const boundCount = Object.values(bindingState).filter(Boolean).length;
+  elements.bindingCount.textContent = `${boundCount} / 2`;
+  if (boundCount === 2) {
+    elements.bindingFeedback.textContent = "两段声音已录好，请继续检查设备。";
+  }
+  updateStartButton();
+}
+
+function restorePairedStudy() {
+  const saved = loadPairedStudy();
+  elements.session.textContent = saved?.session_id || makeSessionCode();
+  if (!saved) return;
+  const savedCompleted = Array.isArray(saved.completed_conditions)
+    ? saved.completed_conditions
+    : [];
+  if (["coregulation", "baseline"].every((item) => savedCompleted.includes(item))) {
+    try { window.localStorage.removeItem(PAIRED_STUDY_STORAGE_KEY); } catch { /* ignore */ }
+    elements.session.textContent = makeSessionCode();
+    return;
+  }
+  elements.parentAge.value = saved.parent_age || "";
+  elements.childAge.value = saved.child_age || "";
+  elements.childGrade.value = saved.child_grade || "";
+  elements.consent.checked = saved.consent === true;
+  savedCompleted
+    .filter((condition) => ["coregulation", "baseline"].includes(condition))
+    .forEach((condition) => completedConditions.add(condition));
+  betweenConditionsPending = completedConditions.size === 1
+    && saved.between_conditions_pending === true;
+  [
+    ["parent", saved.parent_role],
+    ["child", saved.child_role],
+  ].forEach(([group, value]) => {
+    const option = elements.roleOptions.find(
+      (button) => button.dataset.roleGroup === group && button.dataset.role === value,
+    );
+    if (option) selectRole(option);
+  });
+  const remaining = ["coregulation", "baseline"].filter(
+    (condition) => !completedConditions.has(condition),
+  );
+  const preferred = remaining.includes(saved.selected_condition)
+    ? saved.selected_condition
+    : remaining[0];
+  if (preferred) selectCondition(preferred, { save: false });
+  updateConditionOptions();
 }
 
 function setPhase(phase) {
@@ -313,6 +434,7 @@ function selectRole(button) {
   }
   updateFamilyDisplay();
   updateStartButton();
+  persistPairedStudy();
 }
 
 function setStatus(message, tone = "neutral") {
@@ -646,7 +768,7 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
       media_devices: Boolean(navigator.mediaDevices),
       media_recorder: Boolean(window.MediaRecorder),
       secure_context: window.isSecureContext,
-      page_version: "0.7.0",
+      page_version: "0.8.0",
     },
   }));
   const ready = await waitForMessage(ws, ["ready", "error"]);
@@ -713,8 +835,11 @@ function readStudyContext() {
   }
   return {
     participant_id: elements.session.textContent,
-    experiment_label: "正式实验",
-    session_round: "1",
+    experiment_label: selectedCondition === "baseline" ? "实验二" : "实验一",
+    session_round: selectedCondition === "baseline" ? "E2" : "E1",
+    experiment_condition: selectedCondition,
+    experience_order: Math.min(2, completedConditions.size + 1),
+    paired_study: true,
     basic_info: {
       parent_age: parentAge,
       child_age: childAge,
@@ -737,7 +862,8 @@ function validateStep(step) {
   if (step === 1) {
     const parentAge = elements.parentAge.valueAsNumber;
     const childAge = elements.childAge.valueAsNumber;
-    return Number.isInteger(parentAge) && parentAge >= 18 && parentAge <= 80
+    return Boolean(selectedCondition)
+      && Number.isInteger(parentAge) && parentAge >= 18 && parentAge <= 80
       && Number.isInteger(childAge) && childAge >= 5 && childAge <= 18
       && Boolean(elements.childGrade.value.trim())
       && Boolean(elements.taskName.value.trim())
@@ -786,7 +912,9 @@ function nextStep() {
     goToStep(currentStep + 1);
   } else if (!validateStep(currentStep)) {
     if (currentStep === 1) {
-      window.alert("请先填完基本信息和作业内容。");
+      window.alert(selectedCondition
+        ? "请先填完基本信息和作业内容。"
+        : "请先按研究人员告知选择本轮实验。");
     } else if (currentStep === 2) {
       window.alert("请先选择角色并录完两段声音。");
     }
@@ -798,6 +926,7 @@ function prevStep() {
 }
 
 function updateStartButton() {
+  const conditionReady = Boolean(selectedCondition);
   const rolesReady = Boolean(selectedRoles.parent && selectedRoles.child);
   const voicesReady = bindingState.parent && bindingState.child;
   const parentAge = elements.parentAge.valueAsNumber;
@@ -814,7 +943,8 @@ function updateStartButton() {
   );
   const deviceReady = devicesReady();
   elements.start.disabled = !(
-    informationReady
+    conditionReady
+    && informationReady
     && taskReady
     && rolesReady
     && voicesReady
@@ -835,7 +965,9 @@ function updateStartButton() {
     const roleReady = Boolean(selectedRoles[button.dataset.speaker]);
     button.disabled = bindingBusy || !roleReady;
   });
-  if (!informationReady) {
+  if (!conditionReady) {
+    elements.startRequirement.textContent = "请先选择本轮实验。";
+  } else if (!informationReady) {
     elements.startRequirement.textContent = "先填写基本信息。";
   } else if (!taskReady) {
     elements.startRequirement.textContent = "请完整填写今天的作业。";
@@ -890,6 +1022,22 @@ async function ensureSessionAdmission() {
     throw new Error("暂时无法建立本次会话，请刷新页面后重试。");
   }
   sessionAccessToken = payload.session_token;
+  setBoundSpeakers(payload.bound_speakers);
+  if (Array.isArray(payload.completed_conditions)) {
+    payload.completed_conditions.forEach((condition) => {
+      if (["coregulation", "baseline"].includes(condition)) {
+        completedConditions.add(condition);
+      }
+    });
+    if (completedConditions.has(selectedCondition)) {
+      const remaining = ["coregulation", "baseline"].find(
+        (condition) => !completedConditions.has(condition),
+      );
+      selectedCondition = remaining || null;
+    }
+    updateConditionOptions();
+    persistPairedStudy();
+  }
   return sessionAccessToken;
 }
 
@@ -1034,6 +1182,7 @@ async function recordBindingAudio(speaker) {
       : `${currentLabel}已录好，请继续录${otherLabel}的声音。`;
 
     if (button) button.textContent = "重新录制";
+    persistPairedStudy();
     updateStartButton();
   } catch (error) {
     if (statusSpan) statusSpan.textContent = hadBinding ? "已录好" : "未录音";
@@ -1942,6 +2091,28 @@ function renderSupportSummary() {
 
 function showSessionSummary(summary) {
   latestSessionSummary = summary;
+  if (
+    summary.valid
+    && !summary.preview
+    && ["coregulation", "baseline"].includes(summary.experiment_condition)
+  ) {
+    completedConditions.add(summary.experiment_condition);
+    const remaining = ["coregulation", "baseline"].find(
+      (condition) => !completedConditions.has(condition),
+    );
+    if (remaining) selectedCondition = remaining;
+    betweenConditionsPending = completedConditions.size === 1;
+    persistPairedStudy();
+    if (completedConditions.size === 2) {
+      betweenConditionsPending = false;
+      try { window.localStorage.removeItem(PAIRED_STUDY_STORAGE_KEY); } catch { /* ignore */ }
+    }
+  }
+  updateConditionOptions();
+  if (betweenConditionsPending && completedConditions.size === 1) {
+    showConditionTransition(summary.experiment_condition);
+    return;
+  }
   renderRoleImages(elements.summaryFamily, targetRoles("both"));
   elements.summaryDuration.textContent = formatDuration(summary.duration_ms);
   elements.summaryInterventions.textContent = `${sessionInsights.interventionCount} 次`;
@@ -1961,13 +2132,74 @@ function showSessionSummary(summary) {
   elements.homeNav.classList.remove("active");
   elements.homeNav.removeAttribute("aria-current");
   elements.recordNav.setAttribute("aria-current", "page");
+  elements.newSession.textContent = summary.valid === false
+    ? "返回准备并重试"
+    : completedConditions.size === 1
+      ? "继续体验另一个实验"
+      : "完成本次体验";
   setPhase("summary");
 }
 
+function conditionLabel(condition) {
+  return condition === "baseline" ? "实验二" : "实验一";
+}
+
+function showConditionTransition(completedCondition = null) {
+  const completed = completedCondition
+    || ["coregulation", "baseline"].find((condition) => completedConditions.has(condition));
+  const next = ["coregulation", "baseline"].find(
+    (condition) => !completedConditions.has(condition),
+  );
+  if (!completed || !next) return;
+  elements.transitionCompletedCondition.textContent = conditionLabel(completed);
+  elements.transitionNextCondition.textContent = conditionLabel(next);
+  elements.summaryPanel.hidden = true;
+  elements.startCard.hidden = true;
+  elements.intervention.hidden = true;
+  elements.sessionControls.hidden = true;
+  elements.transitionPanel.hidden = false;
+  elements.recordNav.disabled = true;
+  elements.recordNav.classList.remove("active");
+  elements.recordNav.removeAttribute("aria-current");
+  elements.homeNav.classList.add("active");
+  elements.homeNav.setAttribute("aria-current", "page");
+  elements.continueCondition.focus();
+}
+
 function resetPreparation() {
+  elements.transitionPanel.hidden = true;
   elements.summaryPanel.hidden = true;
   elements.startCard.hidden = false;
   elements.intervention.hidden = true;
+  if (completedConditions.size === 1 || latestSessionSummary?.valid === false) {
+    const remaining = ["coregulation", "baseline"].find(
+      (condition) => !completedConditions.has(condition),
+    );
+    if (completedConditions.size === 1) selectedCondition = remaining || null;
+    betweenConditionsPending = false;
+    latestSessionSummary = null;
+    if (elements.taskName) elements.taskName.value = "";
+    if (elements.taskType) elements.taskType.value = "";
+    if (elements.taskDifficulty) elements.taskDifficulty.value = "";
+    deviceCheckBusy = false;
+    resetDeviceCheck("开始下一轮前，请重新检查摄像头和麦克风。");
+    elements.recordNav.classList.remove("active");
+    elements.recordNav.removeAttribute("aria-current");
+    elements.recordNav.disabled = true;
+    elements.homeNav.classList.add("active");
+    elements.homeNav.setAttribute("aria-current", "page");
+    updateConditionOptions();
+    updateFamilyDisplay();
+    setPhase("setup");
+    resetSessionRecordingState();
+    persistPairedStudy();
+    goToStep(1);
+    return;
+  }
+  try { window.localStorage.removeItem(PAIRED_STUDY_STORAGE_KEY); } catch { /* ignore */ }
+  completedConditions.clear();
+  betweenConditionsPending = false;
+  selectedCondition = null;
   elements.session.textContent = makeSessionCode();
   sessionAccessToken = null;
   elements.parentAge.value = "";
@@ -2003,14 +2235,17 @@ function resetPreparation() {
   elements.homeNav.classList.add("active");
   elements.homeNav.setAttribute("aria-current", "page");
   updateFamilyDisplay();
+  updateConditionOptions();
   setPhase("setup");
   resetSessionRecordingState();
+  persistPairedStudy();
   goToStep(1);
 }
 
 async function stopCapture(normal = true, reason = null) {
   if (stopping) return;
   stopping = true;
+  const finishedCondition = activeStudyContext?.experiment_condition || selectedCondition;
   let hasLiveSocket = Boolean(socket && socket.readyState === WebSocket.OPEN);
   if (normal && !hasLiveSocket) {
     setStatus("正在恢复连接并安全结束…", "working");
@@ -2022,6 +2257,7 @@ async function stopCapture(normal = true, reason = null) {
     preview: !hasLiveSocket,
     duration_ms: localDurationMs,
     run_id: elements.session.textContent,
+    experiment_condition: finishedCondition,
   };
   if (hasLiveSocket) await drainBufferedMedia();
   haltCaptureLoops();
@@ -2054,6 +2290,7 @@ async function stopCapture(normal = true, reason = null) {
       }));
       finalSummary = await waitForMessage(socket, ["summary", "error"], 180000);
       finalSummary.duration_ms = localDurationMs;
+      finalSummary.experiment_condition = finishedCondition;
       socket.close();
     }
   } catch (error) {
@@ -2062,6 +2299,7 @@ async function stopCapture(normal = true, reason = null) {
       valid: false,
       duration_ms: localDurationMs,
       run_id: elements.session.textContent,
+      experiment_condition: finishedCondition,
       error: error instanceof Error ? error.message : "结束时发生错误",
     };
   } finally {
@@ -2080,7 +2318,10 @@ async function stopCapture(normal = true, reason = null) {
   }
 }
 
-elements.session.textContent = makeSessionCode();
+restorePairedStudy();
+elements.conditionOptions.forEach((button) => {
+  button.addEventListener("click", () => selectCondition(button.dataset.condition));
+});
 elements.roleOptions.forEach((button) => {
   button.addEventListener("click", () => selectRole(button));
 });
@@ -2100,12 +2341,17 @@ elements.bindingButtons.forEach((button) => {
 ].forEach((element) => {
   element.addEventListener("input", () => {
     updateStartButton();
+    persistPairedStudy();
   });
   element.addEventListener("change", () => {
     updateStartButton();
+    persistPairedStudy();
   });
 });
-elements.consent.addEventListener("change", updateStartButton);
+elements.consent.addEventListener("change", () => {
+  updateStartButton();
+  persistPairedStudy();
+});
 elements.deviceCheckButton.addEventListener("click", () => void checkDevices());
 elements.start.addEventListener("click", () => void startCapture());
 elements.wizardNext.addEventListener("click", nextStep);
@@ -2169,6 +2415,7 @@ elements.difficultyOptions.addEventListener("click", (event) => {
   setStatus("已收到你们的反馈，继续按合适的难度进行。", "success");
 });
 elements.newSession.addEventListener("click", resetPreparation);
+elements.continueCondition.addEventListener("click", resetPreparation);
 elements.recordNav.addEventListener("click", () => {
   if (latestSessionSummary) showSessionSummary(latestSessionSummary);
 });
@@ -2189,7 +2436,21 @@ window.addEventListener("pagehide", () => {
 });
 setPhase("setup");
 updateFamilyDisplay();
+updateConditionOptions();
 updateCounters();
 updateInterventionPauseControl();
 updateVoiceToggleControl();
 goToStep(1);
+if (betweenConditionsPending && completedConditions.size === 1) {
+  showConditionTransition();
+}
+if (
+  selectedCondition
+  && Number.isInteger(elements.parentAge.valueAsNumber)
+  && Number.isInteger(elements.childAge.valueAsNumber)
+  && elements.childGrade.value.trim()
+) {
+  void ensureSessionAdmission().catch(() => {
+    // The family can retry normally from the recording step.
+  });
+}

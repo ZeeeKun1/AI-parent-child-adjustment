@@ -1,5 +1,10 @@
 """Research-grounded target-aware intervention strategy selection."""
 
+from coregulation_poc.intervention.baseline import (
+    BaselineAction,
+    BaselineDecision,
+    BaselineDecisionGenerator,
+)
 from coregulation_poc.intervention.models import (
     InterventionPlan,
     MessageSource,
@@ -16,6 +21,9 @@ from coregulation_poc.intervention.selector import (
 from coregulation_poc.intervention.strategy_library import load_strategy_library
 
 __all__ = [
+    "BaselineAction",
+    "BaselineDecision",
+    "BaselineDecisionGenerator",
     "InterventionPlan",
     "MessageGenerator",
     "MessageSource",

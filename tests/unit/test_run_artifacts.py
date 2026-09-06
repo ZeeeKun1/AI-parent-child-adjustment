@@ -25,3 +25,23 @@ def test_artifact_store_uses_readable_study_name_and_avoids_collision(
 
     assert first.run_dir.name == run_name
     assert second.run_dir.name == f"{run_name}_02"
+
+
+def test_artifact_store_can_pair_runs_under_one_family(tmp_path: Path) -> None:
+    first = RunArtifactStore(
+        tmp_path,
+        "internal-session",
+        run_name="experiment_1_coregulation",
+        group_name="family_001",
+    )
+    second = RunArtifactStore(
+        tmp_path,
+        "internal-session",
+        run_name="experiment_2_baseline",
+        group_name="family_001",
+    )
+
+    assert first.run_dir == (
+        tmp_path / "studies" / "family_001" / "experiment_1_coregulation"
+    ).resolve()
+    assert second.run_dir.parent == first.run_dir.parent

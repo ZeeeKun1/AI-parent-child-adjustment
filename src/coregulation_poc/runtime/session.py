@@ -32,6 +32,9 @@ from coregulation_poc.delivery import (
     not_attempted_voice_execution,
 )
 from coregulation_poc.intervention import (
+    BaselineAction,
+    BaselineDecision,
+    BaselineDecisionGenerator,
     MessageGenerator,
     StrategyChoiceGenerator,
     StrategySelector,
@@ -73,6 +76,7 @@ class RealtimeLoopConfig:
     analysis_deadline_seconds: float = 35.0
     max_pending_analysis_jobs: int = 12
     max_intervention_staleness_ms: int = 35_000
+    baseline_min_intervention_interval_ms: int = 120_000
     voice_synthesis_timeout_seconds: float = 8.0
     shutdown_drain_timeout_seconds: float = 30.0
     voice_enabled: bool = False
@@ -98,6 +102,8 @@ class RealtimeLoopConfig:
             raise ValueError("max_pending_analysis_jobs must be between 2 and 60")
         if self.max_intervention_staleness_ms < 5_000:
             raise ValueError("intervention staleness must be at least 5000 ms")
+        if self.baseline_min_intervention_interval_ms < 10_000:
+            raise ValueError("baseline intervention interval must be at least 10000 ms")
         if self.voice_synthesis_timeout_seconds <= 0:
             raise ValueError("voice synthesis timeout must be positive")
         if self.shutdown_drain_timeout_seconds <= 0:
@@ -118,9 +124,12 @@ class _AnalysisJob:
 
     snapshot: MediaWindow
     observation_task: asyncio.Task[WindowObservation] | None
-    judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None
+    judgment_task: asyncio.Task[
+        tuple[WindowObservation, StateAssessment | BaselineDecision]
+    ] | None
     completed: asyncio.Future[None]
     scheduled_monotonic: float
+    sequence: int
     skip_reason: str | None = None
 
 
@@ -215,6 +224,11 @@ class RealtimeSession:
             message_generator=message_generator,
             strategy_choice_generator=strategy_choice_generator,
         )
+        self.baseline_generator = (
+            BaselineDecisionGenerator(cast(Any, text_chat_provider))
+            if text_chat_provider is not None
+            else None
+        )
         self.strategy_cards = {card.strategy_id: card for card in self.strategy_library.cards}
         self.delivery = DeliveryCoordinator(load_delivery_policy())
         self.previous_state: CoregulationState | None = None
@@ -224,6 +238,11 @@ class RealtimeSession:
         self.assessment_history: list[StateAssessment] = []
         self.pending_delivery: DeliveryPackage | None = None
         self._pending_plan: InterventionPlan | None = None
+        self._baseline_pending_decision: BaselineDecision | None = None
+        self._baseline_last_delivery_at_ms: int | None = None
+        self._baseline_decision_count = 0
+        self._baseline_intervention_count = 0
+        self._experiment_condition = "coregulation"
         self.delivery_reports: list[dict[str, Any]] = []
         self.intervention_outcomes: list[dict[str, Any]] = []
         self.expert_interventions: list[dict[str, Any]] = []
@@ -242,7 +261,7 @@ class RealtimeSession:
         self._perception_tasks: set[asyncio.Task[WindowObservation]] = set()
         self._judgment_semaphore = asyncio.Semaphore(self.config.max_parallel_judgment)
         self._judgment_tasks: set[
-            asyncio.Task[tuple[WindowObservation, StateAssessment]]
+            asyncio.Task[tuple[WindowObservation, StateAssessment | BaselineDecision]]
         ] = set()
         self._late_result_tasks: set[asyncio.Task[None]] = set()
         self._latest_media_timestamp_ms = 0
@@ -272,9 +291,25 @@ class RealtimeSession:
         if hasattr(self.recognizer, "task_context"):
             self.recognizer.task_context = task_context
 
+    def set_experiment_condition(self, condition: str) -> None:
+        if condition not in {"coregulation", "baseline"}:
+            raise ValueError("experiment condition must be coregulation or baseline")
+        if self._started and condition != self._experiment_condition:
+            raise ValueError("experiment condition cannot change after the session starts")
+        if condition == "baseline":
+            if self.baseline_generator is None:
+                raise ValueError("baseline decision model is unavailable")
+            if not callable(getattr(self.recognizer, "observe", None)):
+                raise ValueError("baseline condition requires staged perception")
+        self._experiment_condition = condition
+
     @property
     def api_call_count(self) -> int:
         recognition_calls = int(getattr(self.recognizer, "api_call_count", self.assessment_count))
+        if self._experiment_condition == "baseline":
+            return recognition_calls + int(
+                getattr(self.baseline_generator, "call_count", 0)
+            )
         message_calls = int(getattr(self.selector.message_generator, "call_count", 0))
         strategy_choice_calls = int(
             getattr(self.selector.strategy_choice_generator, "call_count", 0)
@@ -285,6 +320,8 @@ class RealtimeSession:
     def runtime_metrics(self) -> dict[str, Any]:
         return {
             "assessment_count": self.assessment_count,
+            "baseline_decision_count": self._baseline_decision_count,
+            "baseline_intervention_count": self._baseline_intervention_count,
             "scheduled_assessment_count": self._scheduled_assessment_count,
             "analysis_queue_depth": self._analysis_queue.qsize(),
             "perception_inflight_count": sum(
@@ -325,6 +362,8 @@ class RealtimeSession:
             "spontaneous_recovery_count": self._spontaneous_recovery_count,
             "awaiting_post_intervention_response": (
                 self.controller.awaiting_post_intervention_response
+                if self._experiment_condition == "coregulation"
+                else self.pending_delivery is not None
             ),
             "awaiting_positive_maintenance_observation": (
                 self._positive_maintenance_pending is not None
@@ -355,6 +394,7 @@ class RealtimeSession:
                     self.config.max_intervention_staleness_ms
                 ),
                 "voice_enabled": self.config.voice_enabled,
+                "experiment_condition": self._experiment_condition,
             }
         )
 
@@ -416,7 +456,9 @@ class RealtimeSession:
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[None] = loop.create_future()
         observation_task: asyncio.Task[WindowObservation] | None = None
-        judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment]] | None = None
+        judgment_task: asyncio.Task[
+            tuple[WindowObservation, StateAssessment | BaselineDecision]
+        ] | None = None
         skip_reason: str | None = None
         if self._analysis_queue.qsize() >= self.config.max_pending_analysis_jobs:
             # Preserve the ten-second timeline slot without retaining another
@@ -439,6 +481,7 @@ class RealtimeSession:
             judgment_task = asyncio.create_task(
                 self._judge_after_observation(
                     observation_task,
+                    sequence=self._scheduled_assessment_count + 1,
                     previous_state=previous_state_snapshot,
                     history=history_snapshot,
                 )
@@ -452,6 +495,7 @@ class RealtimeSession:
                 judgment_task=judgment_task,
                 completed=completed,
                 scheduled_monotonic=time.monotonic(),
+                sequence=self._scheduled_assessment_count + 1,
                 skip_reason=skip_reason,
             )
         )
@@ -478,14 +522,16 @@ class RealtimeSession:
         self,
         observation_task: asyncio.Task[WindowObservation],
         *,
+        sequence: int,
         previous_state: CoregulationState | None,
         history: tuple[StateAssessment, ...],
-    ) -> tuple[WindowObservation, StateAssessment]:
+    ) -> tuple[WindowObservation, StateAssessment | BaselineDecision]:
         """Judge independently, then let the ordered worker commit the result."""
 
         observation = await observation_task
         return await self._judge_observation(
             observation,
+            sequence=sequence,
             previous_state=previous_state,
             history=history,
         )
@@ -494,12 +540,24 @@ class RealtimeSession:
         self,
         observation: WindowObservation,
         *,
+        sequence: int,
         previous_state: CoregulationState | None,
         history: tuple[StateAssessment, ...],
-    ) -> tuple[WindowObservation, StateAssessment]:
+    ) -> tuple[WindowObservation, StateAssessment | BaselineDecision]:
         """Judge one window with an immutable scheduling-time history snapshot."""
 
         async with self._judgment_semaphore:
+            if self._experiment_condition == "baseline":
+                if self.baseline_generator is None:
+                    raise RuntimeError("baseline decision model is unavailable")
+                decision = await asyncio.to_thread(
+                    self.baseline_generator.generate,
+                    observation=observation,
+                    sequence=sequence,
+                    task_context=self._task_context,
+                    recent_messages=list(self._recent_intervention_messages),
+                )
+                return observation, decision
             staged_recognizer = cast(Any, self.recognizer)
             assessment = await staged_recognizer.judge(
                 observation=observation,
@@ -583,7 +641,7 @@ class RealtimeSession:
             remaining = max(0.0, self.config.analysis_deadline_seconds - elapsed)
             try:
                 async with asyncio.timeout(remaining):
-                    observation, model_assessment = await asyncio.shield(
+                    observation, model_result = await asyncio.shield(
                         job.judgment_task
                     )
             except TimeoutError:
@@ -596,6 +654,8 @@ class RealtimeSession:
                 ) from None
             history_available = bool(self.assessment_history)
         else:
+            if self._experiment_condition == "baseline":
+                raise RuntimeError("baseline condition requires staged perception")
             observation = None
             await self.send_event(
                 {
@@ -604,13 +664,21 @@ class RealtimeSession:
                     "window_end_ms": snapshot.end_ms,
                 }
             )
-            model_assessment = await self.recognizer.assess(
+            model_result = await self.recognizer.assess(
                 session_id=self.session_id,
                 window=snapshot,
                 previous_state=self.previous_state,
                 history=history,
                 history_available=history_available,
             )
+        if isinstance(model_result, BaselineDecision):
+            await self._apply_baseline_decision(
+                snapshot=snapshot,
+                decision=model_result,
+                recognition_observation=observation,
+            )
+            return
+        model_assessment = model_result
         # The chronological worker owns trajectory state.  This also protects
         # generic recognizers that may have started with slightly stale context.
         model_assessment = model_assessment.model_copy(
@@ -630,7 +698,7 @@ class RealtimeSession:
         if task is None:
             return
         try:
-            observation, assessment = await task
+            observation, result = await task
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -647,6 +715,24 @@ class RealtimeSession:
             return
         self._late_analysis_result_count += 1
         perception_report = getattr(observation, "perception_report", None)
+        if isinstance(result, BaselineDecision):
+            with suppress(ConnectionError, RuntimeError):
+                await self.send_event(
+                    {
+                        "type": "late_baseline_decision",
+                        "window_start_ms": job.snapshot.start_ms,
+                        "window_end_ms": job.snapshot.end_ms,
+                        "decision": result.model_dump(mode="json"),
+                        "perception_report": (
+                            perception_report.model_dump(mode="json")
+                            if perception_report is not None
+                            else None
+                        ),
+                        "record_only": True,
+                    }
+                )
+            return
+        assessment = result
         with suppress(ConnectionError, RuntimeError):
             await self.send_event(
                 {
@@ -671,6 +757,26 @@ class RealtimeSession:
         reason: str,
     ) -> None:
         """Keep one explicit timeline slot when cloud analysis is unavailable."""
+
+        if self._experiment_condition == "baseline":
+            self.assessment_count += 1
+            self._baseline_decision_count += 1
+            await self.send_event(
+                {
+                    "type": "baseline_decision",
+                    "sequence": job.sequence,
+                    "window_start_ms": job.snapshot.start_ms,
+                    "window_end_ms": job.snapshot.end_ms,
+                    "action": BaselineAction.NO_INTERVENTION.value,
+                    "target_actor": Actor.UNKNOWN.value,
+                    "message": None,
+                    "reason": "analysis_unavailable",
+                    "confidence": ConfidenceLevel.LOW.value,
+                    "limitation": str(reason)[:500],
+                    "record_only": True,
+                }
+            )
+            return
 
         limitation = f"Window analysis unavailable: {reason}"
         insufficient = ModalityEvidence(
@@ -707,6 +813,119 @@ class RealtimeSession:
             history_available=bool(self.assessment_history),
             recognition_observation=None,
         )
+
+    async def _apply_baseline_decision(
+        self,
+        *,
+        snapshot: MediaWindow,
+        decision: BaselineDecision,
+        recognition_observation: WindowObservation,
+    ) -> None:
+        """Commit one baseline decision without invoking state or strategy modules."""
+
+        self.assessment_count += 1
+        self._baseline_decision_count += 1
+        binding_event = self._speaker_binding_event(snapshot, recognition_observation)
+        if binding_event is not None:
+            await self.send_event(binding_event)
+        staleness_ms = max(0, self._latest_media_timestamp_ms - snapshot.end_ms)
+        perception = recognition_observation.perception_report
+        acoustic = recognition_observation.acoustic_features
+        await self.send_event(
+            {
+                "type": "baseline_decision",
+                **decision.model_dump(mode="json"),
+                "perception_report": perception.model_dump(mode="json"),
+                "acoustic_features": acoustic.model_dump(mode="json"),
+                "analysis_staleness_ms": staleness_ms,
+                "live_action_eligible": (
+                    staleness_ms <= self.config.max_intervention_staleness_ms
+                ),
+                "state_classification_used": False,
+                "strategy_library_used": False,
+            }
+        )
+        if decision.action is BaselineAction.NO_INTERVENTION:
+            self._self_continue_suppressed = False
+            return
+        if self._interventions_paused or self._expert_takeover_active:
+            await self.send_event(
+                {
+                    "type": "intervention_held",
+                    "sequence": decision.sequence,
+                    "reason": (
+                        "expert_takeover_active"
+                        if self._expert_takeover_active
+                        else "interventions_paused"
+                    ),
+                }
+            )
+            return
+        if self.pending_delivery is not None:
+            await self.send_event(
+                {
+                    "type": "intervention_held",
+                    "sequence": decision.sequence,
+                    "reason": "baseline_delivery_pending",
+                }
+            )
+            return
+        if self._self_continue_suppressed:
+            self._self_continue_suppressed = False
+            await self.send_event(
+                {
+                    "type": "intervention_held",
+                    "sequence": decision.sequence,
+                    "reason": "self_continue_suppressed",
+                }
+            )
+            return
+        if staleness_ms > self.config.max_intervention_staleness_ms:
+            await self._hold_stale_intervention(
+                sequence=decision.sequence,
+                staleness_ms=staleness_ms,
+            )
+            return
+        if (
+            self._baseline_last_delivery_at_ms is not None
+            and snapshot.end_ms - self._baseline_last_delivery_at_ms
+            < self.config.baseline_min_intervention_interval_ms
+        ):
+            await self.send_event(
+                {
+                    "type": "intervention_held",
+                    "sequence": decision.sequence,
+                    "reason": "baseline_minimum_interval",
+                    "minimum_interval_ms": (
+                        self.config.baseline_min_intervention_interval_ms
+                    ),
+                }
+            )
+            return
+        preparation = self.delivery.prepare_direct(
+            session_id=self.session_id,
+            sequence=decision.sequence,
+            planned_at_ms=decision.window_end_ms,
+            target_actor=decision.target_actor,
+            message=decision.message or "",
+            runtime=DeliveryRuntimeContext(
+                prepared_at_ms=decision.window_end_ms,
+                interventions_paused=self._interventions_paused,
+                voice_enabled=self.config.voice_enabled,
+                voice_available=self.voice_synthesizer is not None,
+            ),
+        )
+        if preparation.package is None:
+            await self.send_event(
+                {
+                    "type": "intervention_held",
+                    "sequence": decision.sequence,
+                    "reason": preparation.hold_reason.value,
+                }
+            )
+            return
+        self._baseline_pending_decision = decision
+        await self._deliver(preparation.package)
 
     def _trajectory_previous_state(self) -> CoregulationState | None:
         """Return the immediately preceding slot, including an unknown slot."""
@@ -1054,10 +1273,14 @@ class RealtimeSession:
         """Record an actionable old state without showing an obsolete prompt."""
 
         self._stale_intervention_count += 1
-        if self.controller.awaiting_post_intervention_response:
+        if (
+            self._experiment_condition == "coregulation"
+            and self.controller.awaiting_post_intervention_response
+        ):
             self.controller.mark_intervention_not_delivered()
         self.pending_delivery = None
         self._pending_plan = None
+        self._baseline_pending_decision = None
         await self.send_event(
             {
                 "type": "intervention_held",
@@ -1069,9 +1292,13 @@ class RealtimeSession:
 
     async def _deliver(self, package: DeliveryPackage) -> None:
         if self._interventions_paused or self._expert_takeover_active:
-            if self.controller.awaiting_post_intervention_response:
+            if (
+                self._experiment_condition == "coregulation"
+                and self.controller.awaiting_post_intervention_response
+            ):
                 self.controller.mark_intervention_not_delivered()
             self._pending_plan = None
+            self._baseline_pending_decision = None
             await self.send_event(
                 {
                     "type": "intervention_held",
@@ -1098,7 +1325,11 @@ class RealtimeSession:
                 "prepared_at_ms": package.prepared_at_ms,
                 "target_actor": package.target_actor.value,
                 "strategy_id": package.strategy_id,
-                "repair_target": package.repair_target.value,
+                "repair_target": (
+                    None
+                    if package.repair_target is None
+                    else package.repair_target.value
+                ),
                 "source": "ai",
                 "heading": package.visual_prompt.heading,
                 "message": package.visual_prompt.message,
@@ -1115,7 +1346,9 @@ class RealtimeSession:
                 ),
                 "selection_reason": plan.selection_reason if plan is not None else None,
                 "message_source": (
-                    plan.message_source.value if plan is not None else None
+                    plan.message_source.value
+                    if plan is not None
+                    else package.message_source.value
                 ),
                 "message_validation_checks": (
                     plan.validation_checks if plan is not None else {}
@@ -1134,7 +1367,11 @@ class RealtimeSession:
         except (ConnectionError, OSError, RuntimeError):
             self.pending_delivery = None
             self._pending_plan = None
-            if self.controller.awaiting_post_intervention_response:
+            self._baseline_pending_decision = None
+            if (
+                self._experiment_condition == "coregulation"
+                and self.controller.awaiting_post_intervention_response
+            ):
                 self.controller.mark_intervention_not_delivered()
             raise
         if not voice_pending:
@@ -1261,8 +1498,12 @@ class RealtimeSession:
                 package.prepared_at_ms,
             )
             pending_plan = self._pending_plan
-            if pending_plan is None:
-                if self.controller.awaiting_post_intervention_response:
+            baseline_decision = self._baseline_pending_decision
+            if pending_plan is None and baseline_decision is None:
+                if (
+                    self._experiment_condition == "coregulation"
+                    and self.controller.awaiting_post_intervention_response
+                ):
                     self.controller.mark_intervention_not_delivered()
                 self.pending_delivery = None
                 await self.send_event(
@@ -1274,10 +1515,11 @@ class RealtimeSession:
                     }
                 )
                 return True
-            self.controller.mark_intervention_delivered(
-                pending_plan.state,
-                delivered_at_ms=delivery_timeline_ms,
-            )
+            if pending_plan is not None:
+                self.controller.mark_intervention_delivered(
+                    pending_plan.state,
+                    delivered_at_ms=delivery_timeline_ms,
+                )
             if package.delivery_id not in self._recorded_message_delivery_ids:
                 shown_message = re.sub(
                     r"\s+", " ", package.visual_prompt.message
@@ -1288,10 +1530,14 @@ class RealtimeSession:
                         self._recent_intervention_messages[-3:]
                     )
                 self._recorded_message_delivery_ids.add(package.delivery_id)
-            positive_maintenance = (
+            if baseline_decision is not None:
+                self._baseline_last_delivery_at_ms = delivery_timeline_ms
+                self._baseline_intervention_count += 1
+                self.pending_delivery = None
+                self._baseline_pending_decision = None
+            elif pending_plan is not None and (
                 pending_plan.decision_action is InterventionAction.REINFORCE
-            )
-            if positive_maintenance:
+            ):
                 self._positive_maintenance_pending = {
                     "delivery_id": package.delivery_id,
                     "strategy_id": pending_plan.strategy_id,
@@ -1312,10 +1558,14 @@ class RealtimeSession:
             self.window.clear()
             self._last_scheduled_at_ms = delivery_timeline_ms
         else:
-            if self.controller.awaiting_post_intervention_response:
+            if (
+                self._experiment_condition == "coregulation"
+                and self.controller.awaiting_post_intervention_response
+            ):
                 self.controller.mark_intervention_not_delivered()
             self.pending_delivery = None
             self._pending_plan = None
+            self._baseline_pending_decision = None
         report_record = report.model_dump(mode="json")
         report_record["delivery_timeline_ms"] = delivery_timeline_ms
         self.delivery_reports.append(report_record)
@@ -1348,10 +1598,14 @@ class RealtimeSession:
         self._expert_takeover_active = True
         self._interventions_paused = True
         if self.pending_delivery is not None:
-            if self.controller.awaiting_post_intervention_response:
+            if (
+                self._experiment_condition == "coregulation"
+                and self.controller.awaiting_post_intervention_response
+            ):
                 self.controller.mark_intervention_not_delivered()
             self.pending_delivery = None
             self._pending_plan = None
+            self._baseline_pending_decision = None
             self._post_response_not_before_ms = None
         await self.send_event(
             {

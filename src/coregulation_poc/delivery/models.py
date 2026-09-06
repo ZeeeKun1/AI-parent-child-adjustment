@@ -185,9 +185,9 @@ class DeliveryPackage(BaseModel):
     planned_at_ms: int = Field(ge=0)
     prepared_at_ms: int = Field(ge=0)
     delivery_policy_version: int = Field(ge=1)
-    strategy_id: str = Field(min_length=1)
+    strategy_id: str | None = Field(default=None, min_length=1)
     target_actor: Actor
-    repair_target: RepairTarget
+    repair_target: RepairTarget | None = None
     message_source: MessageSource
     visual_prompt: VisualPrompt
     voice_prompt: VoicePrompt
@@ -216,6 +216,11 @@ class DeliveryPackage(BaseModel):
                 raise ValueError("degraded delivery requires an explicit voice fallback reason")
         if self.status is DeliveryPreparationStatus.HELD:
             raise ValueError("held preparation cannot contain a delivery package")
+        if self.message_source is MessageSource.BASELINE_DIRECT_MODEL:
+            if self.strategy_id is not None or self.repair_target is not None:
+                raise ValueError("baseline delivery cannot claim a strategy or repair target")
+        elif self.strategy_id is None or self.repair_target is None:
+            raise ValueError("strategy delivery requires a strategy and repair target")
         return self
 
 
