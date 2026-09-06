@@ -2146,7 +2146,7 @@ summary:focus-visible {
 
 .device-state-list .secondary-action {
   width: 100%;
-  margin-top: auto;
+  margin-top: 2px;
 }
 
 @container (max-width: 680px) {
@@ -2625,8 +2625,10 @@ body[data-phase="positive"] .intervention-backdrop {
 }
 
 .condition-transition-card .start-btn {
+  display: block;
   width: min(100%, 360px);
   min-height: 52px;
+  margin-inline: auto;
 }
 
 .condition-transition-note {
@@ -3173,11 +3175,21 @@ body[data-phase="positive"] .intervention-backdrop {
 /* Step 3: device check fills the panel */
 .wizard-panel[data-step="3"] .device-check-layout {
   grid-template-columns: minmax(0, 1.35fr) minmax(260px, 0.65fr);
-  min-height: 320px;
+  align-items: start;
+  min-height: 0;
 }
 
 .wizard-panel[data-step="3"] .device-preview {
-  aspect-ratio: 4 / 3;
+  height: clamp(220px, 38vh, 320px);
+  aspect-ratio: auto;
+}
+
+.wizard-panel[data-step="3"] .device-state-list {
+  align-self: start;
+}
+
+.wizard-panel[data-step="3"] .consent {
+  padding: 10px 0 2px;
 }
 
 /* Remove old setup-section card nesting inside wizard */
@@ -3244,6 +3256,7 @@ body[data-phase="positive"] .intervention-backdrop {
   }
 
   .wizard-panel[data-step="3"] .device-preview {
+    height: auto;
     aspect-ratio: 16 / 9;
   }
 
