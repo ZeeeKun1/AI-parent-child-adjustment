@@ -293,7 +293,7 @@ class StateTrajectoryController:
             assessment.state in rule.allowed_states
             and assessment.support_need is SupportNeed.POSITIVE_REINFORCEMENT
         ):
-            candidates |= explicit
+            candidates |= explicit.intersection(rule.standalone_trigger_performances)
 
         # Case 2: recovery from fluctuation confirmed by trajectory.
         if (

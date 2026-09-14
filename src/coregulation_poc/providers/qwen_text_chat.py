@@ -15,6 +15,7 @@ wrap it with ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +32,20 @@ class TextChatResult:
     completion_tokens: int | None
     total_latency_ms: int
     finish_reason: str | None
+    cached_prompt_tokens: int | None = None
+
+
+def _cached_prompt_tokens(usage: Any) -> int | None:
+    """Read cache usage without depending on one compatible-API spelling."""
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        return None
+    value = details.get("cached_tokens")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 class QwenTextChatProvider:
@@ -51,6 +66,7 @@ class QwenTextChatProvider:
         temperature: float = 0.3,
         max_tokens: int = 128,
         timeout_seconds: float = 10,
+        client: httpx.Client | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("api_key must not be empty")
@@ -59,6 +75,38 @@ class QwenTextChatProvider:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout_seconds = timeout_seconds
+        self._client = client if client is not None else httpx.Client(
+            timeout=timeout_seconds,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+        )
+        self._owns_client = client is None
+        self._lifecycle_lock = threading.Lock()
+        self._active_requests = 0
+        self._closed = False
+
+    def _post(self, *args: Any, **kwargs: Any) -> httpx.Response:
+        # One connection pool per provider, no conversation or response cache.
+        with self._lifecycle_lock:
+            if self._closed:
+                raise ConnectionError("Qwen text provider is closed")
+            self._active_requests += 1
+        try:
+            return self._client.post(*args, **kwargs)
+        finally:
+            with self._lifecycle_lock:
+                self._active_requests -= 1
+                if self._closed and self._active_requests == 0 and self._owns_client:
+                    self._client.close()
+
+    def close(self) -> None:
+        # Cancellation of asyncio.to_thread cannot terminate an in-flight HTTP
+        # request. Defer pool closure until its final caller exits.
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._active_requests == 0 and self._owns_client:
+                self._client.close()
 
     def generate(self, prompt: str) -> TextChatResult:
         """Send a single-turn chat completion request and return the text.
@@ -101,7 +149,7 @@ class QwenTextChatProvider:
         }
 
         try:
-            response = httpx.post(
+            response = self._post(
                 self.BASE_URL,
                 headers=headers,
                 json=payload,
@@ -145,6 +193,7 @@ class QwenTextChatProvider:
             completion_tokens=usage.get("completion_tokens") if isinstance(usage, dict) else None,
             total_latency_ms=latency_ms,
             finish_reason=finish_reason,
+            cached_prompt_tokens=_cached_prompt_tokens(usage),
         )
 
     def generate_structured(
@@ -214,7 +263,7 @@ class QwenTextChatProvider:
             payload["response_format"] = {"type": "json_object"}
 
         try:
-            response = httpx.post(
+            response = self._post(
                 self.BASE_URL,
                 headers=headers,
                 json=payload,
@@ -258,4 +307,5 @@ class QwenTextChatProvider:
             completion_tokens=usage.get("completion_tokens") if isinstance(usage, dict) else None,
             total_latency_ms=latency_ms,
             finish_reason=finish_reason,
+            cached_prompt_tokens=_cached_prompt_tokens(usage),
         )

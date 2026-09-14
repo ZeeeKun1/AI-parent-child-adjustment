@@ -49,9 +49,10 @@ class StateActionRule(DecisionRule):
 class PositiveMaintenanceRule(DecisionRule):
     allowed_states: list[CoregulationState] = Field(min_length=1)
     explicit_trigger_performances: list[str] = Field(min_length=1)
+    standalone_trigger_performances: list[str] = Field(min_length=1)
     recovery_transition_states: list[CoregulationState] = Field(min_length=1)
     requires_natural_turn_boundary: bool
-    minimum_interval_ms: int = Field(ge=120_000)
+    minimum_interval_ms: int = Field(ge=240_000)
 
 
 class InterventionPolicy(BaseModel):
@@ -111,6 +112,12 @@ class InterventionPolicy(BaseModel):
             raise ValueError("positive maintenance recovery transitions are limited to fluctuation")
         if not self.positive_maintenance.requires_natural_turn_boundary:
             raise ValueError("positive maintenance must wait for a natural turn boundary")
+        if not set(self.positive_maintenance.standalone_trigger_performances).issubset(
+            self.positive_maintenance.explicit_trigger_performances
+        ):
+            raise ValueError(
+                "standalone positive triggers must be included in explicit triggers"
+            )
 
         for state in (CoregulationState.DYSREGULATION, CoregulationState.HIGH_RISK):
             if self.state_actions[state].requires_natural_turn_boundary:

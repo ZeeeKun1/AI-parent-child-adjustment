@@ -142,6 +142,7 @@ async def _exercise_baseline_runtime() -> None:
     await session.stop("completed")
 
     event_types = [event["type"] for event in events]
+    assert "analysis_stage_timing" in event_types
     assert "baseline_decision" in event_types
     assert "intervention" in event_types
     assert "state_update" not in event_types
@@ -149,3 +150,6 @@ async def _exercise_baseline_runtime() -> None:
     intervention = next(event for event in events if event["type"] == "intervention")
     assert intervention["strategy_id"] is None
     assert intervention["repair_target"] is None
+    timing = next(event for event in events if event["type"] == "analysis_stage_timing")
+    assert timing["condition"] == "baseline"
+    assert timing["judgment_latency_ms"] >= 0

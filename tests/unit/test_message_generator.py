@@ -208,6 +208,18 @@ class TestMessagePrompt:
         assert "2" in prompt
         assert "答案是" in prompt
         assert "不得编造题目内容" in prompt
+        assert "本轮唯一核心动作（必须完整执行）" in prompt
+        assert "只负责表达，不负责重新判断问题" in prompt
+        assert "不得替换、删减、弱化核心动作" in prompt
+        assert "长期在家庭作业现场工作的亲子沟通专家" in prompt
+        assert "专业性体现在行动恰当" in prompt
+        assert "人类专家的说话方式" in prompt
+        assert "通常20至50个汉字已经够用" in prompt
+        assert "示例行动不属于本轮策略" in prompt
+        assert "专家会说" in prompt
+        assert "自然、柔和、具体" in prompt
+        assert "任何一项不满足就重写" not in prompt
+        assert "不要输出检查过程" in prompt
 
     def test_prompt_contains_evidence_quote(self) -> None:
         library = load_strategy_library()

@@ -1,4 +1,4 @@
-version: 5
+version: 6
 source:
   - "Formative study section 3.4.1: intervention timing depends on dyadic co-regulation state"
   - "Formative study section 3.4.2: experts use multiple cues and whole context"
@@ -108,13 +108,16 @@ guard_actions:
 positive_maintenance:
   action: reinforce
   reason_code: positive_maintenance_opportunity
-  minimum_interval_ms: 120000
+  minimum_interval_ms: 240000
   allowed_states: [normal]
   explicit_trigger_performances:
     - "task completion"
     - "positive dyadic exchange"
     - "active child participation"
     - "supportive parental guidance"
+  standalone_trigger_performances:
+    - "task completion"
+    - "positive dyadic exchange"
   recovery_transition_states: [fluctuation]
   requires_natural_turn_boundary: true
   research_basis: [protect_natural_rhythm, reinforce_positive_coordination]

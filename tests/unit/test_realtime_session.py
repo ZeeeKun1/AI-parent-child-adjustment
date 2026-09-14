@@ -590,6 +590,80 @@ def test_visual_intervention_is_sent_before_voice_synthesis_finishes() -> None:
     asyncio.run(_exercise_visual_first_delivery())
 
 
+def test_streaming_voice_chunks_precede_completion_and_keep_full_fallback() -> None:
+    asyncio.run(_exercise_streaming_voice())
+
+
+def test_streaming_failure_keeps_visual_delivery_and_session_alive() -> None:
+    async def exercise():
+        events = []
+
+        class BrokenVoice:
+            async def synthesize_streaming(self, text, *, on_chunk):
+                await on_chunk(b"\x00\x00" * 160, 16000)
+                raise RuntimeError("stream interrupted")
+
+        async def send(event):
+            events.append(event)
+
+        session = RealtimeSession(
+            session_id="stream-error", recognizer=_SequenceRecognizer(), send_event=send,
+            config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
+            voice_synthesizer=BrokenVoice(),
+        )
+        session.set_voice_streaming(True)
+        await session.start()
+        await _reach_confirmed_dysregulation(session)
+        assert any(e["type"] == "intervention" for e in events)
+        final = next(e for e in events if e["type"] == "intervention_voice")
+        assert final["voice_error"] == "stream interrupted"
+        assert final["audio_base64"] is None
+        assert session.runtime_metrics["analysis_error_count"] == 0
+        await session.stop("completed")
+
+    asyncio.run(exercise())
+
+
+async def _exercise_streaming_voice() -> None:
+    events = []
+    sent_chunk = asyncio.Event()
+    release = asyncio.Event()
+
+    class StreamingVoice(_BlockingVoiceSynthesizer):
+        async def synthesize_streaming(self, text, *, on_chunk):
+            await on_chunk(b"\x00\x00" * 160, 16000)
+            sent_chunk.set()
+            await release.wait()
+            await on_chunk(b"\x01\x00" * 160, 16000)
+            return VoiceAudio(b"\x00\x00" * 160 + b"\x01\x00" * 160, 16000, "test")
+
+    async def send(event):
+        events.append(event)
+
+    session = RealtimeSession(
+        session_id="stream-test", recognizer=_SequenceRecognizer(), send_event=send,
+        config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
+        voice_synthesizer=StreamingVoice(),
+    )
+    session.set_voice_streaming(True)
+    await session.start()
+    task = asyncio.create_task(_reach_confirmed_dysregulation(session))
+    await asyncio.wait_for(sent_chunk.wait(), 2)
+    first = next(e for e in events if e["type"] == "intervention")
+    assert first["voice_streaming"] is True
+    assert any(e["type"] == "intervention_audio_chunk" for e in events)
+    assert not any(e["type"] == "intervention_voice" for e in events)
+    release.set()
+    await task
+    chunks = [e for e in events if e["type"] == "intervention_audio_chunk"]
+    assert [e["sample_offset"] for e in chunks] == [0, 160]
+    assert [e["chunk_index"] for e in chunks] == [0, 1]
+    final = next(e for e in events if e["type"] == "intervention_voice")
+    assert final["audio_sample_count"] == 320
+    assert final["audio_base64"]
+    await session.stop("completed")
+
+
 async def _exercise_visual_first_delivery() -> None:
     events: list[dict[str, object]] = []
 

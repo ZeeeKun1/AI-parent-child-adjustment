@@ -285,7 +285,7 @@ def test_both_actor_evidence_uses_closest_dyadic_card() -> None:
 def test_positive_event_selects_role_specific_reinforcement() -> None:
     observation = _observation(
         state="normal",
-        performance="active child participation",
+        performance="task completion",
         actor="child",
         assessed_at_ms=1000,
         support_need="positive_reinforcement",

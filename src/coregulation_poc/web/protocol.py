@@ -240,6 +240,7 @@ class BrowserCaptureRecorder:
                 "media_devices",
                 "secure_context",
                 "page_version",
+                "pcm_streaming",
             }
             and isinstance(value, (str, bool, int, float, type(None)))
         }

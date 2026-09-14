@@ -63,6 +63,7 @@ ChunkHandler = Callable[[MediaChunk], Awaitable[None]]
 AUDITED_RUNTIME_EVENTS = {
     "loop_started",
     "analysis_started",
+    "analysis_stage_timing",
     "analysis_skipped",
     "late_analysis_result",
     "late_analysis_failure",
@@ -73,6 +74,7 @@ AUDITED_RUNTIME_EVENTS = {
     "voiceprint_cleanup",
     "intervention",
     "intervention_voice",
+    "intervention_audio_chunk",
     "intervention_held",
     "intervention_outcome",
     "interventions_paused",
@@ -178,18 +180,24 @@ class _RuntimeEventRelay:
         """Audit every runtime event and deliver it now or after reconnection."""
 
         self._audit(payload)
-        await self.registry.observe(self.session_id, payload)
+        is_audio_chunk = payload.get("type") == "intervention_audio_chunk"
+        if not is_audio_chunk:
+            await self.registry.observe(self.session_id, payload)
         async with self._lock:
             sender = self._sender
             if sender is None:
-                self._pending.append(dict(payload))
+                # Never fill the bounded replay queue with hundreds of PCM
+                # chunks. The final complete WAV repairs a missing stream tail.
+                if not is_audio_chunk:
+                    self._pending.append(dict(payload))
                 return
             try:
                 await sender(payload)
             except (ConnectionError, OSError, RuntimeError, WebSocketDisconnect):
                 if self._sender is sender:
                     self._sender = None
-                self._pending.append(dict(payload))
+                if not is_audio_chunk:
+                    self._pending.append(dict(payload))
 
     async def attach(self, sender: RuntimeSocketSender) -> bool:
         """Attach a replacement socket and replay events completed while offline."""
@@ -1145,6 +1153,8 @@ def create_browser_capture_app(
                     runtime_reused = True
                     if runtime_relay is None:
                         raise BrowserProtocolError("实时会话续接状态不完整，请重新开始实验")
+                if hasattr(runtime_session, "set_voice_streaming"):
+                    runtime_session.set_voice_streaming(capabilities.get("pcm_streaming") is True)
                 if hasattr(runtime_session, "set_experiment_condition"):
                     try:
                         runtime_session.set_experiment_condition(

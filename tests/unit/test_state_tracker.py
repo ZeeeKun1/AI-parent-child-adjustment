@@ -204,10 +204,18 @@ def test_positive_maintenance_requires_event_pause_and_is_not_a_recovery_guard()
             performance="steady coordination",
         )
     )
-    later_event = controller.ingest(
+    still_cooling_down = controller.ingest(
         _observation(
             "normal",
             122_000,
+            boundary=True,
+            performance="task completion",
+        )
+    )
+    later_event = controller.ingest(
+        _observation(
+            "normal",
+            242_000,
             boundary=True,
             performance="task completion",
         )
@@ -219,7 +227,34 @@ def test_positive_maintenance_requires_event_pause_and_is_not_a_recovery_guard()
     assert reinforced.reason_code is InterventionDecisionReason.POSITIVE_MAINTENANCE_OPPORTUNITY
     assert controller.awaiting_post_intervention_response is False
     assert repeated.action is InterventionAction.NO_INTERVENTION
+    assert still_cooling_down.action is InterventionAction.NO_INTERVENTION
     assert later_event.action is InterventionAction.REINFORCE
+
+
+def test_ordinary_positive_behavior_is_reinforced_only_after_fluctuation_recovery() -> None:
+    controller = _controller()
+
+    ordinary_normal = controller.ingest(
+        _observation(
+            "normal",
+            1000,
+            boundary=True,
+            performance="active child participation",
+        )
+    )
+    controller.ingest(_observation("fluctuation", 10_000, boundary=False))
+    recovered = controller.ingest(
+        _observation(
+            "normal",
+            20_000,
+            boundary=True,
+            performance="active child participation",
+            trajectory="recovering",
+        )
+    )
+
+    assert ordinary_normal.action is InterventionAction.NO_INTERVENTION
+    assert recovered.action is InterventionAction.REINFORCE
 
 
 def test_positive_maintenance_has_independent_cooldown_and_never_blocks_dysregulation() -> None:

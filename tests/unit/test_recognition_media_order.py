@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from coregulation_poc.capture.media import MediaChunk, MediaKind
-from coregulation_poc.runtime.recognition import _qwen_input_chunks
+from coregulation_poc.runtime.recognition import (
+    _qwen_input_chunks,
+    _qwen_upload_chunks,
+)
 from coregulation_poc.runtime.window import MediaWindow
 
 
@@ -44,3 +47,54 @@ def test_qwen_input_rejects_image_only_window_before_api_call() -> None:
 
     with pytest.raises(ValueError, match="requires audio"):
         _qwen_input_chunks(window)
+
+
+def test_qwen_upload_batches_one_second_of_audio_without_changing_bytes() -> None:
+    audio_chunks = tuple(
+        MediaChunk(MediaKind.AUDIO, index * 100, bytes([index]) * 3_200)
+        for index in range(10)
+    )
+    window = _window(*audio_chunks)
+
+    uploaded = _qwen_upload_chunks(window)
+
+    assert len(uploaded) == 1
+    assert uploaded[0].kind is MediaKind.AUDIO
+    assert uploaded[0].timestamp_ms == 0
+    assert uploaded[0].payload == b"".join(chunk.payload for chunk in audio_chunks)
+    assert window.audio_chunks == audio_chunks
+
+
+def test_qwen_upload_preserves_image_boundaries_and_all_payloads() -> None:
+    chunks = (
+        MediaChunk(MediaKind.AUDIO, 0, b"audio-a"),
+        MediaChunk(MediaKind.AUDIO, 100, b"audio-b"),
+        MediaChunk(MediaKind.IMAGE, 150, b"image"),
+        MediaChunk(MediaKind.AUDIO, 200, b"audio-c"),
+        MediaChunk(MediaKind.AUDIO, 300, b"audio-d"),
+    )
+
+    uploaded = _qwen_upload_chunks(_window(*chunks))
+
+    assert [chunk.kind for chunk in uploaded] == [
+        MediaKind.AUDIO,
+        MediaKind.IMAGE,
+        MediaKind.AUDIO,
+    ]
+    assert uploaded[0].payload == b"audio-aaudio-b"
+    assert uploaded[1] is chunks[2]
+    assert uploaded[2].payload == b"audio-caudio-d"
+
+
+def test_qwen_upload_splits_audio_batches_at_one_second_limit() -> None:
+    audio_chunks = tuple(
+        MediaChunk(MediaKind.AUDIO, index * 100, bytes([index]) * 3_200)
+        for index in range(11)
+    )
+
+    uploaded = _qwen_upload_chunks(_window(*audio_chunks))
+
+    assert [len(chunk.payload) for chunk in uploaded] == [32_000, 3_200]
+    assert b"".join(chunk.payload for chunk in uploaded) == b"".join(
+        chunk.payload for chunk in audio_chunks
+    )

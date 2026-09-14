@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections.abc import Awaitable, Callable
 
 from coregulation_poc.acoustics.tencent_voiceprint import (
     SpeakerEnrollmentRecord,
@@ -53,7 +55,41 @@ class QwenVoiceSynthesizer:
             sample_rate_hz=result.sample_rate_hz,
             provider=self.provider_name,
             output_identifier=result.response_id,
+            first_audio_latency_ms=result.first_audio_latency_ms,
+            total_latency_ms=result.total_latency_ms,
         )
+
+    async def synthesize_streaming(
+        self, text: str, *, on_chunk: Callable[[bytes, int], Awaitable[None]],
+    ) -> VoiceAudio:
+        """Bridge the provider's PCM callback with ordered, backpressured delivery."""
+        loop = asyncio.get_running_loop()
+        closed = threading.Event()
+
+        def forward(pcm: bytes) -> None:
+            if closed.is_set():
+                raise RuntimeError("voice stream cancelled")
+            future = asyncio.run_coroutine_threadsafe(
+                on_chunk(pcm, self.provider.sample_rate_hz), loop,
+            )
+            try:
+                future.result(timeout=5)
+            except BaseException:
+                future.cancel()
+                raise
+
+        try:
+            result = await asyncio.to_thread(
+                self.provider.synthesize, text, on_audio_chunk=forward,
+            )
+            return VoiceAudio(
+                pcm_audio=result.pcm_audio, sample_rate_hz=result.sample_rate_hz,
+                provider=self.provider_name, output_identifier=result.response_id,
+                first_audio_latency_ms=result.first_audio_latency_ms,
+                total_latency_ms=result.total_latency_ms,
+            )
+        finally:
+            closed.set()
 
 
 def build_realtime_session_factory(

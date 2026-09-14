@@ -142,6 +142,8 @@ let socketHeartbeatTimer = null;
 let activeStudyContext = null;
 let activeAdmissionToken = null;
 let pendingDeliveryExecution = null;
+const completedDeliveryIds = new Set();
+const pendingDeliveryReceipts = new Map();
 let sessionMediaRecorder = null;
 let recordingMimeType = "";
 let recordingSequence = 0;
@@ -645,6 +647,8 @@ function toggleVoice() {
   voiceEnabled = !voiceEnabled;
   updateVoiceToggleControl();
   if (!voiceEnabled) {
+    const pending = pendingDeliveryExecution;
+    if (pending?.player) pending.player.cancel();
     releaseInterventionAudio();
     setStatus("已关闭语音，只显示文字提示。", "neutral");
   } else {
@@ -768,7 +772,8 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
       media_devices: Boolean(navigator.mediaDevices),
       media_recorder: Boolean(window.MediaRecorder),
       secure_context: window.isSecureContext,
-      page_version: "0.8.0",
+      page_version: "0.9.0",
+      pcm_streaming: typeof PcmInterventionPlayer !== "undefined" && Boolean(window.AudioContext),
     },
   }));
   const ready = await waitForMessage(ws, ["ready", "error"]);
@@ -776,6 +781,7 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
   await waitForMessage(ws, ["started", "error"]);
   startSocketHeartbeat(ws);
   flushBufferedMedia();
+  flushDeliveryReceipts();
   return ready;
 }
 
@@ -1225,6 +1231,7 @@ function releaseInterventionAudio() {
 
 function clearPendingDeliveryExecution() {
   if (pendingDeliveryExecution?.timer) window.clearTimeout(pendingDeliveryExecution.timer);
+  pendingDeliveryExecution?.player?.cancel();
   pendingDeliveryExecution = null;
 }
 
@@ -1289,6 +1296,8 @@ async function playInterventionAudio(message) {
 }
 
 async function presentIntervention(message) {
+  if (completedDeliveryIds.has(message.delivery_id)
+    || pendingDeliveryExecution?.deliveryId === message.delivery_id) return;
   const visualStartedAtMs = sessionTimestampMs();
   currentDeliveryId = message.delivery_id;
 
@@ -1319,6 +1328,10 @@ async function presentIntervention(message) {
     pendingDeliveryExecution = {
       deliveryId: message.delivery_id,
       visualStartedAtMs,
+      player: message.voice_streaming && audioContext
+        ? new PcmInterventionPlayer(audioContext, sessionTimestampMs, () => {
+          elements.interventionChannel.textContent = "正在播放语音提示";
+        }) : null,
       timer: window.setTimeout(() => {
         const pending = pendingDeliveryExecution;
         if (!pending || pending.deliveryId !== message.delivery_id) return;
@@ -1331,6 +1344,18 @@ async function presentIntervention(message) {
         });
       }, VOICE_DELIVERY_TIMEOUT_MS),
     };
+    const pending = pendingDeliveryExecution;
+    if (pending.player) {
+      void pending.player.result.then((voice) => {
+        if (pendingDeliveryExecution !== pending) return;
+        clearPendingDeliveryExecution();
+        elements.interventionChannel.textContent = voice.status === "delivered"
+          ? "文字和语音提示已送达" : "文字提示已显示，语音未完整播放";
+        sendDeliveryExecution(message.delivery_id, visualStartedAtMs, {
+          ...voice, provider: message.voice_provider,
+        });
+      });
+    }
     elements.interventionChannel.textContent = "文字提示已显示，正在准备语音";
     return;
   }
@@ -1341,8 +1366,10 @@ async function presentIntervention(message) {
 }
 
 function sendDeliveryExecution(deliveryId, visualStartedAtMs, voice) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({
+  if (completedDeliveryIds.has(deliveryId)) return;
+  completedDeliveryIds.add(deliveryId);
+  while (completedDeliveryIds.size > 64) completedDeliveryIds.delete(completedDeliveryIds.values().next().value);
+  pendingDeliveryReceipts.set(deliveryId, {
     type: "delivery_execution",
     delivery_id: deliveryId,
     recorded_at_ms: sessionTimestampMs(),
@@ -1353,12 +1380,27 @@ function sendDeliveryExecution(deliveryId, visualStartedAtMs, voice) {
       provider: "browser_overlay",
     },
     voice,
-  }));
+  });
+  while (pendingDeliveryReceipts.size > 64) pendingDeliveryReceipts.delete(pendingDeliveryReceipts.keys().next().value);
+  flushDeliveryReceipts();
+}
+
+function flushDeliveryReceipts() {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  for (const receipt of pendingDeliveryReceipts.values()) {
+    try { socket.send(JSON.stringify(receipt)); } catch (_) { break; }
+  }
 }
 
 async function completeInterventionVoice(message) {
   const pending = pendingDeliveryExecution;
   if (!pending || pending.deliveryId !== message.delivery_id) return;
+  if (pending.player) {
+    if (pending.timer) window.clearTimeout(pending.timer);
+    pending.timer = null;
+    void pending.player.finish(message);
+    return;
+  }
   clearPendingDeliveryExecution();
   const voice = await playInterventionAudio({
     ...message,
@@ -1378,6 +1420,11 @@ function handleServerMessage(event) {
     void presentIntervention(message);
   } else if (message.type === "intervention_voice") {
     void completeInterventionVoice(message);
+  } else if (message.type === "intervention_audio_chunk") {
+    const pending = pendingDeliveryExecution;
+    if (pending?.deliveryId === message.delivery_id && voiceEnabled) pending.player?.append(message);
+  } else if (["delivery_execution_received", "delivery_execution_ignored"].includes(message.type)) {
+    pendingDeliveryReceipts.delete(message.delivery_id);
   } else if (message.type === "interventions_paused") {
     interventionsPaused = true;
     updateInterventionPauseControl();
@@ -1972,6 +2019,10 @@ async function startCapture() {
   }
   if (!admissionToken) return;
 
+  // A new round must not inherit playback receipts; reconnects bypass this path.
+  clearPendingDeliveryExecution();
+  completedDeliveryIds.clear();
+  pendingDeliveryReceipts.clear();
 
   elements.start.disabled = true;
   latestSessionSummary = null;

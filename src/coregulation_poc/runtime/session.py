@@ -116,6 +116,8 @@ class VoiceAudio:
     sample_rate_hz: int
     provider: str
     output_identifier: str | None = None
+    first_audio_latency_ms: int | None = None
+    total_latency_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -202,6 +204,8 @@ class RealtimeSession:
         self.session_id = session_id
         self.recognizer = recognizer
         self.send_event = send_event
+        self._text_chat_provider = text_chat_provider
+        self._voice_streaming_enabled = False
         self.config = config or RealtimeLoopConfig()
         self.voice_synthesizer = voice_synthesizer
         self.turn_boundary_detector = turn_boundary_detector
@@ -285,6 +289,10 @@ class RealtimeSession:
         self._difficulty_feedback_boost = False
         self._started = False
         self._stopped = False
+
+    def set_voice_streaming(self, enabled: bool) -> None:
+        """Opt in only when the browser advertises support; old clients stay valid."""
+        self._voice_streaming_enabled = enabled
 
     def set_task_context(self, task_context: dict[str, Any]) -> None:
         self._task_context = task_context
@@ -546,30 +554,73 @@ class RealtimeSession:
     ) -> tuple[WindowObservation, StateAssessment | BaselineDecision]:
         """Judge one window with an immutable scheduling-time history snapshot."""
 
+        judgment_queued = time.monotonic()
         async with self._judgment_semaphore:
+            judgment_started = time.monotonic()
             if self._experiment_condition == "baseline":
                 if self.baseline_generator is None:
                     raise RuntimeError("baseline decision model is unavailable")
-                decision = await asyncio.to_thread(
+                result: StateAssessment | BaselineDecision = await asyncio.to_thread(
                     self.baseline_generator.generate,
                     observation=observation,
                     sequence=sequence,
                     task_context=self._task_context,
                     recent_messages=list(self._recent_intervention_messages),
                 )
-                return observation, decision
-            staged_recognizer = cast(Any, self.recognizer)
-            assessment = await staged_recognizer.judge(
-                observation=observation,
-                previous_state=previous_state,
-                history=history,
-                history_available=bool(history),
+            else:
+                staged_recognizer = cast(Any, self.recognizer)
+                assessment = await staged_recognizer.judge(
+                    observation=observation,
+                    previous_state=previous_state,
+                    history=history,
+                    history_available=bool(history),
+                )
+                self._latest_completed_judgment_ms = max(
+                    self._latest_completed_judgment_ms,
+                    assessment.assessed_at_ms,
+                )
+                result = assessment
+            judgment_latency_ms = round((time.monotonic() - judgment_started) * 1_000)
+
+        # Diagnostic-only telemetry. These values are never read by state or
+        # intervention logic, and a logging failure cannot fail the analysis.
+        with suppress(ConnectionError, OSError, RuntimeError):
+            await self.send_event(
+                {
+                    "type": "analysis_stage_timing",
+                    "sequence": sequence,
+                    "condition": self._experiment_condition,
+                    "window_start_ms": observation.window.start_ms,
+                    "window_end_ms": observation.window.end_ms,
+                    "speaker_binding_latency_ms": getattr(
+                        observation, "speaker_binding_latency_ms", 0
+                    ),
+                    "perception_latency_ms": getattr(
+                        observation, "perception_latency_ms", 0
+                    ),
+                    "acoustic_latency_ms": getattr(
+                        observation, "acoustic_latency_ms", 0
+                    ),
+                    "observation_total_latency_ms": getattr(
+                        observation, "observation_total_latency_ms", 0
+                    ),
+                    "judgment_queue_wait_ms": round(
+                        (judgment_started - judgment_queued) * 1_000
+                    ),
+                    "judgment_latency_ms": judgment_latency_ms,
+                    "model_pipeline_latency_ms": (
+                        getattr(observation, "observation_total_latency_ms", 0)
+                        + judgment_latency_ms
+                    ),
+                    "source_audio_chunk_count": getattr(
+                        observation, "source_audio_chunk_count", 0
+                    ),
+                    "uploaded_audio_chunk_count": getattr(
+                        observation, "uploaded_audio_chunk_count", 0
+                    ),
+                }
             )
-            self._latest_completed_judgment_ms = max(
-                self._latest_completed_judgment_ms,
-                assessment.assessed_at_ms,
-            )
-        return observation, assessment
+        return observation, result
 
     async def _analysis_worker(self) -> None:
         while True:
@@ -1318,6 +1369,10 @@ class RealtimeSession:
         voice_pending = bool(
             package.voice_prompt.enabled and self.voice_synthesizer is not None
         )
+        stream_method = getattr(self.voice_synthesizer, "synthesize_streaming", None)
+        streaming = bool(
+            voice_pending and self._voice_streaming_enabled and callable(stream_method)
+        )
         intervention_event = {
                 "type": "intervention",
                 "delivery_id": package.delivery_id,
@@ -1357,6 +1412,7 @@ class RealtimeSession:
                 "voice_expected": package.voice_prompt.enabled,
                 "voice_provider": package.voice_prompt.provider,
                 "voice_pending": voice_pending,
+                "voice_streaming": streaming,
                 "voice_output_identifier": None,
                 "audio_mime_type": None,
                 "audio_base64": None,
@@ -1381,17 +1437,45 @@ class RealtimeSession:
         audio_mime_type: str | None = None
         voice_error: str | None = None
         voice_output_identifier: str | None = None
+        voice: VoiceAudio | None = None
+        chunk_index = 0
+        sample_offset = 0
+        stream_open = True
+
+        async def forward_chunk(pcm: bytes, sample_rate: int) -> None:
+            nonlocal chunk_index, sample_offset
+            if not stream_open:
+                return
+            if len(pcm) % 2:
+                raise ValueError("voice PCM16 chunk has incomplete sample")
+            if not pcm:
+                return
+            await self.send_event({
+                "type": "intervention_audio_chunk", "delivery_id": package.delivery_id,
+                "chunk_index": chunk_index, "sample_offset": sample_offset,
+                "sample_rate_hz": sample_rate, "audio_mime_type": "audio/pcm",
+                "audio_base64": base64.b64encode(pcm).decode("ascii"),
+            })
+            chunk_index += 1
+            sample_offset += len(pcm) // 2
+
         try:
+            synthesis = (
+                stream_method(package.voice_prompt.message, on_chunk=forward_chunk)
+                if streaming else self.voice_synthesizer.synthesize(package.voice_prompt.message)
+            )
             voice = await asyncio.wait_for(
-                self.voice_synthesizer.synthesize(package.voice_prompt.message),
+                synthesis,
                 timeout=self.config.voice_synthesis_timeout_seconds,
             )
             wav = pcm16_wav_bytes(voice.pcm_audio, voice.sample_rate_hz)
             audio_base64 = base64.b64encode(wav).decode("ascii")
             audio_mime_type = "audio/wav"
             voice_output_identifier = voice.output_identifier
-        except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+        except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
             voice_error = str(exc)
+        finally:
+            stream_open = False
         await self.send_event(
             {
                 "type": "intervention_voice",
@@ -1401,6 +1485,11 @@ class RealtimeSession:
                 "audio_mime_type": audio_mime_type,
                 "audio_base64": audio_base64,
                 "voice_error": voice_error,
+                "voice_streaming": streaming,
+                "audio_sample_count": len(voice.pcm_audio) // 2 if voice else sample_offset,
+                "sample_rate_hz": voice.sample_rate_hz if voice else None,
+                "first_audio_latency_ms": voice.first_audio_latency_ms if voice else None,
+                "total_synthesis_latency_ms": voice.total_latency_ms if voice else None,
             }
         )
 
@@ -1577,6 +1666,9 @@ class RealtimeSession:
                 "recorded_at_ms": report.recorded_at_ms,
                 "visual_status": report.visual.status.value,
                 "voice_status": report.voice.status.value,
+                "visual_started_at_ms": report.visual.started_at_ms,
+                "voice_started_at_ms": report.voice.started_at_ms,
+                "voice_completed_at_ms": report.voice.completed_at_ms,
                 "post_intervention_observation_armed": (
                     delivered
                     and self._post_response_not_before_ms is not None
@@ -2035,3 +2127,7 @@ class RealtimeSession:
         if self._late_result_tasks:
             await asyncio.gather(*self._late_result_tasks, return_exceptions=True)
         self.window.clear()
+        for resource in (self.recognizer, self._text_chat_provider):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
