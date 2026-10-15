@@ -153,3 +153,68 @@ async def _exercise_baseline_runtime() -> None:
     timing = next(event for event in events if event["type"] == "analysis_stage_timing")
     assert timing["condition"] == "baseline"
     assert timing["judgment_latency_ms"] >= 0
+
+
+def test_tts_failure_does_not_lock_later_baseline_interventions() -> None:
+    async def exercise() -> None:
+        events = []
+
+        class BrokenVoice:
+            calls = 0
+
+            async def synthesize(self, text):
+                self.calls += 1
+                raise ConnectionError("remote host lost")
+
+        voice = BrokenVoice()
+        session = None
+
+        async def send(event):
+            events.append(event)
+            if event["type"] == "intervention":
+                await session.handle_control(
+                    {
+                        "type": "delivery_visual",
+                        "delivery_id": event["delivery_id"],
+                        "started_at_ms": event["prepared_at_ms"],
+                    }
+                )
+
+        provider = _Provider(
+            [
+                '{"action":"intervene","target_actor":"both",'
+                '"message":"先轮流说一句，再一起继续。","reason":"交流受阻","confidence":"high"}'
+            ]
+            * 2
+        )
+        session = RealtimeSession(
+            session_id="baseline-runtime",
+            recognizer=_ObservationOnlyRecognizer(),
+            send_event=send,
+            config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
+            text_chat_provider=provider,
+            voice_synthesizer=voice,
+        )
+        session.set_experiment_condition("baseline")
+        await session.start()
+        for sequence, end_ms in enumerate((10000, 150000), 1):
+            observation = _observation(end_ms)
+            session._latest_media_timestamp_ms = end_ms
+            decision = session.baseline_generator.generate(
+                observation=observation, sequence=sequence, task_context=None, recent_messages=[]
+            )
+            await session._apply_baseline_decision(
+                snapshot=observation.window, decision=decision, recognition_observation=observation
+            )
+            assert session.pending_delivery is None
+        assert voice.calls == 4  # One fresh-connection retry for each prompt.
+        assert sum(e["type"] == "intervention" for e in events) == 2
+        assert not any(e.get("reason") == "baseline_delivery_pending" for e in events)
+        reports = [e for e in events if e["type"] == "delivery_execution_received"]
+        assert all(
+            e["visual_status"] == "delivered" and e["voice_status"] == "failed" for e in reports
+        )
+        assert len(reports) == 2
+        await session.stop("completed")
+
+    asyncio.run(exercise())

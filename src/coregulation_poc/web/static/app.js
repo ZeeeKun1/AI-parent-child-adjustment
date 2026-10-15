@@ -7,7 +7,7 @@ const RECONNECT_DELAY_MS = 2000;
 const SOCKET_HEARTBEAT_MS = 15000;
 const OFFLINE_MEDIA_BUFFER_MS = 12000;
 const OFFLINE_MEDIA_BUFFER_BYTES = 8 * 1024 * 1024;
-const VOICE_DELIVERY_TIMEOUT_MS = 12000;
+const VOICE_DELIVERY_TIMEOUT_MS = 22000;
 const RECORDING_TIMESLICE_MS = 10000;
 const RECORDING_UPLOAD_TIMEOUT_MS = 15000;
 const RECORDING_STOP_WAIT_MS = 60000;
@@ -98,12 +98,15 @@ let mediaStream = null;
 let audioContext = null;
 let audioNode = null;
 let muteNode = null;
+let capturePipeline = null;
+let mediaGeneration = 0;
 let imageTimer = null;
 let elapsedTimer = null;
 let captureHealthTimer = null;
 let startedAt = 0;
 let captureActive = false;
 let stopping = false;
+let captureStarting = false;
 let nextAudioTimestampMs = 0;
 let audioCount = 0;
 let imageCount = 0;
@@ -126,6 +129,14 @@ let lastAudioChunkAt = 0;
 let lastImageFrameAt = 0;
 let cameraHealthFailureCount = 0;
 let microphoneHealthFailureCount = 0;
+const selectedDevices = { audioinput: "", videoinput: "" };
+let lastNonzeroAudioAt = 0;
+let zeroAudioSince = 0;
+let lastVideoDecodedAt = 0;
+let videoFrameRequest = null;
+let captureRecoveryBusy = false;
+let captureRecoveryAttempts = 0;
+let nextCaptureRecoveryAt = 0;
 let sessionAccessToken = null;
 const selectedRoles = { parent: null, child: null };
 let selectedCondition = null;
@@ -144,6 +155,7 @@ let activeAdmissionToken = null;
 let pendingDeliveryExecution = null;
 const completedDeliveryIds = new Set();
 const pendingDeliveryReceipts = new Map();
+const pendingVisualReceipts = new Map();
 let sessionMediaRecorder = null;
 let recordingMimeType = "";
 let recordingSequence = 0;
@@ -502,6 +514,47 @@ function stopCheckedMediaStream() {
   elements.devicePreview.dataset.active = "false";
 }
 
+async function refreshInputDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    for (const kind of ["audioinput", "videoinput"]) {
+      const available = devices.filter((device) => device.kind === kind);
+      if (selectedDevices[kind] && !available.some((device) => device.deviceId === selectedDevices[kind])) {
+        selectedDevices[kind] = "";
+      }
+      document.querySelectorAll(`select[data-input-kind="${kind}"]`).forEach((select) => {
+        select.replaceChildren(new Option("系统默认", ""));
+        available.forEach((device, index) => {
+          select.add(new Option(device.label || `${kind === "audioinput" ? "麦克风" : "摄像头"} ${index + 1}`, device.deviceId));
+        });
+        select.value = selectedDevices[kind];
+      });
+    }
+  } catch (error) {
+    console.warn("[capture] cannot list devices:", error.name);
+  }
+}
+
+function acquireCaptureMedia(video = false) {
+  return CaptureSupport.acquire({ audio: true, video,
+    audioDevice: selectedDevices.audioinput, videoDevice: selectedDevices.videoinput });
+}
+
+function watchVideoFrames() {
+  if (videoFrameRequest !== null && elements.video.cancelVideoFrameCallback) {
+    elements.video.cancelVideoFrameCallback(videoFrameRequest);
+  }
+  videoFrameRequest = null;
+  lastVideoDecodedAt = performance.now();
+  if (!elements.video.requestVideoFrameCallback) return;
+  const frame = () => {
+    lastVideoDecodedAt = performance.now();
+    videoFrameRequest = elements.video.requestVideoFrameCallback(frame);
+  };
+  videoFrameRequest = elements.video.requestVideoFrameCallback(frame);
+}
+
 function resetDeviceCheck(message = "请检查摄像头和麦克风。") {
   stopCheckedMediaStream();
   setDeviceHealth("camera", "unchecked");
@@ -528,47 +581,30 @@ function waitForVideoReady(video, timeoutMs = 5000) {
   });
 }
 
-async function verifyMicrophoneStream(stream, timeoutMs = 4000) {
-  let context = null;
-  let source = null;
-  let node = null;
-  let mute = null;
+async function verifyMicrophoneStream(stream, timeoutMs = 8000, suppliedContext = null) {
+  const context = suppliedContext || CaptureSupport.createContext();
+  let pipeline = null;
+  let signalResolve;
+  const signal = new Promise((resolve) => { signalResolve = resolve; });
+  let timeout;
   try {
-    context = new AudioContext();
-    if (context.state === "suspended") await context.resume();
-    await context.audioWorklet.addModule("/static/audio-worklet.js");
-    source = context.createMediaStreamSource(stream);
-    node = new AudioWorkletNode(context, "pcm16-chunk-processor", {
-      processorOptions: { targetSampleRate: 16000, chunkSamples: 1600 },
+    pipeline = await CaptureSupport.createPcmCapture(stream, context, {
+      onChunk: (_buffer, levels) => {
+        if (CaptureSupport.trackAvailable(stream.getAudioTracks()[0]) && levels.rms >= 0.0035) signalResolve();
+      },
     });
-    mute = context.createGain();
-    mute.gain.value = 0;
-    source.connect(node).connect(mute).connect(context.destination);
-    await new Promise((resolve, reject) => {
-      const timeout = window.setTimeout(
-        () => reject(new Error("没有收到麦克风数据")),
-        timeoutMs,
-      );
-      node.port.onmessage = (event) => {
-        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
-        window.clearTimeout(timeout);
-        resolve();
-      };
-    });
+    await Promise.race([signal, new Promise((_, reject) => {
+      timeout = window.setTimeout(() => reject(new Error("没有检测到清晰声音。请说一句话；若仍无反应，请切换麦克风或检查飞书占用。")), timeoutMs);
+    })]);
   } finally {
-    if (node) node.disconnect();
-    if (source) source.disconnect();
-    if (mute) mute.disconnect();
-    if (context) await context.close();
+    window.clearTimeout(timeout);
+    pipeline?.disconnect();
+    if (!suppliedContext) await context.close();
   }
 }
 
 function deviceAccessMessage(error) {
-  if (!(error instanceof Error)) return "设备检查失败，请重试。";
-  if (error.name === "NotAllowedError") return "没有获得摄像头或麦克风权限。";
-  if (error.name === "NotFoundError") return "没有找到可用的摄像头或麦克风。";
-  if (error.name === "NotReadableError") return "设备可能正被其他程序使用。";
-  return error.message || "设备检查失败，请重试。";
+  return error?.device ? error.message : CaptureSupport.accessMessage(error);
 }
 
 async function checkDevices() {
@@ -581,28 +617,27 @@ async function checkDevices() {
     return;
   }
   deviceCheckBusy = true;
+  let checkContext = null;
   stopCheckedMediaStream();
   setDeviceHealth("camera", "checking");
   setDeviceHealth("microphone", "checking");
-  elements.deviceCheckFeedback.textContent = "正在检查画面和声音…";
+  elements.deviceCheckFeedback.textContent = "正在检查画面，请对麦克风说一句话。";
   updateStartButton();
   try {
-    checkedMediaStream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-      audio: {
-        channelCount: { ideal: 1 },
-        echoCancellation: { ideal: false },
-        noiseSuppression: { ideal: false },
-        autoGainControl: { ideal: false },
-      },
-    });
+    checkContext = CaptureSupport.createContext();
+    const resumed = CaptureSupport.resumeContext(checkContext);
+    resumed.catch(() => {});
+    checkedMediaStream = await acquireCaptureMedia(true);
+    await resumed;
+    await refreshInputDevices();
     elements.video.srcObject = checkedMediaStream;
     await elements.video.play();
     await waitForVideoReady(elements.video);
+    watchVideoFrames();
     setDeviceHealth("camera", "ok");
     elements.devicePreview.dataset.active = "true";
     try {
-      await verifyMicrophoneStream(checkedMediaStream);
+      await verifyMicrophoneStream(checkedMediaStream, 8000, checkContext);
       setDeviceHealth("microphone", "ok");
     } catch (error) {
       setDeviceHealth("microphone", "error");
@@ -612,11 +647,12 @@ async function checkDevices() {
       elements.deviceCheckFeedback.textContent = "摄像头和麦克风都正常，请在画面中确认双方都在采集范围内。";
     }
   } catch (error) {
-    setDeviceHealth("camera", "error");
-    setDeviceHealth("microphone", "error");
+    setDeviceHealth("camera", error.device === "microphone" ? "unchecked" : "error");
+    setDeviceHealth("microphone", error.device === "camera" ? "unchecked" : "error");
     stopCheckedMediaStream();
     elements.deviceCheckFeedback.textContent = deviceAccessMessage(error);
   } finally {
+    if (checkContext) await checkContext.close().catch(() => {});
     deviceCheckBusy = false;
     updateStartButton();
   }
@@ -772,7 +808,7 @@ async function openCaptureSocket(studyContext, admissionToken, reconnectIndex = 
       media_devices: Boolean(navigator.mediaDevices),
       media_recorder: Boolean(window.MediaRecorder),
       secure_context: window.isSecureContext,
-      page_version: "0.9.0",
+      page_version: "0.9.1-reliability-20261016",
       pcm_streaming: typeof PcmInterventionPlayer !== "undefined" && Boolean(window.AudioContext),
     },
   }));
@@ -948,7 +984,7 @@ function updateStartButton() {
     && elements.taskDifficulty.value
   );
   const deviceReady = devicesReady();
-  elements.start.disabled = !(
+  elements.start.disabled = captureStarting || !(
     conditionReady
     && informationReady
     && taskReady
@@ -1056,17 +1092,6 @@ async function recordBindingAudio(speaker) {
   if (deviceHealth.camera !== "unchecked" || deviceHealth.microphone !== "unchecked") {
     resetDeviceCheck("声音录制已更新，完成后请重新检查设备。");
   }
-  let admissionToken;
-  try {
-    admissionToken = await ensureSessionAdmission();
-  } catch (error) {
-    elements.bindingFeedback.textContent = error instanceof Error
-      ? error.message
-      : "暂时无法建立本次会话，请刷新页面后重试。";
-    return;
-  }
-  if (!admissionToken) return;
-
   bindingBusy = true;
 
   const person = elements.bindingPeople.find((p) => p.dataset.speaker === speaker);
@@ -1080,39 +1105,24 @@ async function recordBindingAudio(speaker) {
 
   let bindingStream = null;
   let bindingContext = null;
-  let bindingNode = null;
-  let muteGain = null;
+  let bindingPipeline = null;
   let progressTimer = null;
   const chunks = [];
   const hadBinding = bindingState[speaker];
 
   try {
-    bindingStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: { ideal: 1 },
-        echoCancellation: { ideal: false },
-        noiseSuppression: { ideal: false },
-        autoGainControl: { ideal: false },
-      },
+    // Resume during the click gesture; all three capture stages use the native device rate.
+    bindingContext = CaptureSupport.createContext();
+    const resumed = CaptureSupport.resumeContext(bindingContext);
+    resumed.catch(() => {});
+    const admissionToken = await ensureSessionAdmission();
+    if (!admissionToken) return;
+    bindingStream = await acquireCaptureMedia();
+    await resumed;
+    await refreshInputDevices();
+    bindingPipeline = await CaptureSupport.createPcmCapture(bindingStream, bindingContext, {
+      onChunk: (buffer) => chunks.push(new Uint8Array(buffer)),
     });
-
-    bindingContext = new AudioContext({ sampleRate: 16000 });
-    if (bindingContext.state === "suspended") await bindingContext.resume();
-    await bindingContext.audioWorklet.addModule("/static/audio-worklet.js");
-    const source = bindingContext.createMediaStreamSource(bindingStream);
-    bindingNode = new AudioWorkletNode(bindingContext, "pcm16-chunk-processor", {
-      processorOptions: {
-        targetSampleRate: 16000,
-        chunkSamples: 1600,
-      },
-    });
-    muteGain = bindingContext.createGain();
-    muteGain.gain.value = 0;
-    source.connect(bindingNode).connect(muteGain).connect(bindingContext.destination);
-
-    bindingNode.port.onmessage = (event) => {
-      chunks.push(new Uint8Array(event.data));
-    };
 
     const recordStart = performance.now();
     progressTimer = window.setInterval(() => {
@@ -1126,9 +1136,12 @@ async function recordBindingAudio(speaker) {
     progressTimer = null;
     if (progressBar) progressBar.style.width = "100%";
 
-    bindingNode.disconnect();
-    source.disconnect();
-    if (muteGain) muteGain.disconnect();
+    bindingPipeline.disconnect();
+    bindingPipeline = null;
+    bindingStream.getTracks().forEach((track) => track.stop());
+    bindingStream = null;
+    await bindingContext.close();
+    bindingContext = null;
     if (statusSpan) statusSpan.textContent = "正在确认…";
     if (button) button.textContent = "正在确认…";
     elements.bindingFeedback.textContent = "录音完成，正在确认声音。";
@@ -1139,6 +1152,12 @@ async function recordBindingAudio(speaker) {
     for (const chunk of chunks) {
       combined.set(chunk, offset);
       offset += chunk.length;
+    }
+    if (combined.byteLength < 3 * 16000 * 2) {
+      throw new Error("录音未完整采集，请回到网页，检查飞书占用后重新录制。");
+    }
+    if (CaptureSupport.pcmLevels(combined.buffer).rms < 120 / 32768) {
+      throw new Error("没有检测到清晰语音，请切换麦克风或检查占用后重新录制。");
     }
 
     const sessionId = elements.session.textContent;
@@ -1196,7 +1215,7 @@ async function recordBindingAudio(speaker) {
     const timedOut = error && typeof error === "object" && error.name === "AbortError";
     const errorMsg = timedOut
       ? "声音确认超时，请重新录制。"
-      : (error instanceof Error ? error.message : "录制失败，请重试。");
+      : deviceAccessMessage(error);
     elements.bindingFeedback.textContent = errorMsg;
     if (button) {
       const roleLabel = selectedRoles[speaker]?.label || (speaker === "parent" ? "家长" : "孩子");
@@ -1204,9 +1223,8 @@ async function recordBindingAudio(speaker) {
     }
   } finally {
     if (progressTimer !== null) window.clearInterval(progressTimer);
-    if (bindingNode) bindingNode.disconnect();
-    if (muteGain) muteGain.disconnect();
-    if (bindingContext) void bindingContext.close();
+    bindingPipeline?.disconnect();
+    if (bindingContext) await bindingContext.close().catch(() => {});
     if (bindingStream) bindingStream.getTracks().forEach((track) => track.stop());
     if (progressBar) window.setTimeout(() => { progressBar.style.width = ""; }, 600);
     bindingBusy = false;
@@ -1322,8 +1340,17 @@ async function presentIntervention(message) {
   elements.difficultyOptions.hidden = !["task_support", "needs_clarification", "task_pacing"].includes(message.repair_target);
   elements.interventionChannel.textContent = (message.voice_expected && voiceEnabled) ? "正在同步播放语音" : "你们可以忽略或关闭这条提示";
   elements.intervention.hidden = false;
+  pendingVisualReceipts.set(message.delivery_id, {
+    type: "delivery_visual", delivery_id: message.delivery_id, started_at_ms: visualStartedAtMs,
+  });
+  while (pendingVisualReceipts.size > 64) pendingVisualReceipts.delete(pendingVisualReceipts.keys().next().value);
+  flushDeliveryReceipts();
 
   if (message.voice_pending && voiceEnabled) {
+    if (pendingDeliveryExecution) {
+      sendDeliveryExecution(pendingDeliveryExecution.deliveryId, pendingDeliveryExecution.visualStartedAtMs,
+        { status: "failed", error: "新的提示已出现，旧语音确认未完成" });
+    }
     clearPendingDeliveryExecution();
     pendingDeliveryExecution = {
       deliveryId: message.delivery_id,
@@ -1387,7 +1414,7 @@ function sendDeliveryExecution(deliveryId, visualStartedAtMs, voice) {
 
 function flushDeliveryReceipts() {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  for (const receipt of pendingDeliveryReceipts.values()) {
+  for (const receipt of [...pendingVisualReceipts.values(), ...pendingDeliveryReceipts.values()]) {
     try { socket.send(JSON.stringify(receipt)); } catch (_) { break; }
   }
 }
@@ -1423,8 +1450,11 @@ function handleServerMessage(event) {
   } else if (message.type === "intervention_audio_chunk") {
     const pending = pendingDeliveryExecution;
     if (pending?.deliveryId === message.delivery_id && voiceEnabled) pending.player?.append(message);
+  } else if (message.type === "delivery_visual_received") {
+    pendingVisualReceipts.delete(message.delivery_id);
   } else if (["delivery_execution_received", "delivery_execution_ignored"].includes(message.type)) {
     pendingDeliveryReceipts.delete(message.delivery_id);
+    pendingVisualReceipts.delete(message.delivery_id);
   } else if (message.type === "interventions_paused") {
     interventionsPaused = true;
     updateInterventionPauseControl();
@@ -1626,7 +1656,13 @@ function waitForFirstAudioChunk(timeoutMs = 4000) {
 }
 
 function monitorCaptureHealth() {
-  if (!captureActive || !mediaStream) return;
+  if (!captureActive || captureRecoveryBusy) return;
+  if (!mediaStream) {
+    setDeviceHealth("camera", "error", "device_reconnect_failed", true);
+    setDeviceHealth("microphone", "error", "device_reconnect_failed", true);
+    if (!document.hidden && performance.now() >= nextCaptureRecoveryAt && captureRecoveryAttempts < 2) void recoverCaptureDevices();
+    return;
+  }
   const now = performance.now();
   const videoTrack = mediaStream.getVideoTracks()[0];
   const audioTrack = mediaStream.getAudioTracks()[0];
@@ -1635,14 +1671,14 @@ function monitorCaptureHealth() {
     Number(negotiated?.media_format?.image_interval_ms || 1000) * 3,
   );
   const cameraOkay = Boolean(
-    videoTrack
-    && videoTrack.readyState === "live"
+    CaptureSupport.trackAvailable(videoTrack)
     && lastImageFrameAt > 0
     && now - lastImageFrameAt <= imageStaleMs
+    && now - lastVideoDecodedAt <= imageStaleMs
   );
   const microphoneOkay = Boolean(
-    audioTrack
-    && audioTrack.readyState === "live"
+    CaptureSupport.trackAvailable(audioTrack)
+    && audioContext?.state === "running"
     && lastAudioChunkAt > 0
     && now - lastAudioChunkAt <= 5000
   );
@@ -1665,69 +1701,141 @@ function monitorCaptureHealth() {
       !microphoneOkay ? "麦克风" : null,
     ].filter(Boolean).join("和");
     setStatus(`${failed}采集不正常，请检查设备或联系研究人员。`, "error");
+    document.querySelector("#recover-devices-button").hidden = false;
+    if (!document.hidden && now >= nextCaptureRecoveryAt && captureRecoveryAttempts < 2) {
+      void recoverCaptureDevices();
+    }
   } else if (hadError) {
     setStatus("摄像头和麦克风已恢复正常。", "success");
+    document.querySelector("#recover-devices-button").hidden = true;
+    captureRecoveryAttempts = 0;
+  } else if (zeroAudioSince && now - zeroAudioSince > 30000) {
+    // Ordinary thinking silence is valid. Only ask for a check; do not abort or change state rules.
+    setStatus("暂未检测到声音。若正在交谈，请检查麦克风选择或飞书占用。", "warning");
+    document.querySelector("#recover-devices-button").hidden = false;
+  } else if (lastNonzeroAudioAt && now - lastNonzeroAudioAt < 3000) {
+    document.querySelector("#recover-devices-button").hidden = true;
+  }
+}
+
+async function recoverCaptureDevices(manual = false) {
+  if (!captureActive || stopping || captureRecoveryBusy) return;
+  captureRecoveryBusy = true;
+  captureRecoveryAttempts += 1;
+  nextCaptureRecoveryAt = performance.now() + 10000;
+  const button = document.querySelector("#recover-devices-button");
+  button.disabled = true;
+  try {
+    // A call may suspend Web Audio without ending the mic track. Resume before reopening devices.
+    if (audioContext && audioContext.state !== "closed") {
+      await CaptureSupport.resumeContext(audioContext).catch(() => {});
+    }
+    if (!manual && mediaStream?.getTracks().every(CaptureSupport.trackAvailable)
+      && audioContext?.state === "running" && performance.now() - lastAudioChunkAt < 5000
+      && performance.now() - lastVideoDecodedAt < 10000) return;
+    setStatus("正在恢复摄像头和麦克风…", "working");
+    await stopSessionRecording(false);
+    capturePipeline?.disconnect();
+    capturePipeline = null;
+    mediaStream?.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+    if (!audioContext || audioContext.state === "closed") audioContext = CaptureSupport.createContext();
+    nextAudioTimestampMs = Math.max(nextAudioTimestampMs, sessionTimestampMs());
+    await prepareMedia();
+    if (stopping || !captureActive) return;
+    startSessionRecording(false);
+    await captureImage();
+    setStatus("设备已重新连接，正在确认采集。", "working");
+  } catch (error) {
+    // Failed initialization must not leave another device owner behind for the next retry.
+    capturePipeline?.disconnect();
+    capturePipeline = null;
+    mediaStream?.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+    if (audioContext) await audioContext.close().catch(() => {});
+    audioContext = null;
+    setStatus(deviceAccessMessage(error), "error");
+    button.hidden = false;
+  } finally {
+    button.disabled = false;
+    captureRecoveryBusy = false;
   }
 }
 
 async function prepareMedia() {
+  const generation = mediaGeneration;
   const checkedTracksAreLive = Boolean(
     checkedMediaStream
-    && checkedMediaStream.getVideoTracks().some((track) => track.readyState === "live")
-    && checkedMediaStream.getAudioTracks().some((track) => track.readyState === "live")
+    && checkedMediaStream.getVideoTracks().some(CaptureSupport.trackAvailable)
+    && checkedMediaStream.getAudioTracks().some(CaptureSupport.trackAvailable)
   );
   if (checkedTracksAreLive) {
     mediaStream = checkedMediaStream;
     checkedMediaStream = null;
   } else {
     stopCheckedMediaStream();
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { ideal: negotiated.media_format.image_max_width },
-        height: { ideal: negotiated.media_format.image_max_height },
-        facingMode: "user",
-      },
-      audio: {
-        channelCount: { ideal: 1 },
-        echoCancellation: { ideal: false },
-        noiseSuppression: { ideal: false },
-        autoGainControl: { ideal: false },
-      },
-    });
+    const stream = await acquireCaptureMedia(true);
+    if (generation !== mediaGeneration) {
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error("设备采集已结束。");
+    }
+    mediaStream = stream;
   }
   elements.video.srcObject = mediaStream;
   await elements.video.play();
   await waitForVideoReady(elements.video);
+  watchVideoFrames();
   elements.cameraEmpty.hidden = true;
 
-  audioContext = new AudioContext();
-  if (audioContext.state === "suspended") await audioContext.resume();
-  await audioContext.audioWorklet.addModule("/static/audio-worklet.js");
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  audioNode = new AudioWorkletNode(audioContext, "pcm16-chunk-processor", {
-    processorOptions: {
-      targetSampleRate: negotiated.media_format.audio_sample_rate,
-      chunkSamples: negotiated.media_format.audio_chunk_bytes / 2,
+  if (!audioContext || audioContext.state === "closed") audioContext = CaptureSupport.createContext();
+  const captureStream = mediaStream;
+  const pipeline = await CaptureSupport.createPcmCapture(captureStream, audioContext, {
+    targetSampleRate: negotiated.media_format.audio_sample_rate,
+    chunkSamples: negotiated.media_format.audio_chunk_bytes / 2,
+    onChunk: (buffer, levels) => {
+      if (generation !== mediaGeneration || !CaptureSupport.trackAvailable(captureStream.getAudioTracks()[0])) return;
+      lastAudioChunkAt = performance.now();
+      if (levels.peak > 0) { lastNonzeroAudioAt = lastAudioChunkAt; zeroAudioSince = 0; }
+      else if (!zeroAudioSince) zeroAudioSince = lastAudioChunkAt;
+      const timestampMs = nextAudioTimestampMs;
+      nextAudioTimestampMs += negotiated.media_format.audio_chunk_ms;
+      if (!captureActive) return;
+      sendOrBufferMedia("audio", timestampMs, encodePacket(AUDIO_PACKET, timestampMs, buffer));
     },
   });
-  muteNode = audioContext.createGain();
-  muteNode.gain.value = 0;
-  source.connect(audioNode).connect(muteNode).connect(audioContext.destination);
-  audioNode.port.onmessage = (event) => {
-    lastAudioChunkAt = performance.now();
-    const timestampMs = nextAudioTimestampMs;
-    nextAudioTimestampMs += negotiated.media_format.audio_chunk_ms;
-    if (!captureActive) return;
-    sendOrBufferMedia(
-      "audio",
-      timestampMs,
-      encodePacket(AUDIO_PACKET, timestampMs, event.data),
-    );
+  if (generation !== mediaGeneration) {
+    pipeline.disconnect();
+    captureStream.getTracks().forEach((track) => track.stop());
+    throw new Error("设备采集已结束。");
+  }
+  capturePipeline = pipeline;
+  audioNode = capturePipeline.node;
+  muteNode = capturePipeline.mute;
+  mediaStream.getTracks().forEach((track) => {
+    track.addEventListener("mute", monitorCaptureHealth);
+    track.addEventListener("unmute", () => {
+      if (captureActive && track.kind === "audio") nextAudioTimestampMs = Math.max(nextAudioTimestampMs, sessionTimestampMs());
+      monitorCaptureHealth();
+    });
+    track.addEventListener("ended", monitorCaptureHealth);
+  });
+  audioContext.onstatechange = () => {
+    if (captureActive && audioContext?.state === "running" && performance.now() - lastAudioChunkAt > 500) {
+      nextAudioTimestampMs = Math.max(nextAudioTimestampMs, sessionTimestampMs());
+    }
   };
 }
 
 async function captureImage() {
-  if (!captureActive || imageCaptureBusy) return false;
+  if (!captureActive || imageCaptureBusy || !CaptureSupport.trackAvailable(mediaStream?.getVideoTracks()[0])) return false;
+  if (!elements.video.requestVideoFrameCallback) {
+    const marker = elements.video.getVideoPlaybackQuality?.().totalVideoFrames ?? elements.video.currentTime;
+    if (marker !== captureImage.lastFrameMarker) {
+      captureImage.lastFrameMarker = marker;
+      lastVideoDecodedAt = performance.now();
+    }
+  }
+  if (performance.now() - lastVideoDecodedAt > 10000) return false;
   const sourceWidth = elements.video.videoWidth;
   const sourceHeight = elements.video.videoHeight;
   if (!sourceWidth || !sourceHeight) return false;
@@ -1793,7 +1901,7 @@ function wait(milliseconds) {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function uploadRecordingChunk({ sequence, startMs, endMs, blob, sessionId, token }) {
+async function uploadRecordingChunk({ sequence, startMs, endMs, blob, sessionId, token, segmentStart = 0 }) {
   let lastError = null;
   for (const retryDelay of RECORDING_RETRY_DELAYS_MS) {
     if (retryDelay) await wait(retryDelay);
@@ -1812,6 +1920,7 @@ async function uploadRecordingChunk({ sequence, startMs, endMs, blob, sessionId,
             "X-Study-Access-Token": token,
             "X-Media-Start-Ms": String(startMs),
             "X-Media-End-Ms": String(endMs),
+            "X-Recording-Segment-Start": String(segmentStart),
           },
           body: blob,
           signal: controller.signal,
@@ -1839,12 +1948,12 @@ async function uploadRecordingChunk({ sequence, startMs, endMs, blob, sessionId,
   throw lastError || new Error("录制片段上传失败");
 }
 
-function queueRecordingChunk(blob, startMs, endMs) {
+function queueRecordingChunk(blob, startMs, endMs, segmentStart = 0) {
   const sequence = recordingSequence;
   recordingSequence += 1;
   const sessionId = elements.session.textContent;
   const token = activeAdmissionToken || sessionAccessToken;
-  const pendingChunk = { sequence, startMs, endMs, blob, sessionId, token };
+  const pendingChunk = { sequence, startMs, endMs, blob, sessionId, token, segmentStart };
   recordingPendingUploads += 1;
   recordingUploadChain = recordingUploadChain
     .then(() => uploadRecordingChunk(pendingChunk))
@@ -1878,8 +1987,8 @@ async function retryFailedRecordingChunks() {
   }
 }
 
-function startSessionRecording() {
-  resetSessionRecordingState();
+function startSessionRecording(reset = true) {
+  if (reset) resetSessionRecordingState();
   if (!negotiated?.session_media_retention_enabled) return;
   if (!window.MediaRecorder || !mediaStream) {
     throw new Error("当前浏览器不支持实验音视频记录，请使用最新版 Chrome 或 Edge。");
@@ -1904,10 +2013,11 @@ function startSessionRecording() {
   }
 
   recordingLastChunkEndMs = sessionTimestampMs();
+  const segmentStart = recordingSequence;
   sessionMediaRecorder.addEventListener("dataavailable", (event) => {
     if (!event.data || event.data.size === 0) return;
     const endMs = Math.max(recordingLastChunkEndMs, sessionTimestampMs());
-    queueRecordingChunk(event.data, recordingLastChunkEndMs, endMs);
+    queueRecordingChunk(event.data, recordingLastChunkEndMs, endMs, segmentStart);
     recordingLastChunkEndMs = endMs;
   });
   sessionMediaRecorder.addEventListener("error", (event) => {
@@ -1920,7 +2030,7 @@ function startSessionRecording() {
   sessionMediaRecorder.start(RECORDING_TIMESLICE_MS);
 }
 
-async function stopSessionRecording() {
+async function stopSessionRecording(waitForUploads = true) {
   const recorder = sessionMediaRecorder;
   if (recorder && recorder.state !== "inactive") {
     await Promise.race([
@@ -1937,6 +2047,7 @@ async function stopSessionRecording() {
     ]);
   }
   sessionMediaRecorder = null;
+  if (!waitForUploads) return;
   try {
     await Promise.race([
       recordingUploadChain.then(() => retryFailedRecordingChunks()),
@@ -1964,18 +2075,22 @@ function haltCaptureLoops() {
 }
 
 function releaseMedia() {
+  mediaGeneration += 1;
   haltCaptureLoops();
   if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
   reconnectTimer = null;
   reconnecting = false;
-  if (audioNode) audioNode.disconnect();
-  if (muteNode) muteNode.disconnect();
+  capturePipeline?.disconnect();
+  capturePipeline = null;
   audioNode = null;
   muteNode = null;
-  if (audioContext) void audioContext.close();
+  if (audioContext) void audioContext.close().catch(() => {});
   audioContext = null;
   if (mediaStream) mediaStream.getTracks().forEach((track) => track.stop());
   mediaStream = null;
+  if (videoFrameRequest !== null && elements.video.cancelVideoFrameCallback) elements.video.cancelVideoFrameCallback(videoFrameRequest);
+  videoFrameRequest = null;
+  document.querySelector("#device-preview").prepend(elements.video);
   elements.video.srcObject = null;
   elements.devicePreview.dataset.active = "false";
   elements.cameraEmpty.hidden = false;
@@ -1986,6 +2101,7 @@ function releaseMedia() {
 }
 
 async function startCapture() {
+  if (captureStarting || captureActive) return;
   const studyContext = readStudyContext();
   if (!studyContext) return;
   if (!selectedRoles.parent || !selectedRoles.child) {
@@ -2010,19 +2126,36 @@ async function startCapture() {
     window.alert("请通过 HTTPS 或服务器本机 localhost 打开页面。");
     return;
   }
+  captureStarting = true;
+  updateStartButton();
   let admissionToken;
   try {
+    audioContext = CaptureSupport.createContext();
+    const resumed = CaptureSupport.resumeContext(audioContext);
+    resumed.catch(() => {});
     admissionToken = await ensureSessionAdmission();
+    await resumed;
   } catch (error) {
+    if (audioContext) await audioContext.close().catch(() => {});
+    audioContext = null;
+    captureStarting = false;
+    updateStartButton();
     window.alert(error instanceof Error ? error.message : "暂时无法开始，请刷新页面后重试。");
     return;
   }
-  if (!admissionToken) return;
+  if (!admissionToken) {
+    if (audioContext) await audioContext.close().catch(() => {});
+    audioContext = null;
+    captureStarting = false;
+    updateStartButton();
+    return;
+  }
 
   // A new round must not inherit playback receipts; reconnects bypass this path.
   clearPendingDeliveryExecution();
   completedDeliveryIds.clear();
   pendingDeliveryReceipts.clear();
+  pendingVisualReceipts.clear();
 
   elements.start.disabled = true;
   latestSessionSummary = null;
@@ -2049,6 +2182,9 @@ async function startCapture() {
     audioBackpressureStops = 0;
     cameraHealthFailureCount = 0;
     microphoneHealthFailureCount = 0;
+    captureRecoveryAttempts = 0;
+    zeroAudioSince = 0;
+    lastNonzeroAudioAt = 0;
     lastAudioChunkAt = 0;
     lastImageFrameAt = 0;
     startSessionRecording();
@@ -2063,6 +2199,8 @@ async function startCapture() {
     setDeviceHealth("camera", "ok", "initial_capture_verified", true);
     setDeviceHealth("microphone", "ok", "initial_capture_verified", true);
     elements.startCard.hidden = true;
+    // Keep decoding active after the setup dialog is hidden.
+    document.querySelector("#capture-host").append(elements.video);
     elements.sessionControls.hidden = false;
     const runtimeControlsEnabled = Boolean(negotiated.runtime_controls_enabled);
     elements.pauseInterventions.disabled = !runtimeControlsEnabled;
@@ -2098,6 +2236,8 @@ async function startCapture() {
     if (socket && socket.readyState === WebSocket.OPEN) socket.close();
     updateStartButton();
     window.alert(error instanceof Error ? error.message : "暂时无法开始，请联系研究人员");
+  } finally {
+    captureStarting = false;
   }
 }
 
@@ -2404,6 +2544,28 @@ elements.consent.addEventListener("change", () => {
   persistPairedStudy();
 });
 elements.deviceCheckButton.addEventListener("click", () => void checkDevices());
+document.querySelector("#recover-devices-button").addEventListener("click", () => void recoverCaptureDevices(true));
+document.querySelectorAll("select[data-input-kind]").forEach((select) => {
+  select.addEventListener("change", () => {
+    if (captureActive || bindingBusy || deviceCheckBusy) return;
+    selectedDevices[select.dataset.inputKind] = select.value;
+    document.querySelectorAll(`select[data-input-kind="${select.dataset.inputKind}"]`).forEach((other) => { other.value = select.value; });
+    resetDeviceCheck("设备已更换，请重新检查画面和声音。");
+  });
+});
+document.querySelectorAll("[data-refresh-devices]").forEach((button) => {
+  button.addEventListener("click", () => void refreshInputDevices());
+});
+navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+  void refreshInputDevices();
+  monitorCaptureHealth();
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && captureActive) {
+    if (audioContext) void CaptureSupport.resumeContext(audioContext).catch(() => {});
+    monitorCaptureHealth();
+  }
+});
 elements.start.addEventListener("click", () => void startCapture());
 elements.wizardNext.addEventListener("click", nextStep);
 elements.wizardPrev.addEventListener("click", prevStep);
@@ -2486,6 +2648,7 @@ window.addEventListener("pagehide", () => {
   releaseMedia();
 });
 setPhase("setup");
+void refreshInputDevices();
 updateFamilyDisplay();
 updateConditionOptions();
 updateCounters();

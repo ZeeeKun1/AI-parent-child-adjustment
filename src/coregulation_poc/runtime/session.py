@@ -55,6 +55,7 @@ from coregulation_poc.models import (
     ModalityEvidence,
     StateAssessment,
 )
+from coregulation_poc.providers.qwen_tts_realtime import TTSServiceError
 from coregulation_poc.runtime.recognition import StateRecognizer, WindowObservation
 from coregulation_poc.runtime.window import MediaWindow, RollingMediaWindow
 
@@ -126,9 +127,7 @@ class _AnalysisJob:
 
     snapshot: MediaWindow
     observation_task: asyncio.Task[WindowObservation] | None
-    judgment_task: asyncio.Task[
-        tuple[WindowObservation, StateAssessment | BaselineDecision]
-    ] | None
+    judgment_task: asyncio.Task[tuple[WindowObservation, StateAssessment | BaselineDecision]] | None
     completed: asyncio.Future[None]
     scheduled_monotonic: float
     sequence: int
@@ -241,6 +240,8 @@ class RealtimeSession:
         self._recorded_message_delivery_ids: set[str] = set()
         self.assessment_history: list[StateAssessment] = []
         self.pending_delivery: DeliveryPackage | None = None
+        self._recent_deliveries: dict[str, dict[str, Any]] = {}
+        self._delivery_watchdogs: set[asyncio.Task[None]] = set()
         self._pending_plan: InterventionPlan | None = None
         self._baseline_pending_decision: BaselineDecision | None = None
         self._baseline_last_delivery_at_ms: int | None = None
@@ -259,9 +260,7 @@ class RealtimeSession:
         self._scheduled_assessment_count = 0
         self._analysis_queue: asyncio.Queue[_AnalysisJob | None] = asyncio.Queue()
         self._analysis_worker_task: asyncio.Task[None] | None = None
-        self._perception_semaphore = asyncio.Semaphore(
-            self.config.max_parallel_perception
-        )
+        self._perception_semaphore = asyncio.Semaphore(self.config.max_parallel_perception)
         self._perception_tasks: set[asyncio.Task[WindowObservation]] = set()
         self._judgment_semaphore = asyncio.Semaphore(self.config.max_parallel_judgment)
         self._judgment_tasks: set[
@@ -315,9 +314,7 @@ class RealtimeSession:
     def api_call_count(self) -> int:
         recognition_calls = int(getattr(self.recognizer, "api_call_count", self.assessment_count))
         if self._experiment_condition == "baseline":
-            return recognition_calls + int(
-                getattr(self.baseline_generator, "call_count", 0)
-            )
+            return recognition_calls + int(getattr(self.baseline_generator, "call_count", 0))
         message_calls = int(getattr(self.selector.message_generator, "call_count", 0))
         strategy_choice_calls = int(
             getattr(self.selector.strategy_choice_generator, "call_count", 0)
@@ -335,9 +332,7 @@ class RealtimeSession:
             "perception_inflight_count": sum(
                 1 for task in self._perception_tasks if not task.done()
             ),
-            "judgment_inflight_count": sum(
-                1 for task in self._judgment_tasks if not task.done()
-            ),
+            "judgment_inflight_count": sum(1 for task in self._judgment_tasks if not task.done()),
             "late_result_inflight_count": sum(
                 1 for task in self._late_result_tasks if not task.done()
             ),
@@ -358,9 +353,7 @@ class RealtimeSession:
             "analysis_error_count": self._analysis_error_count,
             "consecutive_analysis_error_count": self._consecutive_analysis_errors,
             "stale_intervention_count": self._stale_intervention_count,
-            "recent_intervention_message_count": len(
-                self._recent_intervention_messages
-            ),
+            "recent_intervention_message_count": len(self._recent_intervention_messages),
             "analysis_timeout_count": self._analysis_timeout_count,
             "analysis_capacity_skip_count": self._analysis_capacity_skip_count,
             "late_analysis_result_count": self._late_analysis_result_count,
@@ -398,11 +391,10 @@ class RealtimeSession:
                 "max_parallel_judgment": self.config.max_parallel_judgment,
                 "analysis_deadline_seconds": self.config.analysis_deadline_seconds,
                 "max_pending_analysis_jobs": self.config.max_pending_analysis_jobs,
-                "max_intervention_staleness_ms": (
-                    self.config.max_intervention_staleness_ms
-                ),
+                "max_intervention_staleness_ms": (self.config.max_intervention_staleness_ms),
                 "voice_enabled": self.config.voice_enabled,
                 "experiment_condition": self._experiment_condition,
+                "reliability_patch": "2026-10-16",
             }
         )
 
@@ -421,8 +413,7 @@ class RealtimeSession:
             return
         if (
             self.config.max_assessments_per_session > 0
-            and self._scheduled_assessment_count
-            >= self.config.max_assessments_per_session
+            and self._scheduled_assessment_count >= self.config.max_assessments_per_session
         ):
             return
         if self._last_scheduled_at_ms is None:
@@ -439,10 +430,7 @@ class RealtimeSession:
         snapshot = self.window.snapshot()
         if snapshot is None or not snapshot.has_both_modalities:
             raise ValueError("both audio and image media are required before analysis")
-        if (
-            self._last_scheduled_at_ms is not None
-            and snapshot.end_ms <= self._last_scheduled_at_ms
-        ):
+        if self._last_scheduled_at_ms is not None and snapshot.end_ms <= self._last_scheduled_at_ms:
             await self.wait_for_analysis()
             return
         completed = await self._schedule_analysis(snapshot)
@@ -464,9 +452,9 @@ class RealtimeSession:
         loop = asyncio.get_running_loop()
         completed: asyncio.Future[None] = loop.create_future()
         observation_task: asyncio.Task[WindowObservation] | None = None
-        judgment_task: asyncio.Task[
-            tuple[WindowObservation, StateAssessment | BaselineDecision]
-        ] | None = None
+        judgment_task: (
+            asyncio.Task[tuple[WindowObservation, StateAssessment | BaselineDecision]] | None
+        ) = None
         skip_reason: str | None = None
         if self._analysis_queue.qsize() >= self.config.max_pending_analysis_jobs:
             # Preserve the ten-second timeline slot without retaining another
@@ -479,9 +467,7 @@ class RealtimeSession:
             )
             self._analysis_capacity_skip_count += 1
         elif self._supports_staged_recognition():
-            history_snapshot = tuple(
-                self.assessment_history[-self.config.history_assessments :]
-            )
+            history_snapshot = tuple(self.assessment_history[-self.config.history_assessments :])
             previous_state_snapshot = self.previous_state
             observation_task = asyncio.create_task(self._observe_window(snapshot))
             self._perception_tasks.add(observation_task)
@@ -595,26 +581,18 @@ class RealtimeSession:
                     "speaker_binding_latency_ms": getattr(
                         observation, "speaker_binding_latency_ms", 0
                     ),
-                    "perception_latency_ms": getattr(
-                        observation, "perception_latency_ms", 0
-                    ),
-                    "acoustic_latency_ms": getattr(
-                        observation, "acoustic_latency_ms", 0
-                    ),
+                    "perception_latency_ms": getattr(observation, "perception_latency_ms", 0),
+                    "acoustic_latency_ms": getattr(observation, "acoustic_latency_ms", 0),
                     "observation_total_latency_ms": getattr(
                         observation, "observation_total_latency_ms", 0
                     ),
-                    "judgment_queue_wait_ms": round(
-                        (judgment_started - judgment_queued) * 1_000
-                    ),
+                    "judgment_queue_wait_ms": round((judgment_started - judgment_queued) * 1_000),
                     "judgment_latency_ms": judgment_latency_ms,
                     "model_pipeline_latency_ms": (
                         getattr(observation, "observation_total_latency_ms", 0)
                         + judgment_latency_ms
                     ),
-                    "source_audio_chunk_count": getattr(
-                        observation, "source_audio_chunk_count", 0
-                    ),
+                    "source_audio_chunk_count": getattr(observation, "source_audio_chunk_count", 0),
                     "uploaded_audio_chunk_count": getattr(
                         observation, "uploaded_audio_chunk_count", 0
                     ),
@@ -692,9 +670,7 @@ class RealtimeSession:
             remaining = max(0.0, self.config.analysis_deadline_seconds - elapsed)
             try:
                 async with asyncio.timeout(remaining):
-                    observation, model_result = await asyncio.shield(
-                        job.judgment_task
-                    )
+                    observation, model_result = await asyncio.shield(job.judgment_task)
             except TimeoutError:
                 self._analysis_timeout_count += 1
                 late_recorder = asyncio.create_task(self._record_late_analysis(job))
@@ -889,9 +865,7 @@ class RealtimeSession:
                 "perception_report": perception.model_dump(mode="json"),
                 "acoustic_features": acoustic.model_dump(mode="json"),
                 "analysis_staleness_ms": staleness_ms,
-                "live_action_eligible": (
-                    staleness_ms <= self.config.max_intervention_staleness_ms
-                ),
+                "live_action_eligible": (staleness_ms <= self.config.max_intervention_staleness_ms),
                 "state_classification_used": False,
                 "strategy_library_used": False,
             }
@@ -947,9 +921,7 @@ class RealtimeSession:
                     "type": "intervention_held",
                     "sequence": decision.sequence,
                     "reason": "baseline_minimum_interval",
-                    "minimum_interval_ms": (
-                        self.config.baseline_min_intervention_interval_ms
-                    ),
+                    "minimum_interval_ms": (self.config.baseline_min_intervention_interval_ms),
                 }
             )
             return
@@ -1048,9 +1020,7 @@ class RealtimeSession:
             "child_mean_cosine": binding.child_mean_cosine,
             "provider_request_count": binding.provider_request_count,
             "low_confidence_segment_count": binding.low_confidence_segment_count,
-            "continuity_assisted_segment_count": (
-                binding.continuity_assisted_segment_count
-            ),
+            "continuity_assisted_segment_count": (binding.continuity_assisted_segment_count),
             "segment_count": len(binding.segments),
             "segments_truncated": len(binding.segments) > len(segments),
             "segments": segments,
@@ -1168,17 +1138,18 @@ class RealtimeSession:
                     "support_target": assessment.support_target.value,
                     "interruptibility": assessment.interruptibility.value,
                     "interaction_performance": list(assessment.interaction_performance),
-                    "high_risk_signals": assessment.high_risk_signals.model_dump(
-                        mode="json"
-                    ),
+                    "high_risk_signals": assessment.high_risk_signals.model_dump(mode="json"),
                     "assessment": assessment.model_dump(mode="json"),
                     "perception_report": (
                         perception.model_dump(mode="json")
                         if (
                             recognition_observation is not None
-                            and (perception := getattr(
-                                recognition_observation, "perception_report", None
-                            )) is not None
+                            and (
+                                perception := getattr(
+                                    recognition_observation, "perception_report", None
+                                )
+                            )
+                            is not None
                         )
                         else None
                     ),
@@ -1186,16 +1157,18 @@ class RealtimeSession:
                         acoustic.model_dump(mode="json")
                         if (
                             recognition_observation is not None
-                            and (acoustic := getattr(
-                                recognition_observation, "acoustic_features", None
-                            )) is not None
+                            and (
+                                acoustic := getattr(
+                                    recognition_observation, "acoustic_features", None
+                                )
+                            )
+                            is not None
                         )
                         else None
                     ),
                     "analysis_staleness_ms": analysis_staleness_ms,
                     "live_action_eligible": (
-                        analysis_staleness_ms
-                        <= self.config.max_intervention_staleness_ms
+                        analysis_staleness_ms <= self.config.max_intervention_staleness_ms
                     ),
                     **boundary_resolution.as_event_fields(),
                 }
@@ -1205,11 +1178,7 @@ class RealtimeSession:
                 InterventionAction.PROGRESSIVE_SUPPORT,
                 InterventionAction.REINFORCE,
             }
-            if (
-                actionable
-                and analysis_staleness_ms
-                > self.config.max_intervention_staleness_ms
-            ):
+            if actionable and analysis_staleness_ms > self.config.max_intervention_staleness_ms:
                 await self._hold_stale_intervention(
                     sequence=decision.sequence,
                     staleness_ms=analysis_staleness_ms,
@@ -1366,58 +1335,60 @@ class RealtimeSession:
         if plan is not None:
             self.previous_plan = plan
         self.pending_delivery = package
-        voice_pending = bool(
-            package.voice_prompt.enabled and self.voice_synthesizer is not None
-        )
+        self._recent_deliveries[package.delivery_id] = {
+            "package": package,
+            "plan": self._pending_plan,
+            "baseline": self._baseline_pending_decision,
+            "visual_started_at_ms": None,
+            "voice_error": None,
+            "finalized": False,
+        }
+        while len(self._recent_deliveries) > 64:
+            self._recent_deliveries.pop(next(iter(self._recent_deliveries)))
+        voice_pending = bool(package.voice_prompt.enabled and self.voice_synthesizer is not None)
         stream_method = getattr(self.voice_synthesizer, "synthesize_streaming", None)
         streaming = bool(
             voice_pending and self._voice_streaming_enabled and callable(stream_method)
         )
         intervention_event = {
-                "type": "intervention",
-                "delivery_id": package.delivery_id,
-                "sequence": package.sequence,
-                "prepared_at_ms": package.prepared_at_ms,
-                "target_actor": package.target_actor.value,
-                "strategy_id": package.strategy_id,
-                "repair_target": (
-                    None
-                    if package.repair_target is None
-                    else package.repair_target.value
-                ),
-                "source": "ai",
-                "heading": package.visual_prompt.heading,
-                "message": package.visual_prompt.message,
-                "strategy_selection_source": (
-                    plan.strategy_selection_source.value if plan is not None else None
-                ),
-                "semantic_selection_confidence": (
-                    plan.semantic_selection_confidence.value
-                    if plan is not None and plan.semantic_selection_confidence is not None
-                    else None
-                ),
-                "semantic_relaxed_dimensions": (
-                    plan.semantic_relaxed_dimensions if plan is not None else []
-                ),
-                "selection_reason": plan.selection_reason if plan is not None else None,
-                "message_source": (
-                    plan.message_source.value
-                    if plan is not None
-                    else package.message_source.value
-                ),
-                "message_validation_checks": (
-                    plan.validation_checks if plan is not None else {}
-                ),
-                "dismissible": package.visual_prompt.dismissible,
-                "voice_expected": package.voice_prompt.enabled,
-                "voice_provider": package.voice_prompt.provider,
-                "voice_pending": voice_pending,
-                "voice_streaming": streaming,
-                "voice_output_identifier": None,
-                "audio_mime_type": None,
-                "audio_base64": None,
-                "voice_error": None,
-            }
+            "type": "intervention",
+            "delivery_id": package.delivery_id,
+            "sequence": package.sequence,
+            "prepared_at_ms": package.prepared_at_ms,
+            "target_actor": package.target_actor.value,
+            "strategy_id": package.strategy_id,
+            "repair_target": (
+                None if package.repair_target is None else package.repair_target.value
+            ),
+            "source": "ai",
+            "heading": package.visual_prompt.heading,
+            "message": package.visual_prompt.message,
+            "strategy_selection_source": (
+                plan.strategy_selection_source.value if plan is not None else None
+            ),
+            "semantic_selection_confidence": (
+                plan.semantic_selection_confidence.value
+                if plan is not None and plan.semantic_selection_confidence is not None
+                else None
+            ),
+            "semantic_relaxed_dimensions": (
+                plan.semantic_relaxed_dimensions if plan is not None else []
+            ),
+            "selection_reason": plan.selection_reason if plan is not None else None,
+            "message_source": (
+                plan.message_source.value if plan is not None else package.message_source.value
+            ),
+            "message_validation_checks": (plan.validation_checks if plan is not None else {}),
+            "dismissible": package.visual_prompt.dismissible,
+            "voice_expected": package.voice_prompt.enabled,
+            "voice_provider": package.voice_prompt.provider,
+            "voice_pending": voice_pending,
+            "voice_streaming": streaming,
+            "voice_output_identifier": None,
+            "audio_mime_type": None,
+            "audio_base64": None,
+            "voice_error": None,
+        }
         try:
             await self.send_event(intervention_event)
         except (ConnectionError, OSError, RuntimeError):
@@ -1430,6 +1401,9 @@ class RealtimeSession:
             ):
                 self.controller.mark_intervention_not_delivered()
             raise
+        watchdog = asyncio.create_task(self._finish_unconfirmed_delivery(package.delivery_id))
+        self._delivery_watchdogs.add(watchdog)
+        watchdog.add_done_callback(self._delivery_watchdogs.discard)
         if not voice_pending:
             return
 
@@ -1450,32 +1424,47 @@ class RealtimeSession:
                 raise ValueError("voice PCM16 chunk has incomplete sample")
             if not pcm:
                 return
-            await self.send_event({
-                "type": "intervention_audio_chunk", "delivery_id": package.delivery_id,
-                "chunk_index": chunk_index, "sample_offset": sample_offset,
-                "sample_rate_hz": sample_rate, "audio_mime_type": "audio/pcm",
-                "audio_base64": base64.b64encode(pcm).decode("ascii"),
-            })
+            await self.send_event(
+                {
+                    "type": "intervention_audio_chunk",
+                    "delivery_id": package.delivery_id,
+                    "chunk_index": chunk_index,
+                    "sample_offset": sample_offset,
+                    "sample_rate_hz": sample_rate,
+                    "audio_mime_type": "audio/pcm",
+                    "audio_base64": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
             chunk_index += 1
             sample_offset += len(pcm) // 2
 
-        try:
-            synthesis = (
-                stream_method(package.voice_prompt.message, on_chunk=forward_chunk)
-                if streaming else self.voice_synthesizer.synthesize(package.voice_prompt.message)
-            )
-            voice = await asyncio.wait_for(
-                synthesis,
-                timeout=self.config.voice_synthesis_timeout_seconds,
-            )
-            wav = pcm16_wav_bytes(voice.pcm_audio, voice.sample_rate_hz)
-            audio_base64 = base64.b64encode(wav).decode("ascii")
-            audio_mime_type = "audio/wav"
-            voice_output_identifier = voice.output_identifier
-        except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
-            voice_error = str(exc)
-        finally:
-            stream_open = False
+        for attempt in range(2):
+            try:
+                synthesis = (
+                    stream_method(package.voice_prompt.message, on_chunk=forward_chunk)
+                    if streaming
+                    else self.voice_synthesizer.synthesize(package.voice_prompt.message)
+                )
+                voice = await asyncio.wait_for(
+                    synthesis,
+                    timeout=self.config.voice_synthesis_timeout_seconds,
+                )
+                wav = pcm16_wav_bytes(voice.pcm_audio, voice.sample_rate_hz)
+                audio_base64 = base64.b64encode(wav).decode("ascii")
+                audio_mime_type = "audio/wav"
+                voice_output_identifier = voice.output_identifier
+                voice_error = None
+                break
+            except (ConnectionError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                voice_error = str(exc) or type(exc).__name__
+                # Retry only before sound was streamed; never repeat a played prefix.
+                if attempt or sample_offset or isinstance(exc, TTSServiceError):
+                    break
+                await self.send_event(
+                    {"type": "intervention_voice_retry", "delivery_id": package.delivery_id}
+                )
+        stream_open = False
+        self._recent_deliveries[package.delivery_id]["voice_error"] = voice_error
         await self.send_event(
             {
                 "type": "intervention_voice",
@@ -1492,9 +1481,74 @@ class RealtimeSession:
                 "total_synthesis_latency_ms": voice.total_latency_ms if voice else None,
             }
         )
+        if voice_error:
+            await self._finish_confirmed_text(package.delivery_id, voice_error)
+
+    async def _finish_confirmed_text(self, delivery_id: str, reason: str) -> None:
+        record = self._recent_deliveries.get(delivery_id)
+        if record is None or record["finalized"] or record["visual_started_at_ms"] is None:
+            return
+        started_at_ms = record["visual_started_at_ms"]
+        await self.handle_control(
+            {
+                "type": "delivery_execution",
+                "delivery_id": delivery_id,
+                "recorded_at_ms": max(started_at_ms, self._latest_media_timestamp_ms),
+                "visual": {
+                    "status": "delivered",
+                    "started_at_ms": started_at_ms,
+                    "provider": "browser_overlay",
+                },
+                "voice": {"status": "failed", "error": reason},
+            }
+        )
+
+    async def _finish_unconfirmed_delivery(
+        self, delivery_id: str, timeout_seconds: float = 60
+    ) -> None:
+        """A missing browser receipt must never lock a whole session."""
+        await asyncio.sleep(timeout_seconds)
+        record = self._recent_deliveries.get(delivery_id)
+        if record is None or record["finalized"]:
+            return
+        if record["visual_started_at_ms"] is not None:
+            await self._finish_confirmed_text(delivery_id, "browser voice confirmation timed out")
+        elif self.pending_delivery is record["package"]:
+            self.pending_delivery = None
+            self._pending_plan = None
+            self._baseline_pending_decision = None
+            if self._experiment_condition == "coregulation":
+                self.controller.mark_intervention_not_delivered()
+            await self.send_event(
+                {
+                    "type": "delivery_unconfirmed",
+                    "delivery_id": delivery_id,
+                    "reason": "browser presentation confirmation timed out",
+                }
+            )
 
     async def handle_control(self, control: dict[str, Any]) -> bool:
         control_type = control.get("type")
+        if control_type == "delivery_visual":
+            delivery_id = control.get("delivery_id")
+            record = (
+                self._recent_deliveries.get(delivery_id) if isinstance(delivery_id, str) else None
+            )
+            if record is not None:
+                if record["visual_started_at_ms"] is None:
+                    record["visual_started_at_ms"] = self._non_negative_int(
+                        control.get("started_at_ms"), "started_at_ms"
+                    )
+                await self.send_event(
+                    {
+                        "type": "delivery_visual_received",
+                        "delivery_id": delivery_id,
+                        "visual_started_at_ms": record["visual_started_at_ms"],
+                    }
+                )
+                if record["voice_error"]:
+                    await self._finish_confirmed_text(delivery_id, record["voice_error"])
+            return True
         if control_type == "expert_takeover":
             await self._start_expert_takeover(control)
             return True
@@ -1541,7 +1595,21 @@ class RealtimeSession:
         ):
             await self._record_expert_delivery(control)
             return True
+        delivery_id = control.get("delivery_id")
+        record = self._recent_deliveries.get(delivery_id) if isinstance(delivery_id, str) else None
+        if record is not None and record["finalized"]:
+            await self.send_event(
+                {
+                    "type": "delivery_execution_received",
+                    "delivery_id": control["delivery_id"],
+                    "duplicate": True,
+                }
+            )
+            return True
         package = self.pending_delivery
+        late_receipt = package is None or control.get("delivery_id") != package.delivery_id
+        if late_receipt and record is not None:
+            package = record["package"]
         if package is None or control.get("delivery_id") != package.delivery_id:
             await self.send_event(
                 {
@@ -1576,6 +1644,22 @@ class RealtimeSession:
                 else None
             ),
         )
+        if record is not None:
+            record["finalized"] = True
+        if late_receipt:
+            self.delivery_reports.append(report.model_dump(mode="json"))
+            await self.send_event(
+                {
+                    "type": "delivery_execution_received",
+                    "delivery_id": package.delivery_id,
+                    "overall_status": report.overall_status.value,
+                    "visual_status": visual.status.value,
+                    "voice_status": voice.status.value,
+                    "late_receipt": True,
+                    "post_intervention_observation_armed": False,
+                }
+            )
+            return True
         delivered = any(
             channel.status is OutputExecutionStatus.DELIVERED for channel in (visual, voice)
         )
@@ -1586,8 +1670,10 @@ class RealtimeSession:
                 self._latest_media_timestamp_ms,
                 package.prepared_at_ms,
             )
-            pending_plan = self._pending_plan
-            baseline_decision = self._baseline_pending_decision
+            pending_plan = self._pending_plan or (record["plan"] if record else None)
+            baseline_decision = self._baseline_pending_decision or (
+                record["baseline"] if record else None
+            )
             if pending_plan is None and baseline_decision is None:
                 if (
                     self._experiment_condition == "coregulation"
@@ -1610,14 +1696,10 @@ class RealtimeSession:
                     delivered_at_ms=delivery_timeline_ms,
                 )
             if package.delivery_id not in self._recorded_message_delivery_ids:
-                shown_message = re.sub(
-                    r"\s+", " ", package.visual_prompt.message
-                ).strip()
+                shown_message = re.sub(r"\s+", " ", package.visual_prompt.message).strip()
                 if shown_message:
                     self._recent_intervention_messages.append(shown_message)
-                    self._recent_intervention_messages = (
-                        self._recent_intervention_messages[-3:]
-                    )
+                    self._recent_intervention_messages = self._recent_intervention_messages[-3:]
                 self._recorded_message_delivery_ids.add(package.delivery_id)
             if baseline_decision is not None:
                 self._baseline_last_delivery_at_ms = delivery_timeline_ms
@@ -1670,12 +1752,10 @@ class RealtimeSession:
                 "voice_started_at_ms": report.voice.started_at_ms,
                 "voice_completed_at_ms": report.voice.completed_at_ms,
                 "post_intervention_observation_armed": (
-                    delivered
-                    and self._post_response_not_before_ms is not None
+                    delivered and self._post_response_not_before_ms is not None
                 ),
                 "positive_maintenance_observation_armed": (
-                    delivered
-                    and self._positive_maintenance_pending is not None
+                    delivered and self._positive_maintenance_pending is not None
                 ),
                 "delivery_timeline_ms": delivery_timeline_ms,
             }
@@ -1996,9 +2076,7 @@ class RealtimeSession:
             "recovery_status": maintenance_status,
             "effect_category": effect_category,
             "observed_state": observed_state,
-            "observed_interaction_performance": list(
-                assessment.interaction_performance
-            ),
+            "observed_interaction_performance": list(assessment.interaction_performance),
             "observed_evidence": [
                 {
                     "modality": item.modality.value,
@@ -2027,8 +2105,12 @@ class RealtimeSession:
         status = OutputExecutionStatus(str(raw.get("status")))
         if status is OutputExecutionStatus.NOT_ATTEMPTED:
             return ChannelExecution(modality=modality, status=status)
-        started_at_ms = RealtimeSession._non_negative_int(
-            raw.get("started_at_ms"), f"{modality.value}.started_at_ms"
+        started_raw = raw.get("started_at_ms")
+        # A failed synthesis/playback may never have started. Do not invent a playback time.
+        started_at_ms = (
+            None
+            if started_raw is None and status is OutputExecutionStatus.FAILED
+            else RealtimeSession._non_negative_int(started_raw, f"{modality.value}.started_at_ms")
         )
         completed_raw = raw.get("completed_at_ms")
         completed_at_ms = (
@@ -2126,6 +2208,10 @@ class RealtimeSession:
             await asyncio.gather(*self._judgment_tasks, return_exceptions=True)
         if self._late_result_tasks:
             await asyncio.gather(*self._late_result_tasks, return_exceptions=True)
+        for task in tuple(self._delivery_watchdogs):
+            task.cancel()
+        if self._delivery_watchdogs:
+            await asyncio.gather(*tuple(self._delivery_watchdogs), return_exceptions=True)
         self.window.clear()
         for resource in (self.recognizer, self._text_chat_provider):
             close = getattr(resource, "close", None)

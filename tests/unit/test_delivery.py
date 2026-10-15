@@ -50,7 +50,7 @@ def test_policy_requires_prominent_text_and_autoplay_voice() -> None:
     assert policy.visual.prominence == "high"
     assert policy.visual.blocks_primary_task is False
     assert policy.voice.autoplay is True
-    assert policy.voice.model == "qwen3-tts-instruct-flash-realtime-2026-01-22"
+    assert policy.voice.model == "qwen3-tts-flash-realtime"
     assert policy.voice.voice == "Maia"
     assert policy.voice.optimize_instructions is False
 
@@ -195,7 +195,7 @@ class _FakeSynthesizer:
     def synthesize(self, text: str) -> SpeechSynthesisResult:
         return SpeechSynthesisResult(
             pcm_audio=b"\x00\x00" * 2400,
-            model="qwen3-tts-instruct-flash-realtime-2026-01-22",
+            model="qwen3-tts-flash-realtime",
             voice="Maia",
             sample_rate_hz=24000,
             text=text,
@@ -225,7 +225,7 @@ def test_delivery_replay_saves_traceable_maia_wav(tmp_path: Path) -> None:
 
     assert valid is True
     assert result["voice_synthesis_count"] == 1
-    assert synthesis["model"] == "qwen3-tts-instruct-flash-realtime-2026-01-22"
+    assert synthesis["model"] == "qwen3-tts-flash-realtime"
     assert synthesis["voice"] == "Maia"
     assert synthesis["source_message_sha256"]
     assert synthesis["audio_sha256"]

@@ -95,9 +95,7 @@ def test_browser_recorder_rejects_wrong_audio_chunk_size(tmp_path: Path) -> None
     recorder.start()
 
     with pytest.raises(BrowserProtocolError, match="audio packet size"):
-        recorder.accept_packet(
-            encode_binary_packet(MediaChunk(MediaKind.AUDIO, 0, b"\x00" * 100))
-        )
+        recorder.accept_packet(encode_binary_packet(MediaChunk(MediaKind.AUDIO, 0, b"\x00" * 100)))
 
     recorder.finish(status="failed", error="invalid audio")
 
@@ -197,3 +195,41 @@ def test_browser_recorder_accepts_late_retry_and_assembles_in_order(
     assert recording_manifest["complete"] is True
     assert recording_manifest["missing_sequences"] == []
     assert not (summary.run_dir / "media" / ".session_recording.webm.chunks").exists()
+
+
+def test_device_recovery_keeps_independent_recordings_instead_of_concatenating_headers(
+    tmp_path: Path,
+) -> None:
+    recorder = BrowserCaptureRecorder(
+        output_dir=tmp_path,
+        session_id="recovered-recording",
+        media_format=MediaFormat(),
+        max_image_bytes=750000,
+        recording_enabled=True,
+    )
+    recorder.start()
+    for sequence, segment, payload in (
+        (0, 0, b"header-a"),
+        (1, 0, b"continuation-a"),
+        (2, 2, b"header-b"),
+        (3, 2, b"continuation-b"),
+    ):
+        recorder.accept_recording_chunk(
+            sequence=sequence,
+            start_ms=sequence * 10000,
+            end_ms=(sequence + 1) * 10000,
+            content_type="video/webm",
+            payload=payload,
+            segment_start_sequence=segment,
+        )
+    summary = recorder.finish(status="completed")
+    manifest = json.loads((summary.run_dir / "recording_manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["segments"]) == 2
+    assert (
+        summary.run_dir / manifest["segments"][0]["filename"]
+    ).read_bytes() == b"header-acontinuation-a"
+    assert (
+        summary.run_dir / manifest["segments"][1]["filename"]
+    ).read_bytes() == b"header-bcontinuation-b"
+    assert manifest["segments"][1]["first_timestamp_ms"] == 20000
+    assert manifest["complete"] is True

@@ -289,6 +289,7 @@ class BrowserCaptureRecorder:
         end_ms: int,
         content_type: str,
         payload: bytes,
+        segment_start_sequence: int = 0,
     ) -> dict[str, Any]:
         """Store one MediaRecorder fragment with retry-safe, out-of-order delivery."""
 
@@ -298,6 +299,8 @@ class BrowserCaptureRecorder:
             raise BrowserProtocolError("recording chunks require an active capture session")
         if isinstance(sequence, bool) or sequence < 0:
             raise BrowserProtocolError("recording sequence must be a non-negative integer")
+        if isinstance(segment_start_sequence, bool) or not 0 <= segment_start_sequence <= sequence:
+            raise BrowserProtocolError("recording segment start is invalid")
         if (
             isinstance(start_ms, bool)
             or isinstance(end_ms, bool)
@@ -316,7 +319,11 @@ class BrowserCaptureRecorder:
         digest = hashlib.sha256(payload).hexdigest()
         existing = self._recording_chunks.get(sequence)
         if existing is not None:
-            if existing["sha256"] != digest or existing["payload_bytes"] != len(payload):
+            if (
+                existing["sha256"] != digest
+                or existing["payload_bytes"] != len(payload)
+                or existing.get("segment_start_sequence", 0) != segment_start_sequence
+            ):
                 raise BrowserProtocolError("recording retry does not match the accepted chunk")
             return {
                 "sequence": sequence,
@@ -328,9 +335,7 @@ class BrowserCaptureRecorder:
             self.recording_filename = f"session_recording.{extension}"
             media_dir = (self.run_dir / "media").resolve()
             media_dir.mkdir(parents=True, exist_ok=True)
-            self._recording_chunk_dir = (
-                media_dir / f".{self.recording_filename}.chunks"
-            ).resolve()
+            self._recording_chunk_dir = (media_dir / f".{self.recording_filename}.chunks").resolve()
             self._recording_chunk_dir.mkdir(parents=True, exist_ok=True)
         elif normalized_content_type != self.recording_content_type:
             raise BrowserProtocolError("recording content type changed during the session")
@@ -346,6 +351,7 @@ class BrowserCaptureRecorder:
             "end_ms": end_ms,
             "payload_bytes": len(payload),
             "sha256": digest,
+            "segment_start_sequence": segment_start_sequence,
         }
         self._recording_chunks[sequence] = metadata
         self._recording_highest_sequence = max(
@@ -391,6 +397,7 @@ class BrowserCaptureRecorder:
             return
         self._recording_finalized = True
         final_path: Path | None = None
+        recording_segments: list[dict[str, Any]] = []
         if (
             self.recording_enabled
             and self._recording_chunk_dir is not None
@@ -398,17 +405,36 @@ class BrowserCaptureRecorder:
             and self.recording_filename is not None
             and self._recording_chunks
         ):
-            final_path = (
-                self._recording_chunk_dir.parent / self.recording_filename
-            ).resolve()
-            with final_path.open("wb") as output:
-                for sequence in sorted(self._recording_chunks):
-                    chunk_path = (
-                        self._recording_chunk_dir / f"{sequence:08d}.part"
-                    ).resolve()
-                    with chunk_path.open("rb") as source:
-                        while block := source.read(1024 * 1024):
-                            output.write(block)
+            grouped: dict[int, list[int]] = {}
+            for sequence in sorted(self._recording_chunks):
+                segment = self._recording_chunks[sequence].get("segment_start_sequence", 0)
+                grouped.setdefault(segment, []).append(sequence)
+            for index, (segment, sequences) in enumerate(sorted(grouped.items())):
+                filename = Path(self.recording_filename)
+                segment_name = (
+                    self.recording_filename
+                    if index == 0
+                    else f"{filename.stem}_part_{segment:06d}{filename.suffix}"
+                )
+                segment_path = (self._recording_chunk_dir.parent / segment_name).resolve()
+                with segment_path.open("wb") as output:
+                    for sequence in sequences:
+                        with (self._recording_chunk_dir / f"{sequence:08d}.part").open(
+                            "rb"
+                        ) as source:
+                            while block := source.read(1024 * 1024):
+                                output.write(block)
+                if final_path is None:
+                    final_path = segment_path
+                recording_segments.append(
+                    {
+                        "filename": str(segment_path.relative_to(self.run_dir)),
+                        "first_timestamp_ms": self._recording_chunks[sequences[0]]["start_ms"],
+                        "last_timestamp_ms": self._recording_chunks[sequences[-1]]["end_ms"],
+                        "bytes_saved": segment_path.stat().st_size,
+                        "sha256": sha256_file(segment_path),
+                    }
+                )
             for chunk_path in self._recording_chunk_dir.iterdir():
                 if chunk_path.is_file():
                     chunk_path.unlink()
@@ -426,11 +452,10 @@ class BrowserCaptureRecorder:
                     and not self._recording_missing_sequences
                 ),
                 "filename": (
-                    None
-                    if final_path is None
-                    else str(final_path.relative_to(self.run_dir))
+                    None if final_path is None else str(final_path.relative_to(self.run_dir))
                 ),
                 "content_type": self.recording_content_type,
+                "segments": recording_segments,
                 "chunk_count": self.recording_chunk_count,
                 "bytes_saved": self.recording_bytes_saved,
                 "first_timestamp_ms": self.recording_first_timestamp_ms,
@@ -438,10 +463,7 @@ class BrowserCaptureRecorder:
                 "upload_failure_count": upload_failure_count,
                 "missing_sequences": sorted(self._recording_missing_sequences),
                 "sha256": None if final_path is None else sha256_file(final_path),
-                "chunks": [
-                    self._recording_chunks[key]
-                    for key in sorted(self._recording_chunks)
-                ],
+                "chunks": [self._recording_chunks[key] for key in sorted(self._recording_chunks)],
             },
         )
 
@@ -498,8 +520,7 @@ class BrowserCaptureRecorder:
         height, width = image.shape[:2]
         if width > self.media_format.image_max_width or height > self.media_format.image_max_height:
             raise BrowserProtocolError(
-                "image dimensions exceed the negotiated maximum: "
-                f"{width}x{height}"
+                f"image dimensions exceed the negotiated maximum: {width}x{height}"
             )
 
     def _record_chunk(self, chunk: MediaChunk, *, candidate_timestamp_ms: int) -> None:

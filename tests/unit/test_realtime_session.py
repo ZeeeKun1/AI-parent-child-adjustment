@@ -174,9 +174,7 @@ class _PositiveRecognizer:
             actor="both",
             previous_state=previous_state,
         )
-        return assessment.model_copy(
-            update={"support_need": SupportNeed.POSITIVE_REINFORCEMENT}
-        )
+        return assessment.model_copy(update={"support_need": SupportNeed.POSITIVE_REINFORCEMENT})
 
 
 class _PersistentActiveSpeechRecognizer:
@@ -425,9 +423,7 @@ async def _exercise_latency_without_superseding_judgment() -> None:
 
     assert any(event["type"] == "state_update" for event in events)
     assert not any(event["type"] == "intervention" for event in events)
-    assert any(
-        event.get("reason") == "stale_assessment_record_only" for event in events
-    )
+    assert any(event.get("reason") == "stale_assessment_record_only" for event in events)
     assert session.runtime_metrics["stale_intervention_count"] == 1
     await session.stop("completed")
 
@@ -575,9 +571,7 @@ async def _exercise_bounded_analysis_capacity() -> None:
     await session.wait_for_analysis()
 
     updates = [event for event in events if event["type"] == "state_update"]
-    event_summary = [
-        (event["type"], event.get("message"), event.get("reason")) for event in events
-    ]
+    event_summary = [(event["type"], event.get("message"), event.get("reason")) for event in events]
     assert not [event for event in events if event["type"] == "loop_error"]
     assert [event["sequence"] for event in updates] == [1, 2, 3, 4, 5], event_summary
     assert len([event for event in updates if event["state"] is None]) == 3
@@ -588,6 +582,103 @@ async def _exercise_bounded_analysis_capacity() -> None:
 
 def test_visual_intervention_is_sent_before_voice_synthesis_finishes() -> None:
     asyncio.run(_exercise_visual_first_delivery())
+
+
+def test_late_delivery_receipt_is_recorded_without_touching_current_delivery() -> None:
+    async def exercise():
+        events = []
+
+        async def send(event):
+            events.append(event)
+
+        session = RealtimeSession(
+            session_id="late-receipt",
+            recognizer=_SequenceRecognizer(),
+            send_event=send,
+            config=RealtimeLoopConfig(assessment_interval_ms=100000),
+        )
+        await session.start()
+        await _reach_confirmed_dysregulation(session)
+        original = session.pending_delivery
+        assert original is not None
+        replacement = original.model_copy(update={"delivery_id": "later-delivery"})
+        session.pending_delivery = replacement
+        control = {
+            "type": "delivery_execution",
+            "delivery_id": original.delivery_id,
+            "recorded_at_ms": 12000,
+            "visual": {"status": "delivered", "started_at_ms": 11000},
+            "voice": {"status": "failed", "error": "failed before playback"},
+        }
+        await session.handle_control(control)
+        assert session.pending_delivery is replacement
+        assert len(session.delivery_reports) == 1
+        assert any(e.get("late_receipt") for e in events)
+        await session.handle_control(control)
+        assert len(session.delivery_reports) == 1
+        await session.stop("completed")
+
+    asyncio.run(exercise())
+
+
+def test_voice_reconnect_retries_once_before_first_audio() -> None:
+    async def exercise():
+        events = []
+
+        class Voice:
+            calls = 0
+
+            async def synthesize(self, text):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ConnectionError("connection lost")
+                return VoiceAudio(b"\x01\x00" * 160, 16000, "test")
+
+        async def send(event):
+            events.append(event)
+
+        voice = Voice()
+        session = RealtimeSession(
+            session_id="voice-retry",
+            recognizer=_SequenceRecognizer(),
+            send_event=send,
+            config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
+            voice_synthesizer=voice,
+        )
+        await session.start()
+        await _reach_confirmed_dysregulation(session)
+        assert voice.calls == 2
+        assert sum(e["type"] == "intervention" for e in events) == 1
+        assert next(e for e in events if e["type"] == "intervention_voice")["voice_error"] is None
+        await session.stop("completed")
+
+    asyncio.run(exercise())
+
+
+def test_missing_browser_confirmation_expires_without_inventing_a_delivery() -> None:
+    async def exercise():
+        events = []
+
+        async def send(event):
+            events.append(event)
+
+        session = RealtimeSession(
+            session_id="missing-receipt",
+            recognizer=_SequenceRecognizer(),
+            send_event=send,
+            config=RealtimeLoopConfig(assessment_interval_ms=100000),
+        )
+        await session.start()
+        await _reach_confirmed_dysregulation(session)
+        delivery_id = session.pending_delivery.delivery_id
+        await session._finish_unconfirmed_delivery(delivery_id, timeout_seconds=0.001)
+        assert session.pending_delivery is None
+        assert session.controller.awaiting_post_intervention_response is False
+        assert len(session.delivery_reports) == 0
+        assert any(e["type"] == "delivery_unconfirmed" for e in events)
+        await session.stop("completed")
+
+    asyncio.run(exercise())
 
 
 def test_streaming_voice_chunks_precede_completion_and_keep_full_fallback() -> None:
@@ -607,7 +698,9 @@ def test_streaming_failure_keeps_visual_delivery_and_session_alive() -> None:
             events.append(event)
 
         session = RealtimeSession(
-            session_id="stream-error", recognizer=_SequenceRecognizer(), send_event=send,
+            session_id="stream-error",
+            recognizer=_SequenceRecognizer(),
+            send_event=send,
             config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
             voice_synthesizer=BrokenVoice(),
         )
@@ -641,7 +734,9 @@ async def _exercise_streaming_voice() -> None:
         events.append(event)
 
     session = RealtimeSession(
-        session_id="stream-test", recognizer=_SequenceRecognizer(), send_event=send,
+        session_id="stream-test",
+        recognizer=_SequenceRecognizer(),
+        send_event=send,
         config=RealtimeLoopConfig(assessment_interval_ms=100000, voice_enabled=True),
         voice_synthesizer=StreamingVoice(),
     )
@@ -725,8 +820,7 @@ async def _exercise_bounded_shutdown() -> None:
     await asyncio.wait_for(session.stop("completed"), timeout=1)
 
     assert any(
-        event.get("stage") == "shutdown" and event["type"] == "loop_error"
-        for event in events
+        event.get("stage") == "shutdown" and event["type"] == "loop_error" for event in events
     )
 
 
@@ -780,9 +874,7 @@ async def _exercise_positive_maintenance_loop() -> None:
     assert session.controller.awaiting_post_intervention_response is False
     assert session.pending_delivery is None
     assert session.runtime_metrics["awaiting_positive_maintenance_observation"] is True
-    receipt = [
-        event for event in events if event["type"] == "delivery_execution_received"
-    ][-1]
+    receipt = [event for event in events if event["type"] == "delivery_execution_received"][-1]
     assert receipt["post_intervention_observation_armed"] is False
     assert receipt["positive_maintenance_observation_armed"] is True
 

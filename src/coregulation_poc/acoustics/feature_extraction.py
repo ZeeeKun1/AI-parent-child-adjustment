@@ -101,6 +101,9 @@ def extract_acoustic_features(
 
     segments: list[AcousticSegment] = []
     for seg in binding.segments:
+        # A discontinuous device timeline can invalidate one segment; keep the usable evidence.
+        if seg.start_ms < 0 or seg.end_ms <= seg.start_ms:
+            continue
         rms = _compute_segment_rms(audio_chunks, seg.start_ms, seg.end_ms, sample_rate)
         segments.append(
             AcousticSegment(

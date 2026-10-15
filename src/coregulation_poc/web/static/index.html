@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; worker-src 'self' blob:">
     <title>家庭作业亲子调节助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=22">
+    <link rel="stylesheet" href="/static/styles.css?v=23">
   </head>
   <body data-phase="setup">
     <header class="nav-bar">
@@ -62,6 +62,7 @@
       </div>
       <p id="status" role="status" aria-live="polite">等待开始。</p>
       <div class="control-actions">
+        <button id="recover-devices-button" class="ctrl-btn" type="button" hidden>恢复设备</button>
         <button id="pause-interventions-button" class="ctrl-btn" type="button" disabled>暂停提示</button>
         <button id="toggle-voice-button" class="ctrl-btn" type="button" disabled>关闭语音</button>
         <button id="self-continue-button" class="ctrl-btn quiet" type="button" disabled>我们可以继续</button>
@@ -200,6 +201,10 @@
                 <span class="binding-count" id="binding-count">0 / 2</span>
               </div>
               <p class="binding-intro">请轮流朗读下面的句子，每段约 5 秒。两段录音只用于本次活动中区分家长和孩子。</p>
+              <div class="capture-input-row">
+                <label>录音麦克风<select data-input-kind="audioinput" aria-label="录音麦克风"><option value="">系统默认</option></select></label>
+                <button type="button" class="ctrl-btn" data-refresh-devices>刷新设备</button>
+              </div>
               <div class="binding-people">
                 <div class="binding-person" data-speaker="parent" data-bound="false">
                   <img id="parent-binding-avatar" class="binding-avatar" src="/static/img/avatar-mother.png" alt="">
@@ -233,13 +238,17 @@
           <!-- Step 3: Device check + Consent + Start -->
           <div class="wizard-panel" data-step="3" role="tabpanel" hidden>
             <h3 class="wizard-col-title">确认画面和声音</h3>
-            <p class="wizard-col-hint">检查通过后，确认本次活动的音视频记录说明即可开始。</p>
+            <p class="wizard-col-hint">检查时请说一句话，并确认家长、孩子和作业区域都在画面内。</p>
             <div class="device-check-layout">
               <div class="device-preview" id="device-preview" data-active="false">
                 <video id="preview" muted playsinline aria-label="摄像头检查画面"></video>
                 <div class="device-preview-placeholder">检查后在这里确认画面范围</div>
               </div>
               <div class="device-state-list">
+                <div class="capture-input-row">
+                  <label>摄像头<select data-input-kind="videoinput" aria-label="实验摄像头"><option value="">系统默认</option></select></label>
+                  <label>麦克风<select data-input-kind="audioinput" aria-label="实验麦克风"><option value="">系统默认</option></select></label>
+                </div>
                 <div class="device-state" data-device-status="camera" data-state="unchecked">
                   <span class="device-state-dot" aria-hidden="true"></span>
                   <span>摄像头</span>
@@ -358,7 +367,9 @@
       <div class="camera-empty" id="camera-empty" hidden>摄像头预览</div>
     </details>
 
+    <div id="capture-host" aria-hidden="true"></div>
+    <script src="/static/capture-support.js?v=1" defer></script>
     <script src="/static/intervention-audio.js?v=1" defer></script>
-    <script src="/static/app.js?v=18" defer></script>
+    <script src="/static/app.js?v=19" defer></script>
   </body>
 </html>

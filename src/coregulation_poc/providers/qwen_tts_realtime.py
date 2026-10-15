@@ -31,6 +31,14 @@ class SpeechSynthesisResult:
     events: list[dict[str, Any]]
 
 
+class TTSServiceError(ConnectionError):
+    """A service rejection, distinct from a broken transport."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"Qwen TTS service error ({code}): {message}")
+
+
 class QwenRealtimeTTSProvider:
     """Synthesize an approved intervention message without changing its wording."""
 
@@ -144,6 +152,8 @@ class QwenRealtimeTTSProvider:
             raise ConnectionError("Qwen TTS returned a non-JSON WebSocket event") from exc
         if not isinstance(event, dict):
             raise ConnectionError("Qwen TTS returned an invalid WebSocket event")
+        if event.get("code") and event.get("message") and not event.get("type"):
+            raise TTSServiceError(str(event["code"]), str(event["message"]))
         return event
 
     @staticmethod
@@ -325,6 +335,8 @@ class QwenRealtimeTTSProvider:
                 total_latency_ms=round((time.monotonic() - started) * 1000),
                 events=events,
             )
+        except TTSServiceError:
+            raise
         except (OSError, websocket.WebSocketException) as exc:
             event_types = [str(event.get("type")) for event in events]
             raise ConnectionError(

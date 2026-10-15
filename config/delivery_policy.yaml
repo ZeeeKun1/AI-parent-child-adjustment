@@ -1,9 +1,10 @@
-version: 2
+version: 3
 source:
   - "形成性研究与WOZ实验：专家在亲子互动过程中采用语音实施干预"
   - "三阶段主题分析3.0：干预内容需区分家长、儿童与双方对象"
   - "研究团队设计决定（2026-08-02）：醒目文字提示与语音同步输出"
   - "实时亲子指导相关研究：语音能够提供即时支持，但需控制打断与误报风险"
+  - "运行维护（2026-10-16）：改用可调用的Qwen3-TTS-Flash-Realtime，保留Maia音色；该模型不支持声音风格指令"
 
 principles:
   require_authorized_intervention_plan: true
@@ -26,13 +27,14 @@ visual:
 
 voice:
   provider: "alibaba_qwen_realtime_tts"
-  model: "qwen3-tts-instruct-flash-realtime-2026-01-22"
+  model: "qwen3-tts-flash-realtime"
   voice: "Maia"
   language: "zh-CN"
   language_type: "chinese"
   response_format: "pcm"
   sample_rate_hz: 24000
   mode: "commit"
+  # Retained for compatible instruct models; Flash does not accept this parameter.
   instructions: "请使用冷静、中性、支持性的成年女性声音，以自然且不催促的节奏清晰表达；不要夸张，不使用责备或命令式语气。"
   optimize_instructions: false
   autoplay: true

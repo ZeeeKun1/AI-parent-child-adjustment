@@ -885,6 +885,7 @@ def create_browser_capture_app(
         try:
             start_ms = int(request.headers.get("x-media-start-ms", ""))
             end_ms = int(request.headers.get("x-media-end-ms", ""))
+            segment_start_sequence = int(request.headers.get("x-recording-segment-start", "0"))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="录制片段时间信息不正确") from exc
         payload = await _read_request_body(
@@ -901,6 +902,7 @@ def create_browser_capture_app(
                     end_ms=end_ms,
                     content_type=content_type,
                     payload=payload,
+                    segment_start_sequence=segment_start_sequence,
                 )
         except BrowserProtocolError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
